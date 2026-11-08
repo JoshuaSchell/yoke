@@ -65,7 +65,11 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
         .on_press(|s: &mut App| if s.settings { s.close_settings() } else { s.open_settings() })
         .build(k)
         .key("settings-open");
-    let toolbar = Toolbar::new().leading(crumbs).trailing(row().gap(2.0).center_y().offset(0.0, -FRAME).child(usage::toolbar_button(s, k)).child(hud_button).child(settings_button));
+    let mut trailing = row().gap(2.0).center_y().offset(0.0, -FRAME);
+    if let Some(button) = update_button(s, k) {
+        trailing = trailing.child(button.mr(6.0));
+    }
+    let toolbar = Toolbar::new().leading(crumbs).trailing(trailing.child(usage::toolbar_button(s, k)).child(hud_button).child(settings_button));
     let attention = Attention::of(s, k);
     let window = SplitView::new(main)
         .sidebar(&s.sidebar, |s: &mut App| &mut s.sidebar, sidebar::view(s, k))
@@ -208,6 +212,22 @@ fn breadcrumb(project: &str, title: &str, k: &Kit) -> El {
             .child(text(project.to_owned()).key("crumb-project").font(k.ty.ui).color(c.text_muted).a11y_hidden()))
         .child(rune::icon(&icons::CHEVRON_RIGHT, 12.0).key("crumb-sep").color(c.icon_faint).a11y_hidden())
         .child(text(title.to_owned()).key("crumb-title").font(k.ty.ui_medium).color(c.text_strong).truncate().shrink().a11y_hidden())
+}
+
+/// "Restart to update", once an update is installed and waits for a restart. Held back while
+/// a turn runs, since quitting would cut it off.
+fn update_button(s: &App, k: &Kit) -> Option<El> {
+    let version = s.update_ready()?;
+    let busy = s.threads.iter().any(|t| t.busy);
+    let help = if busy { format!("Yoke {version} is installed. Finish or stop the running turns, then restart.") } else { format!("Yoke {version} is installed. Restart to use it.") };
+    Some(rune_kit::Button::new("Restart to update")
+        .variant(rune_kit::ButtonVariant::Contrast)
+        .control_size(ControlSize::Small)
+        .disabled(busy)
+        .on_press(|s: &mut App| { s.restart_to_update(); })
+        .build(k)
+        .help(help)
+        .key("restart-to-update"))
 }
 
 /// The new-thread screen's centre.

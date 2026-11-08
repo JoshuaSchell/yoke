@@ -30,6 +30,12 @@ The sidebar lists every project, as T3 Code does, each with its threads under it
 
 Download the `.dmg` from [Releases](https://github.com/JoshuaSchell/yoke/releases) (Apple silicon), open it and drag Yoke to Applications. It isn't notarized yet, so the first time, right-click it and choose Open.
 
+## Updates
+
+The installed app keeps itself up to date. At launch and every 6 hours it reads `latest.json` from the newest GitHub Release, and when there's a newer version it downloads the update bundle in the background, checks its signature against the public key built into the app (`assets/updater.pub`), and replaces the app on disk. The toolbar then shows **Restart to update** (held back while a turn runs). Settings › Advanced shows where it stands and has **Check now**. A build run from source (`cargo run`) never updates itself. The code is `src/updater.rs`, on cargo-packager's updater.
+
+The release workflow signs the bundle with the private half of that key, from the repo secrets `CARGO_PACKAGER_SIGN_PRIVATE_KEY` and `CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD`. Keep a backup of the key: an app that can't verify an update won't install it, so losing the key means reinstalling once by hand. To try an update locally against a release's files: `YOKE_UPDATE_FILES=<folder with latest.json and the .app.tar.gz> cargo test -- --ignored an_update_installs --nocapture`.
+
 ## Release
 
 Bump `version` in `Cargo.toml`, commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`. The Release workflow (`.github/workflows/release.yml`) tests, packages and publishes a GitHub Release with the `.dmg`. Run it by hand from the Actions tab for a dry run that only builds the `.dmg`. The CI workflow runs the tests on every push to `main`.

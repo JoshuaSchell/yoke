@@ -1,6 +1,6 @@
 [package]
 name = "yoke"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A small T3 Code-style desktop app for prompting coding agents (Claude Code, Codex, OpenCode), built on Rune."
 publish = false
@@ -18,6 +18,9 @@ serde_json = "1"
 base64 = "0.22"
 # Local dates for the usage page (days, "resets 9:20 PM").
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Updates the installed app from GitHub Releases (src/updater.rs): a signed Yoke.app.tar.gz
+# and latest.json beside the .dmg, which .github/workflows/release.yml makes.
+cargo-packager-updater = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

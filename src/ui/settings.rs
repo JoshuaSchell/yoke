@@ -275,7 +275,6 @@ fn agents(s: &App, k: &Kit) -> El {
 }
 
 fn advanced(s: &App, k: &Kit) -> El {
-    let c = &k.c;
     let hud = Switch::new(s.hud)
         .hide_label()
         .label("Show frame stats")
@@ -293,10 +292,38 @@ fn advanced(s: &App, k: &Kit) -> El {
             .key("prefs-reveal");
         rows.push(setting(k, "Settings file", &path.display().to_string(), reveal));
     }
-    rows.push(row().w_full().min_h(52.0).px(18.0).py(12.0).gap(20.0).center_y()
-        .child(text("Version").font(label_style(k)).color(c.text_strong).grow(1.0))
-        .child(text(format!("Yoke {}", env!("CARGO_PKG_VERSION"))).font(help_style(k)).color(c.text_muted)));
+    rows.push(version_row(s, k));
     card(k, rows)
+}
+
+/// The version, and where updates stand: the installed app checks GitHub Releases at launch
+/// and every few hours (`updater`); a build run from source doesn't update itself.
+fn version_row(s: &App, k: &Kit) -> El {
+    use crate::updater::Status;
+    let installed = crate::updater::bundle().is_some();
+    let status = match &s.update.status {
+        _ if !installed => "Updates come to the installed app, not a build run from source.".to_owned(),
+        Status::Idle => "Checks for updates at launch and every few hours.".to_owned(),
+        Status::Checking => "Checking for updates…".to_owned(),
+        Status::UpToDate => "Up to date.".to_owned(),
+        Status::Installing(v) => format!("Installing Yoke {v}…"),
+        Status::Ready(v) => format!("Yoke {v} is installed. Restart to use it."),
+        Status::Failed(e) => format!("Couldn't update: {e}"),
+    };
+    let mut r = row().w_full().min_h(52.0).px(18.0).py(12.0).gap(20.0).center_y()
+        .child(col().grow(1.0).min_w(0.0).gap(2.0)
+            .child(text(format!("Yoke {}", env!("CARGO_PKG_VERSION"))).font(label_style(k)).color(k.c.text_strong))
+            .child(text(status).font(help_style(k)).color(k.c.text_muted).wrap()));
+    let idle = !matches!(s.update.status, Status::Checking | Status::Installing(_) | Status::Ready(_));
+    if installed && idle {
+        r = r.child(Button::new("Check now")
+            .variant(ButtonVariant::Outline)
+            .control_size(ControlSize::Small)
+            .on_press(|s: &mut App| s.check_for_update())
+            .build(k)
+            .key("update-check"));
+    }
+    r
 }
 
 fn label_style(k: &Kit) -> TextStyle {

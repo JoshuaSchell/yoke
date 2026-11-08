@@ -1,9 +1,13 @@
 # Builds Yoke for Apple silicon and publishes it.
 #
-# - A tag like v0.2.0 (matching Cargo.toml's version) tests, packages the .dmg and publishes a
-#   GitHub Release with it attached.
-# - Run by hand (Actions › Release › Run workflow), it builds the .dmg as a workflow artifact
-#   and publishes nothing: a dry run.
+# - A tag like v0.2.0 (matching Cargo.toml's version) tests, packages and publishes a GitHub
+#   Release with the .dmg (to install), Yoke_<version>_aarch64.app.tar.gz (the update bundle,
+#   signed) and latest.json (what the installed app reads to find it; src/updater.rs).
+# - Run by hand (Actions › Release › Run workflow), it builds the same files as a workflow
+#   artifact and publishes nothing: a dry run.
+#
+# Signing needs the repo secrets CARGO_PACKAGER_SIGN_PRIVATE_KEY and
+# CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD, the private half of assets/updater.pub.
 name: Release
 
 on:
@@ -22,10 +26,12 @@ jobs:
       - name: Rust (the version rust-toolchain.toml pins)
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Version, from Cargo.toml
+        run: echo "VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')" >> "$GITHUB_ENV"
       - name: The tag matches Cargo.toml's version
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          version=$VERSION
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml's version $version"
             exit 1
@@ -33,18 +39,46 @@ jobs:
       - run: cargo test --locked
       - name: cargo-packager
         run: cargo install cargo-packager --locked --version 0.11.8
-      - name: Package (Yoke.app and the .dmg, ad-hoc signed)
+      - name: Package (Yoke.app and the .dmg, ad-hoc signed; the update bundle, key-signed)
+        env:
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
         run: cargo packager --release
+      - name: The update bundle and latest.json
+        run: |
+          cd target/release
+          bundle="Yoke_${VERSION}_aarch64.app.tar.gz"
+          if [ ! -f Yoke.app.tar.gz.sig ]; then
+            echo "::error::No signed update bundle: are the CARGO_PACKAGER_SIGN_PRIVATE_KEY secrets set?"
+            exit 1
+          fi
+          mv Yoke.app.tar.gz "$bundle"
+          mv Yoke.app.tar.gz.sig "$bundle.sig"
+          python3 - "$bundle" <<'PY'
+          import datetime, json, os, sys
+          bundle, version = sys.argv[1], os.environ["VERSION"]
+          url = f"https://github.com/JoshuaSchell/yoke/releases/download/v{version}/{bundle}"
+          json.dump({
+              "version": version,
+              "notes": f"Yoke {version}",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": {"macos-aarch64": {"url": url, "signature": open(bundle + ".sig").read().strip(), "format": "app"}},
+          }, open("latest.json", "w"), indent=2)
+          PY
+          cat latest.json
       - uses: actions/upload-artifact@v4
         with:
           name: Yoke-macos-aarch64
-          path: target/release/*.dmg
+          path: |
+            target/release/*.dmg
+            target/release/*.app.tar.gz
+            target/release/latest.json
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" target/release/*.dmg \
+          gh release create "$GITHUB_REF_NAME" target/release/*.dmg target/release/*.app.tar.gz target/release/latest.json \
             --title "Yoke ${GITHUB_REF_NAME#v}" \
             --generate-notes \
             --notes "For Apple silicon Macs. Open the .dmg and drag Yoke to Applications. Yoke isn't notarized yet, so the first time, right-click it and choose Open."

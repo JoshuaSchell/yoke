@@ -12,6 +12,7 @@ mod history;
 mod picker;
 mod settings;
 mod store;
+mod updater;
 mod worktree;
 mod shortcuts;
 mod ui;
@@ -58,6 +59,10 @@ fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     // Plan limits are read again every few minutes, and "resets in 12m" moves on; an idle
     // window still draws nothing in between.
     if s.usage_tick(std::time::SystemTime::now()) {
+        changed = true;
+    }
+    // An installed app looks for an update at launch and every few hours.
+    if s.update_tick() {
         changed = true;
     }
     tx.wake_after(Duration::from_secs(60));

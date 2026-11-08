@@ -128,6 +128,8 @@ pub struct App {
     pub open_menu: Option<&'static str>,
     /// The model picker's search, rail and favorites (`picker`).
     pub picker: crate::picker::Picker,
+    /// Updates from GitHub Releases (`updater`).
+    pub update: crate::updater::Updater,
     /// Settings (⌘,) fills the main pane instead of the thread.
     pub settings: bool,
     /// The page Settings shows.
@@ -210,7 +212,7 @@ pub struct App {
     worktrees: Receiver<(ThreadId, Result<Worktree, String>)>,
     worktrees_tx: Sender<(ThreadId, Result<Worktree, String>)>,
     discover_tx: Sender<(Harness, Vec<ModelOpt>)>,
-    waker: Option<Waker>,
+    pub(crate) waker: Option<Waker>,
     running: HashMap<ThreadId, Running>,
     /// Threads whose turn just ended with queued messages to send next.
     ready: Vec<ThreadId>,
@@ -503,6 +505,7 @@ impl App {
             beat: 0,
             keys: Keys::load(&prefs),
             picker: crate::picker::Picker::load(&prefs),
+            update: crate::updater::Updater::default(),
             store: store::dir(&prefs),
             worktree_mode: prefs.get(WORKTREE_KEY).unwrap_or(false),
             worktrees,
