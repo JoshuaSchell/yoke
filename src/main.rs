@@ -110,6 +110,10 @@ const SCENES: &[Scene] = &[
     ("skills", app::scenes::skills),
     ("agents", app::scenes::agents),
     ("background", app::scenes::background),
+    ("resume", app::scenes::resume),
+    ("background-bar", app::scenes::background_bar),
+    ("agent-view", app::scenes::agent_view),
+    ("agent-view-resumed", app::scenes::agent_view_resumed),
     ("wake", app::scenes::wake),
     ("steer", app::scenes::steer),
     ("stop-background", app::scenes::stop_background),
@@ -1427,6 +1431,207 @@ mod tests {
         assert!(!said.contains("SLOW_DONE") && said.contains("STARTED"), "{said}");
         assert!(t.items.iter().all(|i| !matches!(&i.kind, Kind::Tool { .. })), "no subagent row in the conversation");
         assert!(!t.has_background() && !t.busy);
+    }
+
+    /// The cards of every run of one agent, oldest first: (call, resumed, its rows' words).
+    fn runs_of(t: &crate::app::Thread, task: &str) -> Vec<(String, bool, Vec<String>)> {
+        t.runs(task).iter().map(|a| (a.call.clone(), a.resumed, a.items.iter().map(|i| match &i.kind {
+            Kind::Tool { name, detail, .. } => format!("{name}: {detail}"),
+            Kind::Assistant { text, .. } => text.clone(),
+            Kind::Agents(g) => format!("agents: {}", g.iter().map(|a| a.description.as_str()).collect::<Vec<_>>().join(", ")),
+            _ => "other".into(),
+        }).collect())).collect()
+    }
+
+    /// An agent resumed with `SendMessage` (2.1.319): the resume is a card of its own at the
+    /// foot of the conversation, its run's work goes there (though the CLI marks those lines
+    /// with the first `Agent` call), the first card says it was resumed, and the second run's
+    /// progress, time and end are its own.
+    #[test]
+    fn a_resumed_agent_gets_a_card_where_it_was_resumed() {
+        use crate::app::{AgentStatus, scenes};
+        let (agent, first, resume) = ("a1cf368fa2a708ef5", "toolu_01NTAtgnsJaDz3L25Rd9Fj6u", "toolu_01VqSccapNG4bawJZhZqDZJt");
+        let mut app = new_app();
+        let lines: Vec<&str> = scenes::RESUME.lines().collect();
+        // Up to the second run's Bash call, before it has finished.
+        let bash = lines.iter().position(|l| l.contains("echo TWO\"") && l.contains("\"type\":\"assistant\"")).unwrap();
+        let id = scenes::play(&mut app, "resume", scenes::RESUME, bash + 3);
+        let t = app.thread_mut(id).unwrap();
+        let runs = runs_of(t, agent);
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!((runs[0].0.as_str(), runs[0].1), (first, false));
+        assert_eq!((runs[1].0.as_str(), runs[1].1), (resume, true));
+        assert_eq!(runs[0].2, ["Bash: sleep 5; echo ONE", "ONE"], "the first run keeps its own work");
+        assert_eq!(runs[1].2, ["Bash: sleep 5; echo TWO"], "the resumed run's work is on its card");
+        assert!(t.items.iter().all(|i| !matches!(&i.kind, Kind::Tool { name, .. } if name == "SendMessage")), "no plain SendMessage row");
+        // The resume's card comes after the first turn's: where the SendMessage was made.
+        let at = |call: &str| t.items.iter().position(|i| matches!(&i.kind, Kind::Agents(g) if g.iter().any(|a| a.call == call))).unwrap();
+        assert!(at(resume) > at(first) + 3, "{} vs {}", at(resume), at(first));
+        let cards = t.runs(agent);
+        let (old, new) = (cards[0], cards[1]);
+        assert!(t.resumed_since(old) && !t.resumed_since(new));
+        assert_eq!(old.status(t.task_for(&old.call)), AgentStatus::Completed);
+        assert_eq!(new.status(t.task_for(&new.call)), AgentStatus::Background);
+        assert_eq!(new.description, "Echo helper");
+        assert_eq!(new.asked(t.task_for(&new.call)).as_deref(), Some("Run the Bash command `sleep 5; echo TWO` and reply with its output only."));
+        assert_eq!(crate::ui::agents::detail(new, t.task_for(&new.call)).as_deref(), Some("Running Sleep 5 seconds then echo TWO"), "its own progress line");
+        assert_eq!(new.model.as_deref(), Some("claude-haiku-5-5"));
+        assert_eq!(t.task(agent).and_then(|x| x.call.as_deref()), Some(resume), "the background line's task is the latest run");
+
+        // The rest: the run ends on its own card.
+        let mut p = crate::harness::ParseState::default();
+        for line in &lines[..bash + 3] { crate::harness::claude::parse(&serde_json::from_str(line).unwrap(), &mut p); }
+        for line in &lines[bash + 3..] {
+            for e in crate::harness::claude::parse(&serde_json::from_str(line).unwrap(), &mut p) { app.apply(id, e); }
+        }
+        let t = app.thread_mut(id).unwrap();
+        let runs = runs_of(t, agent);
+        assert_eq!(runs[1].2, ["Bash: sleep 5; echo TWO", "TWO"]);
+        assert_eq!(runs[0].2.len(), 2, "nothing went to the first card");
+        let new = t.runs(agent)[1];
+        assert_eq!(new.status(t.task_for(&new.call)), AgentStatus::Completed);
+        assert_eq!(new.report(t.task_for(&new.call)), "TWO", "its report, not the SendMessage's \"Resuming agent\"");
+        assert!(t.items.iter().any(|i| matches!(&i.kind, Kind::Wake(w) if w == "Echo helper finished")));
+    }
+
+    /// An agent that starts one of its own and resumes it (2.1.319): the inner agent's card
+    /// is inside the outer's, and its resumed run is a second card there, where the outer
+    /// agent's SendMessage was, with that run's work on it.
+    #[test]
+    fn a_subagents_own_agents_nest_and_resume_inside_it() {
+        use crate::app::scenes;
+        let (outer, inner) = ("a5943f3b3913e0cfb", "abe546a24f5ce04f7");
+        let mut app = new_app();
+        let id = scenes::play(&mut app, "nested", scenes::NESTED, usize::MAX);
+        let t = app.thread_mut(id).unwrap();
+        let top: Vec<&str> = t.items.iter().filter_map(|i| match &i.kind { Kind::Agents(g) => Some(g.iter().map(|a| a.description.as_str())), _ => None }).flatten().collect();
+        assert_eq!(top, ["Outer helper"], "only the outer agent in the conversation");
+        let o = runs_of(t, outer);
+        assert_eq!(o.len(), 1);
+        assert_eq!(o[0].2.iter().filter(|r| r.starts_with("agents: Inner helper")).count(), 2, "the inner agent's two runs, in the outer's card: {:?}", o[0].2);
+        assert!(!o[0].2.iter().any(|r| r.starts_with("SendMessage")), "{:?}", o[0].2);
+        let i = runs_of(t, inner);
+        assert_eq!(i.iter().map(|r| r.1).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(i[0].2, ["Bash: echo ONE"]);
+        assert_eq!(i[1].2, ["Bash: sleep 3; echo TWO", "TWO"]);
+        let resumed = t.runs(inner)[1];
+        assert_eq!(resumed.asked(t.task_for(&resumed.call)).as_deref(), Some("Run the Bash command `sleep 3; echo TWO` and reply with its output only."));
+        assert_eq!(resumed.report(t.task_for(&resumed.call)), "TWO");
+    }
+
+    /// Pressing a card opens its agent over the thread: its header, its runs and their rows.
+    /// The thread stays laid out underneath, out of reach, and Esc (or Back) goes back to it
+    /// scrolled where it was. The background line's entry opens the same agent.
+    #[test]
+    fn an_agent_opens_over_the_thread_and_esc_goes_back_where_it_was() {
+        use crate::app::scenes;
+        let mut app = new_app();
+        scenes::resume(&mut app);
+        let mut rt = headless(app);
+        for _ in 0..10 { rt.frame(1.0 / 60.0); }
+        // How far the conversation's rows are scrolled.
+        let scrolled = |rt: &Runtime<App>| rt.elements().iter().find(|e| e.key.as_deref() == Some("rows-120")).map(|e| e.scrolled[1]).unwrap();
+        let bottom = scrolled(&rt);
+        let t = rt.elements().into_iter().find(|e| e.key.as_deref() == Some("transcript")).unwrap();
+        rt.wheel(t.rect[0] + t.rect[2] / 2.0, t.rect[1] + 200.0, 60.0);
+        for _ in 0..30 { rt.frame(1.0 / 60.0); }
+        let before = scrolled(&rt);
+        assert!(before < bottom - 40.0, "scrolled up from the foot: {before} vs {bottom}");
+        let card = rt.elements().into_iter().rfind(|e| e.label.as_deref() == Some("Open Echo helper") && e.path.contains("/transcript/") && e.visible[3] > 0.0).expect("the resumed card");
+        let (x, y) = (card.rect[0] + 40.0, card.rect[1] + card.rect[3] / 2.0);
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        for _ in 0..3 { rt.frame(1.0 / 60.0); }
+        assert_eq!(rt.state.agent_view.len(), 1, "the card opened its agent");
+        let shown = |rt: &Runtime<App>, s: &str| rt.elements().iter().any(|e| !e.inert && e.opacity > 0.0 && e.text.as_deref().is_some_and(|t| t.contains(s)));
+        assert!(shown(&rt, "Back to Start a background agent"));
+        assert!(shown(&rt, "Resumed") && shown(&rt, "sleep 5; echo TWO") && shown(&rt, "sleep 5; echo ONE"), "both runs");
+        assert!(shown(&rt, "2 runs"));
+        let composer_inert = |rt: &Runtime<App>| rt.elements().iter().find(|e| e.key.as_deref() == Some("composer-dock")).map(|e| e.inert).unwrap();
+        assert!(composer_inert(&rt), "the composer is under it, out of reach");
+        assert!(rt.elements().iter().any(|e| e.key.as_deref() == Some("transcript")), "the thread is still laid out");
+        rt.key(key(Key::Escape));
+        for _ in 0..3 { rt.frame(1.0 / 60.0); }
+        assert!(rt.state.agent_view.is_empty());
+        assert!((scrolled(&rt) - before).abs() < 1.0, "back where it was: {} vs {before}", scrolled(&rt));
+        assert!(!composer_inert(&rt), "the composer is back");
+        // The background line's entry opens it too, and Back goes back.
+        let id = rt.state.selected.unwrap();
+        rt.update(|s, _| s.open_agent_task(id, "a1cf368fa2a708ef5"));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.agent_view.len(), 1);
+        rt.update(|s, _| { s.close_agent(); });
+        assert!(rt.state.agent_view.is_empty() && rt.state.draft.focused);
+    }
+
+    /// A resume of an agent this thread has no card for (it was first started in an earlier
+    /// session): the resumed run's lines name a call nothing here made, and still go to its
+    /// card, by the `meta.json` Claude Code keeps beside the agent's transcript, or without
+    /// one, as the running resume's whose first call isn't known. Its view reads the earlier
+    /// run back from the saved transcript.
+    #[test]
+    fn a_resume_from_an_earlier_session_finds_its_lines_and_its_first_run() {
+        use crate::app::scenes;
+        let (agent, first) = ("a1cf368fa2a708ef5", "toolu_01NTAtgnsJaDz3L25Rd9Fj6u");
+        let lines: Vec<&str> = scenes::RESUME.lines().collect();
+        let third = lines.iter().enumerate().filter(|(_, l)| l.contains("\"subtype\":\"init\"")).nth(2).unwrap().0;
+        let later = lines[third..].join("\n");
+        let home = std::env::temp_dir().join(format!("yoke-resume-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let dir = crate::history::subagents_dir(&home, std::path::Path::new("/demo/api-client"), "b3e8d341-df40-4c75-bd4b-9618adf95ec5");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("agent-{agent}.meta.json")), format!(r#"{{"description":"Echo helper","toolUseId":"{first}"}}"#)).unwrap();
+        let saved = [
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"Run the Bash command `sleep 5; echo ONE` and reply with its output only."}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"sleep 5; echo ONE"}}]}}"#,
+            r#"{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","tool_use_id":"b1","content":"ONE"}]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-5-5","content":[{"type":"text","text":"ONE"}]}}"#,
+            r#"{"type":"user","isSidechain":true,"origin":{"kind":"coordinator"},"message":{"role":"user","content":"The coordinator sent a message while you were working:\nRun the Bash command `sleep 5; echo TWO` and reply with its output only.\n\nAddress this before completing your current task."}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"b2","name":"Bash","input":{"command":"sleep 5; echo TWO"}}]}}"#,
+        ].join("\n");
+        std::fs::write(dir.join(format!("agent-{agent}.jsonl")), saved).unwrap();
+        for with_meta in [true, false] {
+            let mut app = new_app();
+            if with_meta { app.claude_home = Some(home.clone()); }
+            let id = scenes::play(&mut app, "send it another", &later, usize::MAX);
+            let t = app.thread_mut(id).unwrap();
+            let runs = runs_of(t, agent);
+            assert_eq!(runs.len(), 1, "{runs:?}");
+            assert!(runs[0].1, "a resume");
+            assert_eq!(runs[0].2, ["Bash: sleep 5; echo TWO", "TWO"], "with meta.json: {with_meta}");
+            assert_eq!(t.agent_calls.get(first).map(String::as_str), Some(agent));
+            if with_meta {
+                let card = t.runs(agent)[0].id;
+                app.open_agent(id, card);
+                let v = app.agent_view.last().unwrap();
+                assert_eq!(v.earlier.len(), 1, "the run before, from the saved transcript");
+                assert_eq!(v.earlier[0].0.as_deref(), Some("Run the Bash command `sleep 5; echo ONE` and reply with its output only."));
+                assert_eq!(v.earlier[0].1.len(), 2, "its Bash row and its reply");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A subagent's tool waiting for approval shows under its card in the conversation, so it
+    /// can be answered without opening the agent, and in the agent's view where it is.
+    #[test]
+    fn a_subagents_approval_shows_on_its_card_and_in_its_view() {
+        use crate::harness::{AskRequest, Event, ToolBody};
+        let mut app = new_app();
+        let id = crate::app::scenes::play(&mut app, "agent", "", 0);
+        let sub = |e: Event| Event::Sub { parent: "a1".into(), event: Box::new(e) };
+        app.apply(id, Event::ToolStart { id: "a1".into(), name: "Agent".into(), detail: "Tidy up".into(), body: ToolBody::None });
+        app.apply(id, sub(Event::ToolStart { id: "b1".into(), name: "Bash".into(), detail: "rm -rf build".into(), body: ToolBody::None }));
+        app.apply(id, Event::Ask(AskRequest { request_id: "r1".into(), tool_use_id: Some("b1".into()), tool: "Bash".into(), input: serde_json::json!({"command": "rm -rf build"}), suggestions: Vec::new(), reason: None }));
+        let mut rt = headless(app);
+        let allow_shown = |rt: &Runtime<App>| rt.elements().iter().any(|e| e.key.as_deref() == Some("allow") && !e.inert && e.visible[3] > 0.0);
+        assert!(allow_shown(&rt), "under the card");
+        let card = rt.state.thread().unwrap().cards()[0].id;
+        rt.update(|s, _| s.open_agent(id, card));
+        rt.frame(1.0 / 60.0);
+        assert!(allow_shown(&rt), "in its view");
+        assert!(rt.elements().iter().any(|e| e.key.as_deref() == Some("allow") && e.path.contains("agent-view")));
     }
 
     /// A background command (2.1.319): the turn ends with its result while the command runs,

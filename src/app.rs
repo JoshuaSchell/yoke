@@ -242,6 +242,9 @@ pub struct App {
     settled_by_hand: HashMap<String, bool>,
     /// The thread the delete dialog asks about (the row's ✕, or ⇧⌘⌫).
     pub confirm_delete: Option<ThreadId>,
+    /// Agents opened over the selected thread, after T3 Code's subagent threads: the last is
+    /// the one showing (one opened from another's view goes on top of it). Esc goes back.
+    pub agent_view: Vec<AgentView>,
     /// A stop waiting on "Stop background work?": what would end work the thread's process
     /// still runs in the background (`StopWhat`), and the thread (0 for quitting).
     pub confirm_stop: Option<(ThreadId, StopWhat)>,
@@ -294,6 +297,18 @@ pub struct App {
     /// Threads whose turn just ended with queued messages to send next.
     ready: Vec<ThreadId>,
     next_id: u64,
+}
+
+/// An agent opened in the main pane: every run of it, live.
+pub struct AgentView {
+    pub thread: ThreadId,
+    /// The card it was opened from, which finds it while its id isn't known yet.
+    pub card: u64,
+    /// The agent's id, which finds every run of it.
+    pub task: Option<String>,
+    /// Runs it made before any this thread has a card for (it was first started in an earlier
+    /// process or session and resumed in this one), read from its saved transcript.
+    pub earlier: Vec<(Option<String>, Vec<Item>)>,
 }
 
 /// Something a thread did that the person would want to hear about when away.
@@ -540,6 +555,10 @@ pub struct Thread {
     /// Why the queue's next message doesn't go on its own (it would restart the CLI, ending
     /// its background work): its ↗ asks.
     pub held: Option<String>,
+    /// Tool calls that refer to a subagent, by call: the `Agent` call that started it, each
+    /// `SendMessage` that resumed it, and the id its lines carry when nothing else said. The
+    /// value is the agent's id (its task's), the same across its runs.
+    pub agent_calls: HashMap<String, String>,
 }
 
 /// A question from the CLI, shown on the row (`item`) of the tool it's about.
@@ -588,6 +607,7 @@ impl Thread {
             cost_seen: None,
             woken: false,
             held: None,
+            agent_calls: HashMap::new(),
         }
     }
 
@@ -633,6 +653,98 @@ impl Thread {
         row.rev += 1;
         let Kind::Agents(g) = &mut row.kind else { return None };
         find_agent_mut(g, call)
+    }
+
+    /// Every subagent card (each run of each agent), in transcript order, those inside other
+    /// agents' cards after their parent's.
+    pub fn cards(&self) -> Vec<&Agent> {
+        fn walk<'a>(items: &'a [Item], out: &mut Vec<&'a Agent>) {
+            for i in items {
+                if let Kind::Agents(g) = &i.kind {
+                    for a in g {
+                        out.push(a);
+                        walk(&a.items, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.items, &mut out);
+        out
+    }
+
+    /// The card with id `id`.
+    pub fn card(&self, id: u64) -> Option<&Agent> {
+        self.cards().into_iter().find(|a| a.id == id)
+    }
+
+    /// Every run of agent `task`, oldest first.
+    pub fn runs(&self, task: &str) -> Vec<&Agent> {
+        self.cards().into_iter().filter(|a| a.task.as_deref() == Some(task)).collect()
+    }
+
+    /// The agent tool call `call` refers to: the `Agent` call that started it, a `SendMessage`
+    /// that resumed it, or (once seen) the id its lines carry.
+    pub fn agent_of(&self, call: &str) -> Option<String> {
+        if let Some(id) = self.agent_calls.get(call) { return Some(id.clone()); }
+        self.cards().into_iter().find(|a| a.call == call).and_then(|a| a.task.clone())
+    }
+
+    /// Whether a run of `a`'s agent came after it (a `SendMessage` resumed it since).
+    pub fn resumed_since(&self, a: &Agent) -> bool {
+        let Some(task) = a.task.as_deref() else { return false };
+        self.runs(task).last().is_some_and(|last| last.id != a.id)
+    }
+
+    /// The call of the run a subagent's line with `parent_tool_use_id` `parent` belongs to.
+    /// Claude Code marks a resumed agent's lines with the `Agent` call that first started it,
+    /// so they go to its latest run's card, the one its resume made, not the first.
+    fn run_for(&mut self, parent: &str) -> String {
+        let task = self.agent_of(parent).or_else(|| self.adopt(parent));
+        task.and_then(|id| self.runs(&id).last().map(|a| a.call.clone())).unwrap_or_else(|| parent.to_owned())
+    }
+
+    /// Lines from a call nothing here knows: a resumed agent first started before this thread
+    /// had its transcript (whose `meta.json` wasn't there to say). They're the running resumed
+    /// agent's whose first call isn't known, the latest if there are several.
+    fn adopt(&mut self, parent: &str) -> Option<String> {
+        let cards = self.cards();
+        if cards.iter().any(|a| a.call == parent) { return None; }
+        let origin_known = |task: &str| cards.iter().any(|a| a.task.as_deref() == Some(task) && !a.resumed)
+            || self.agent_calls.iter().any(|(c, id)| id == task && !cards.iter().any(|a| a.call == *c));
+        let task = cards.iter().rev()
+            .filter(|a| a.resumed && self.task_for(&a.call).is_some_and(Task::running))
+            .filter_map(|a| a.task.clone())
+            .find(|task| !origin_known(task))?;
+        self.agent_calls.insert(parent.to_owned(), task.clone());
+        Some(task)
+    }
+
+    /// Tool call `call` resumed an agent (its task says so): its row becomes that agent's new
+    /// run, a card of its own where the call was made. `fresh` is an id for the card.
+    fn make_run(&mut self, call: &str, fresh: u64) {
+        let Some(task) = self.task_for(call).filter(|x| x.kind == TaskKind::Agent).cloned() else { return };
+        // The model is reported once per agent: its earlier run's.
+        let model = self.runs(&task.id).iter().rev().find_map(|a| a.model.clone());
+        let Some(row) = find_tool_mut(&mut self.items, call) else { return };
+        let Kind::Tool { state, output, .. } = &mut row.kind else { return };
+        let mut a = Agent::new(fresh, call.to_owned(), task.description.clone(), *state);
+        a.output = std::mem::take(output);
+        a.task = Some(task.id.clone());
+        a.resumed = true;
+        a.model = model;
+        row.kind = Kind::Agents(vec![a]);
+        row.rev += 1;
+        // The card it resumes says so.
+        self.bump_runs(&task.id);
+    }
+
+    /// Bumps the rows showing any run of agent `task`.
+    fn bump_runs(&mut self, task: &str) {
+        fn has(k: &Kind, task: &str) -> bool {
+            matches!(k, Kind::Agents(g) if g.iter().any(|a| a.task.as_deref() == Some(task) || a.items.iter().any(|i| has(&i.kind, task))))
+        }
+        for row in self.items.iter_mut().filter(|i| has(&i.kind, task)) { row.rev += 1; }
     }
 }
 
@@ -732,7 +844,7 @@ fn add_to(items: &mut Vec<Item>, e: Event, fresh: u64) {
             end_stream_in(items);
             if find_tool_mut(items, &call).is_some() { return; }
             if agent_tool(&name) {
-                let agent = Agent { id: fresh + 1, call, description: detail, state: ToolState::Running, output: String::new(), items: Vec::new() };
+                let agent = Agent::new(fresh + 1, call, detail, ToolState::Running);
                 match items.last_mut() {
                     Some(Item { kind: Kind::Agents(g), rev, .. }) => {
                         g.push(agent);
@@ -806,11 +918,14 @@ pub enum Kind {
     TurnEnd { secs: f64, cost_usd: Option<f64>, stopped: bool },
 }
 
-/// A subagent the agent started (an `Agent`, formerly `Task`, tool call), with its own text and
-/// tool calls, which never go into the main conversation.
+/// One run of a subagent: the `Agent` (formerly `Task`) tool call that started it, or a
+/// `SendMessage` call that resumed it (`resumed`), with its own text and tool calls, which never
+/// go into the main conversation. An agent resumed twice has three runs, each a card where its
+/// call was made; they share the agent's id (`task`), which is how its view finds them all.
 pub struct Agent {
-    /// Its card's own id, for opening it (`App::expanded`).
+    /// Its card's own id, for opening it (`App::open_agent`).
     pub id: u64,
+    /// The tool call this run is: the `Agent` call, or the `SendMessage` that resumed it.
     pub call: String,
     /// What the agent was asked to do, in a few words (the call's `description`).
     pub description: String,
@@ -820,6 +935,21 @@ pub struct Agent {
     pub output: String,
     /// Its text and tool rows, as the conversation's own are.
     pub items: Vec<Item>,
+    /// The agent's id (Claude Code's `task_id`, the `agentId` of its transcript), once known:
+    /// the same for every run of it.
+    pub task: Option<String>,
+    /// A later run, started by a `SendMessage` to the agent rather than by an `Agent` call.
+    pub resumed: bool,
+    /// What it was asked this run, when it isn't in a live task (a saved session's).
+    pub prompt: Option<String>,
+    /// The model its replies came from, once one has.
+    pub model: Option<String>,
+}
+
+impl Agent {
+    pub fn new(id: u64, call: String, description: String, state: ToolState) -> Agent {
+        Agent { id, call, description, state, output: String::new(), items: Vec::new(), task: None, resumed: false, prompt: None, model: None }
+    }
 }
 
 /// Whether a tool call starts a subagent.
@@ -940,8 +1070,34 @@ impl Agent {
         if let Some(s) = task.and_then(|t| t.summary.as_deref()).filter(|s| !s.trim().is_empty()) {
             return s.trim().to_owned();
         }
+        // A resume's call answers "Resuming agent …" at once: not what the agent found.
+        if self.resumed && (self.output.trim_start().starts_with('{') || self.output.starts_with("Resum")) { return String::new(); }
         agent_report(&self.output)
     }
+
+    /// What it was asked this run: its task's prompt, else the one saved with it; for a
+    /// resume, the message without the frame the CLI puts round it.
+    pub fn asked(&self, task: Option<&Task>) -> Option<String> {
+        let p = task.and_then(|x| x.prompt.as_deref()).or(self.prompt.as_deref())?;
+        let p = if self.resumed { resume_text(p) } else { p.trim().to_owned() };
+        (!p.is_empty()).then_some(p)
+    }
+}
+
+/// The message that resumed an agent, without the frame Claude Code wraps it in: the
+/// `<agent-message from=…>` tags of one from another agent, or "The coordinator sent a message
+/// while you were working:" and its closing advice.
+pub fn resume_text(text: &str) -> String {
+    let t = text.trim();
+    if let Some(open) = t.find("<agent-message") && let Some(gt) = t[open..].find('>') {
+        let body = &t[open + gt + 1..];
+        return body.split("</agent-message>").next().unwrap_or(body).trim().to_owned();
+    }
+    if t.starts_with("The coordinator sent a message") || t.starts_with("Another Claude session sent a message") {
+        let body = t.split_once('\n').map_or("", |(_, rest)| rest);
+        return body.split("\n\nAddress this before").next().unwrap_or(body).trim().to_owned();
+    }
+    t.to_owned()
 }
 
 /// An `Agent` call's result as the person would read it: the subagent's report, without the
@@ -1083,6 +1239,7 @@ impl App {
             settled_by_hand,
             confirm_delete: None,
             confirm_stop: None,
+            agent_view: Vec::new(),
             quit_ok: false,
             confirm_trust: None,
             trusted,
@@ -1697,6 +1854,7 @@ impl App {
 
     /// ⌘N: the new-thread screen, with the composer back on the new-thread defaults.
     pub fn new_thread(&mut self) {
+        self.agent_view.clear();
         self.close_settings();
         self.usage_open = false;
         self.selected = None;
@@ -1931,6 +2089,8 @@ impl App {
     }
 
     pub fn select(&mut self, id: ThreadId) {
+        // Choosing a thread (the open one too) shows it, not an agent opened over it.
+        self.agent_view.clear();
         self.close_settings();
         self.usage_open = false;
         self.selected = Some(id);
@@ -2532,6 +2692,79 @@ impl App {
         changed
     }
 
+    /// Opens the agent whose card is `card` in thread `thread` over it: all its runs, live.
+    pub fn open_agent(&mut self, thread: ThreadId, card: u64) {
+        let Some(t) = self.threads.iter().find(|t| t.id == thread) else { return };
+        let Some(a) = t.card(card) else { return };
+        let task = a.task.clone().or_else(|| t.task_for(&a.call).filter(|x| x.kind == TaskKind::Agent).map(|x| x.id.clone()));
+        // Its first runs happened somewhere this thread has no card for: its saved transcript has
+        // them, and the runs here are its last.
+        let saved = task.as_deref().and_then(|id| {
+            let runs = t.runs(id);
+            let dir = self.subagents_dir(t).filter(|_| runs.first().is_some_and(|r| r.resumed))?;
+            let mut saved = history::agent_runs(&dir, id);
+            saved.truncate(saved.len().saturating_sub(runs.len()));
+            Some(saved)
+        }).unwrap_or_default();
+        let mut earlier = Vec::new();
+        for r in saved {
+            let mut items = Vec::new();
+            for mut kind in r.rows {
+                let id = self.id();
+                let mut next = self.next_id;
+                history::number(&mut kind, &mut next);
+                self.next_id = next;
+                items.push(Item { id, rev: 0, kind });
+            }
+            earlier.push((r.prompt, items));
+        }
+        if self.selected != Some(thread) { self.select(thread); }
+        self.close_settings();
+        self.usage_open = false;
+        self.open_menu = None;
+        self.draft.focused = false;
+        // Opened again from its own view (a nested card of the same agent): no new layer.
+        if self.agent_view.last().is_some_and(|v| v.thread == thread && v.task.is_some() && v.task == task) { return; }
+        self.agent_view.push(AgentView { thread, card, task, earlier });
+    }
+
+    /// Opens agent `task`'s latest run (the background line's entries).
+    pub fn open_agent_task(&mut self, thread: ThreadId, task: &str) {
+        let card = self.threads.iter().find(|t| t.id == thread).and_then(|t| t.runs(task).last().map(|a| a.id)
+            .or_else(|| t.task(task).and_then(|x| x.call.as_deref()).and_then(|c| t.cards().into_iter().find(|a| a.call == c)).map(|a| a.id)));
+        if let Some(card) = card { self.open_agent(thread, card); }
+    }
+
+    /// Back from the agent showing: to the one it was opened from, or the thread, where it was.
+    pub fn close_agent(&mut self) -> bool {
+        if self.agent_view.pop().is_none() { return false; }
+        if self.agent_view.is_empty() { self.draft.focused = true; }
+        true
+    }
+
+    /// The agent open over the selected thread, if one is.
+    pub fn open_agent_view(&self) -> Option<&AgentView> {
+        self.agent_view.last().filter(|v| Some(v.thread) == self.selected && !self.settings && !self.usage_open)
+    }
+
+    /// Where Claude Code keeps thread `t`'s subagents' transcripts
+    /// (`<session>/subagents/agent-<id>.jsonl`), when it has a session.
+    pub fn subagents_dir(&self, t: &Thread) -> Option<PathBuf> {
+        let home = self.claude_home.as_deref()?;
+        Some(history::subagents_dir(home, &self.run_dir(t)?, t.session.as_deref()?))
+    }
+
+    /// Agent `task` was resumed, but the `Agent` call that first started it isn't in the thread
+    /// (an earlier process or session made it): Claude Code's `meta.json` beside its transcript
+    /// names that call, which the resumed run's lines carry.
+    fn learn_first_call(&mut self, id: ThreadId, task: &str) {
+        let Some(t) = self.threads.iter().find(|t| t.id == id) else { return };
+        let runs = t.runs(task);
+        if runs.iter().any(|a| !a.resumed) || runs.is_empty() { return; }
+        let Some(first) = self.subagents_dir(t).and_then(|d| history::agent_first_call(&d, task)) else { return };
+        if let Some(t) = self.thread_mut(id) { t.agent_calls.entry(first).or_insert_with(|| task.to_owned()); }
+    }
+
     pub(crate) fn apply(&mut self, id: ThreadId, e: Event) {
         if matches!(e, Event::Ask(_) | Event::Done { .. } | Event::Exited { .. }) { self.wake(id); }
         if let Event::RateLimit(info) = &e {
@@ -2561,7 +2794,9 @@ impl App {
         // the background; or with the process, if it ended first. A turn the CLI started
         // itself has none of its own.
         let ends_diff = self.threads.iter().find(|t| t.id == id).is_some_and(|t| t.busy && !t.woken && (done || exited));
+        let agent = match &e { Event::TaskStarted(ts) if ts.kind == "local_agent" && !ts.ambient => Some(ts.id.clone()), _ => None };
         self.apply_to(id, e, selected, fresh);
+        if let Some(task) = agent { self.learn_first_call(id, &task); }
         if ends_diff { self.end_checkpoint(id); }
         if exited { self.keep(id); }
     }
@@ -2638,12 +2873,25 @@ impl App {
                 // unique within a turn).
                 let turn = turn_start(&t.items);
                 let mut rows = t.items.split_off(turn);
+                let call = match &e { Event::ToolStart { id, .. } => id.clone(), _ => String::new() };
                 add_to(&mut rows, e, fresh);
                 t.items.append(&mut rows);
+                // A resume whose task started first.
+                t.make_run(&call, fresh + 1);
             }
-            // A subagent's own text and tool calls go on its card.
+            // A subagent's own text and tool calls go on its card: its latest run's.
             Event::Sub { parent, event } => {
-                if let Some(a) = t.agent_mut(&parent) { add_to(&mut a.items, *event, fresh); }
+                let target = t.run_for(&parent);
+                let Some(a) = t.agent_mut(&target) else { return };
+                match *event {
+                    Event::Model(m) => { a.model = Some(m); }
+                    e => {
+                        let call = match &e { Event::ToolStart { id, .. } => Some(id.clone()), _ => None };
+                        add_to(&mut a.items, e, fresh);
+                        // A subagent resuming one of its own.
+                        if let Some(c) = call { t.make_run(&c, fresh + 1); }
+                    }
+                }
             }
             Event::Ask(ask) => {
                 end_stream(t);
@@ -2693,12 +2941,32 @@ impl App {
                     _ => TaskKind::Other,
                 };
                 if let Some(c) = &ts.call { t.bump_call(c); }
-                t.tasks.retain(|x| x.id != ts.id);
+                // A task the CLI announces again for the same call is the same run; a resumed
+                // agent's is a new run under the same id, and its last one is over.
+                t.tasks.retain(|x| !(x.id == ts.id && x.call == ts.call));
+                let now = Instant::now();
+                for x in t.tasks.iter_mut().filter(|x| x.id == ts.id && x.running()) {
+                    x.status = TaskStatus::Completed;
+                    x.ended = Some(now);
+                }
+                let call = ts.call.clone();
+                let task = ts.id.clone();
                 t.tasks.push(Task {
                     id: ts.id, call: ts.call, kind, description: ts.description, subagent_type: ts.subagent_type, prompt: ts.prompt,
                     parent: ts.parent_task, background: ts.background, status: TaskStatus::Running, progress: None, usage: None, summary: None,
-                    started: Instant::now(), ended: None,
+                    started: now, ended: None,
                 });
+                if kind == TaskKind::Agent && let Some(call) = call {
+                    t.agent_calls.insert(call.clone(), task.clone());
+                    // The card of the `Agent` call that started it, or the row of the
+                    // `SendMessage` that resumed it, which becomes this run's card.
+                    if let Some(a) = t.agent_mut(&call) {
+                        a.task = Some(task.clone());
+                    } else {
+                        t.make_run(&call, fresh + 1);
+                    }
+                    t.bump_runs(&task);
+                }
             }
             Event::TaskProgress { id: task, description, last_tool, usage } => {
                 let Some(x) = t.tasks.iter_mut().rev().find(|x| x.id == task) else { return };
@@ -3112,6 +3380,10 @@ pub mod scenes {
     /// Real Claude Code 2.1.319 streams (trimmed), for the subagent and background scenes.
     pub const SUBAGENTS: &str = include_str!("harness/fixtures/claude-subagents.jsonl");
     pub const BACKGROUND_BASH: &str = include_str!("harness/fixtures/claude-background-bash.jsonl");
+    /// A background agent, then the same agent resumed with `SendMessage` two turns later.
+    pub const RESUME: &str = include_str!("harness/fixtures/claude-resume.jsonl");
+    /// An agent that starts one of its own, then resumes it with `SendMessage`.
+    pub const NESTED: &str = include_str!("harness/fixtures/claude-nested-agents.jsonl");
 
     /// A new Claude thread in the demo, sent `prompt`, with the first `lines` lines of stream
     /// `file` applied as its CLI would send them. Tasks are given the times they took.
@@ -3142,13 +3414,10 @@ pub mod scenes {
         id
     }
 
-    /// Two subagents working: "Count files" done (opened, its own Bash row inside), "Slow echo"
-    /// in the background running its command.
+    /// Two subagents working: "Count files" done, "Slow echo" in the background running its
+    /// command.
     pub fn agents(s: &mut App) {
-        let id = play(s, "Count the files in /tmp with one subagent, and run a slow echo in another in the background.", SUBAGENTS, 53);
-        let t = s.thread_mut(id).unwrap();
-        let first = t.items.iter().find_map(|i| match &i.kind { Kind::Agents(g) => Some(g[0].id), _ => None }).unwrap();
-        s.expanded.insert(first);
+        play(s, "Count the files in /tmp with one subagent, and run a slow echo in another in the background.", SUBAGENTS, 53);
     }
 
     /// The turn over, "Slow echo" still at work: the turn's end says so, and above the composer
@@ -3157,6 +3426,91 @@ pub mod scenes {
         let id = play(s, "Count the files in /tmp with one subagent, and run a slow echo in another in the background.", SUBAGENTS, 70);
         s.apply(id, Event::Done { cost_usd: Some(0.0082), error: None });
         s.alerts.clear();
+    }
+
+    /// `file`'s first `lines` lines into a new thread, with the messages it answered: each
+    /// `(line, message)` is sent just before that line (the stream doesn't echo them).
+    pub fn play_turns(s: &mut App, sent: &[(usize, &str)], file: &str, lines: usize) -> ThreadId {
+        demo(s);
+        let id = 120;
+        let mut t = Thread::new(id, harness::first_line(sent[0].1, 60), Harness::Claude, models::DEFAULT.into());
+        t.project = PathBuf::from("/demo/api-client");
+        s.threads.insert(0, t);
+        s.selected = Some(id);
+        let mut p = harness::ParseState::default();
+        for (i, line) in file.lines().take(lines).enumerate() {
+            if let Some((_, m)) = sent.iter().find(|(at, _)| *at == i) {
+                let item = s.id();
+                let t = s.thread_mut(id).unwrap();
+                t.items.push(Item { id: item, rev: 0, kind: Kind::User((*m).into()) });
+                t.busy = true;
+                t.turn_started = Some(Instant::now());
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            for e in harness::claude::parse(&v, &mut p) {
+                // A turn as long as it took, not as long as the replay.
+                if matches!(e, Event::Done { .. }) && let Some(t) = s.thread_mut(id) { t.turn_started = Instant::now().checked_sub(Duration::from_secs(6)); }
+                s.apply(id, e);
+            }
+        }
+        s.alerts.clear();
+        // Each task as long as its usage says it ran.
+        let now = Instant::now();
+        for x in &mut s.thread_mut(id).unwrap().tasks {
+            if let Some(u) = x.usage { x.started = now.checked_sub(Duration::from_millis(u.duration_ms.max(1000))).unwrap_or(now); }
+            if x.ended.is_some() { x.ended = Some(now); }
+        }
+        id
+    }
+
+    /// Sets task `task`'s latest run going for `secs` (the scenes replay in no time).
+    fn ran_for(s: &mut App, id: ThreadId, task: &str, secs: u64) {
+        let t = s.thread_mut(id).unwrap();
+        if let Some(x) = t.tasks.iter_mut().rev().find(|x| x.id == task) {
+            x.started = Instant::now().checked_sub(Duration::from_secs(secs)).unwrap_or_else(Instant::now);
+        }
+    }
+
+    /// A background agent, then the same agent resumed with `SendMessage` two turns on, at work
+    /// in its resumed run: its card at the foot of the conversation, the first card saying it
+    /// was resumed below, and the background line above the composer.
+    pub fn resume(s: &mut App) {
+        let id = play_turns(s, &[
+            (0, "Start a background agent \u{201c}Echo helper\u{201d} that runs `sleep 5; echo ONE`."),
+            (37, "Now send the same helper another job: `sleep 5; echo TWO`."),
+        ], RESUME, 61);
+        ran_for(s, id, "a1cf368fa2a708ef5", 38 * 60 + 12);
+    }
+
+    /// `resume`, with a command in the background too: one line each, the agent's opening it.
+    pub fn background_bar(s: &mut App) {
+        resume(s);
+        let id = 120;
+        s.apply(id, Event::TaskStarted(harness::TaskStart { id: "bwatch".into(), call: None, kind: "local_bash".into(), description: "cargo watch -x test".into(), subagent_type: None, background: true, parent_task: None, prompt: None, ambient: false }));
+        let mut list = s.thread_mut(id).unwrap().background.clone();
+        list.push(harness::BackgroundTask { id: "bwatch".into(), kind: "local_bash".into(), description: "cargo watch -x test".into(), parent_task: None, ambient: false });
+        s.apply(id, Event::Background(list));
+        ran_for(s, id, "bwatch", 4 * 60 + 40);
+    }
+
+    /// An agent open in the main pane, at work: what it was asked, its tool rows, and the
+    /// agent it started (resumed once, and running again), as cards.
+    pub fn agent_view(s: &mut App) {
+        let id = play_turns(s, &[(0, "Have a helper check the inner echo twice, through an agent of its own.")], NESTED, 33);
+        ran_for(s, id, "a5943f3b3913e0cfb", 38 * 60 + 12);
+        ran_for(s, id, "abe546a24f5ce04f7", 3 * 60 + 5);
+        let t = s.thread_mut(id).unwrap();
+        t.turn_started = Instant::now().checked_sub(Duration::from_secs(38 * 60 + 20));
+        let outer = t.runs("a5943f3b3913e0cfb")[0].id;
+        s.open_agent(id, outer);
+    }
+
+    /// A resumed agent open: its first run, then the resumed one at work after a divider.
+    pub fn agent_view_resumed(s: &mut App) {
+        resume(s);
+        let t = s.thread_mut(120).unwrap();
+        let card = t.runs("a1cf368fa2a708ef5")[1].id;
+        s.open_agent(120, card);
     }
 
     /// A background command's whole life: its call returns at once, the turn ends, and the turn

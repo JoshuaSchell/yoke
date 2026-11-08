@@ -4,11 +4,11 @@
 //! the background after a turn's result, each with a stop control.
 
 use rune::{El, Tx, col, icon, row, text};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Markdown, Spinner};
+use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons;
 
 use crate::app::{Agent, AgentStatus, App, Item, Kind, Task, Thread};
-use crate::ui::theme::{self, Theme};
+use crate::ui::theme::Theme;
 use crate::ui::transcript::duration;
 
 /// A row of consecutive subagent launches: one card, or "N subagents" over several.
@@ -83,22 +83,29 @@ fn plain(s: &str) -> String {
     lines.join(" ").replace('`', "").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A subagent's card: a status mark, its description and one line, its tool calls and time,
-/// and a chevron that opens its own text and tool rows.
+/// A subagent's card, as T3 Code's link to a subagent's thread: a status mark, its
+/// description and one line, its tool calls and time, and a chevron; pressing it opens the
+/// agent's view (`App::open_agent`), all its runs and their rows. A run a `SendMessage` started
+/// says it's a resume; an earlier run, that it was resumed below. A tool inside waiting for
+/// approval shows under it, so it can be answered from here.
 pub fn card(s: &App, t: &Thread, a: &Agent, k: &Kit, look: (Theme, bool)) -> El {
     let c = &k.c;
     let task = t.task_for(&a.call);
     let status = a.status(task);
-    let open = s.expanded.contains(&a.id);
     let line = detail(a, task);
     let failed = status == AgentStatus::Failed;
-    let has_body = !a.items.is_empty() || task.is_some_and(|x| x.prompt.is_some()) || !a.report(task).is_empty();
+    let later = t.resumed_since(a);
     let mark = match status {
         AgentStatus::Running | AgentStatus::Background => Spinner::new().size(12.0).build(k),
         _ => status_dot(status, k),
     };
     let mut title = row().w_full().gap(6.0).center_y()
         .child(text(if a.description.is_empty() { "Subagent".to_owned() } else { a.description.clone() }).font(k.ty.small_medium).color(c.text_base).truncate().shrink());
+    if a.resumed {
+        title = title.child(row().gap(3.0).center_y()
+            .child(icon(&icons::OUTLINE_ROTATE_CLOCKWISE, 11.0).color(c.icon_weaker))
+            .child(text("resumed").font(k.ty.text_xsmall).color(c.text_faint)));
+    }
     if let Some(kind) = task.and_then(|x| x.subagent_type.as_deref()).filter(|k| *k != "general-purpose") {
         title = title.child(text(kind.to_owned()).font(k.ty.text_xsmall).color(c.text_faint).truncate().shrink());
     }
@@ -108,28 +115,55 @@ pub fn card(s: &App, t: &Thread, a: &Agent, k: &Kit, look: (Theme, bool)) -> El 
     let mut head = row().key("head").w_full().px(10.0).py(7.0).gap(10.0).center_y().radius(8.0)
         .child(row().w(14.0).center().child(mark))
         .child(words);
-    // The status in words, unless the line already is it, or it's the expected "done".
-    if line.is_some() && status != AgentStatus::Completed {
+    // Where it went on: a later run's card, further down.
+    if later {
+        head = head.child(row().gap(4.0).center_y()
+            .child(icon(&icons::ARROW_DOWN_TO_LINE, 12.0).color(c.icon_weaker))
+            .child(text("Resumed below").font(k.ty.text_xsmall).color(c.text_muted)));
+    } else if line.is_some() && status != AgentStatus::Completed {
+        // The status in words, unless the line already is it, or it's the expected "done".
         head = head.child(text(status.label()).font(k.ty.text_xsmall).color(if failed { c.danger.fg } else { c.text_muted }));
     }
     if let Some(n) = task.and_then(|x| x.usage).map(|u| u.tool_uses).filter(|n| *n > 0) {
-        head = head.child(text(if n == 1 { "1 tool".to_owned() } else { format!("{n} tools") }).font(k.ty.text_xsmall).color(c.text_faint));
+        head = head.child(text(tools_label(n)).font(k.ty.text_xsmall).color(c.text_faint));
     }
     if let Some(x) = task {
         head = head.child(text(duration(x.elapsed().as_secs_f64())).font(k.ty.text_xsmall).color(c.text_muted));
     }
-    if has_body {
-        let id = a.id;
-        head = head.child(icon(if open { &icons::CHEVRON_DOWN } else { &icons::CHEVRON_RIGHT }, 12.0).color(c.icon_weaker).a11y_hidden())
-            .hover(c.surface_hover).cursor(rune::Cursor::Pointer)
-            .role("button").label(format!("Subagent: {}", a.description)).expanded(open)
-            .on_press(move |s: &mut App| if !s.expanded.remove(&id) { s.expanded.insert(id); });
-    }
+    let (thread, id) = (t.id, a.id);
+    let head = head.child(icon(&icons::CHEVRON_RIGHT, 12.0).color(c.icon_weaker).a11y_hidden())
+        .hover(c.surface_hover).cursor(rune::Cursor::Pointer)
+        .role("button").label(format!("Open {}", if a.description.is_empty() { "subagent" } else { a.description.as_str() }))
+        .help("Open this agent")
+        .on_press(move |s: &mut App| s.open_agent(thread, id));
     let mut card = col().w_full().radius(9.0).border(1.0, c.border_weak).clip_rounded(9.0).child(head);
-    if open && has_body {
-        card = card.child(rune::el().w_full().h(1.0).fill(c.border_weak)).child(body(s, t, a, task, k, look));
+    let asking = waiting(t, &a.items);
+    if !asking.is_empty() {
+        let mut body = col().key("asking").w_full().px(10.0).pt(4.0).pb(10.0).gap(6.0);
+        for item in asking {
+            body = body.child(crate::ui::transcript::tool_row(s, t, item, k, look).key(format!("ask-{}", item.id)));
+        }
+        card = card.child(rune::el().w_full().h(1.0).fill(c.border_weak)).child(body);
     }
     card
+}
+
+/// "1 tool", "12 tools".
+pub fn tools_label(n: u64) -> String {
+    if n == 1 { "1 tool".to_owned() } else { format!("{n} tools") }
+}
+
+/// The tool rows in `items` (and in the cards inside them) waiting for approval.
+fn waiting<'a>(t: &Thread, items: &'a [Item]) -> Vec<&'a Item> {
+    let mut out = Vec::new();
+    for i in items {
+        match &i.kind {
+            Kind::Tool { .. } if t.ask_on(i.id).is_some() => out.push(i),
+            Kind::Agents(g) => for a in g { out.extend(waiting(t, &a.items)); },
+            _ => {}
+        }
+    }
+    out
 }
 
 fn status_dot(status: AgentStatus, k: &Kit) -> El {
@@ -141,39 +175,6 @@ fn status_dot(status: AgentStatus, k: &Kit) -> El {
         AgentStatus::Stopped => c.icon_faint,
     };
     rune::el().size(8.0, 8.0).radius(4.0).fill(color).a11y_hidden()
-}
-
-/// An opened card: what the agent was asked, then its own messages and tool rows, and its
-/// report if no message of its own says it.
-fn body(s: &App, t: &Thread, a: &Agent, task: Option<&Task>, k: &Kit, look: (Theme, bool)) -> El {
-    let c = &k.c;
-    let mut out = col().key("agent-body").w_full().px(10.0).pt(8.0).pb(10.0).gap(6.0);
-    if let Some(p) = task.and_then(|x| x.prompt.as_deref()).filter(|p| !p.trim().is_empty()) {
-        let shown = if p.chars().count() > 600 { format!("{}…", p.chars().take(600).collect::<String>()) } else { p.trim().to_owned() };
-        out = out.child(col().key("prompt").w_full().gap(2.0)
-            .child(text("Asked").font(k.ty.text_xsmall_medium).color(c.text_faint))
-            .child(text(shown).font(k.ty.small).color(c.text_muted).wrap().selectable(true).selection_color(k.selection())));
-    }
-    for item in &a.items {
-        out = out.child(nested(s, t, item, k, look).key(format!("n{}", item.id)));
-    }
-    let report = a.report(task);
-    let said = a.items.iter().any(|i| matches!(&i.kind, Kind::Assistant { text, .. } if text.trim() == report.trim()));
-    if !report.is_empty() && !said && a.status(task).settled() {
-        out = out.child(Markdown::new(report.as_str()).style(theme::markdown(look.0, k)).selectable(true).build(k).key("report"));
-    }
-    out
-}
-
-/// A row inside a subagent's card, drawn as the conversation's own rows are.
-fn nested(s: &App, t: &Thread, item: &Item, k: &Kit, look: (Theme, bool)) -> El {
-    match &item.kind {
-        Kind::Assistant { text, streaming } => Markdown::new(text.as_str()).style(theme::markdown(look.0, k)).selectable(true).streaming(*streaming).build(k),
-        Kind::Tool { .. } => crate::ui::transcript::tool_row(s, t, item, k, look),
-        Kind::Agents(g) => group(s, t, item.id, g, k, look),
-        Kind::Error(m) => crate::ui::transcript::error(m, k),
-        _ => rune::el(),
-    }
 }
 
 /// A key for what's open inside a row of subagent cards (cards, their tool rows, nested
@@ -236,9 +237,9 @@ pub fn background(s: &App, t: &Thread, k: &Kit) -> Option<El> {
             .on_press_tx(move |s: &mut App, _: &mut Tx| s.stop_task(id, &tid))
             .build(k)
             .key(format!("stop-{}", b.id));
-        let mut r = row().key(format!("bg-{}", b.id)).w_full().h(26.0).pl(12.0).pr(4.0).gap(8.0).center_y()
+        let mut r = row().key(format!("bg-{}", b.id)).w_full().h(26.0).pl(8.0).pr(4.0).gap(8.0).center_y().radius(7.0)
             .child(icon(if agent { &icons::TASK } else { &icons::CONSOLE }, 13.0).color(c.icon_weaker))
-            .child(text(label).font(if agent { k.ty.small } else { k.ty.mono }).color(c.text_base).truncate().shrink());
+            .child(text(label.clone()).font(if agent { k.ty.small } else { k.ty.mono }).color(c.text_base).truncate().shrink());
         r = if progress.is_empty() {
             r.child(rune::el().grow(1.0))
         } else {
@@ -247,7 +248,19 @@ pub fn background(s: &App, t: &Thread, k: &Kit) -> Option<El> {
         if let Some(x) = task {
             r = r.child(text(duration(x.elapsed().as_secs_f64())).font(k.ty.text_xsmall).color(c.text_muted));
         }
-        card = card.child(r.child(stop));
+        // An agent opens, as its card does: what it's doing, all of it.
+        let opens = agent && !t.runs(&b.id).is_empty();
+        if opens {
+            let task = b.id.clone();
+            r = r.child(icon(&icons::CHEVRON_RIGHT, 12.0).color(c.icon_weaker).a11y_hidden())
+                .hover(c.surface_hover).cursor(rune::Cursor::Pointer)
+                .role("button").label(format!("Open {label}")).help("Open this agent")
+                .on_press(move |s: &mut App| s.open_agent_task(id, &task));
+        } else {
+            // Its time lines up with the rows that open.
+            r = r.child(rune::el().w(12.0));
+        }
+        card = card.child(row().w_full().px(4.0).child(r.child(stop)));
     }
     let _ = s;
     Some(card)

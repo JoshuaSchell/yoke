@@ -6,6 +6,7 @@
 //! skips files with no prompt in them (the model-listing handshake leaves those). A thread's
 //! transcript is read when it's first opened.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -150,7 +151,7 @@ fn prompt_in(v: &Value, sidechain: bool) -> Option<String> {
         _ => return None,
     };
     let t = text.trim();
-    if t.is_empty() || t.starts_with("<command-") || t.starts_with("<local-command") || t.starts_with("Caveat:") { return None; }
+    if t.is_empty() || t.starts_with("<command-") || t.starts_with("<local-command") || t.starts_with("Caveat:") || t.starts_with("<system-reminder>") { return None; }
     Some(t.to_owned())
 }
 
@@ -164,53 +165,170 @@ pub struct Loaded {
 
 /// The transcript of session file `path`, as rows, and how full its context was at the end.
 /// Subagents' cards get their own rows from their transcripts beside it
-/// (`<id>/subagents/agent-<agent>.jsonl`).
+/// (`<id>/subagents/agent-<agent>.jsonl`): an agent resumed with `SendMessage` has a card for
+/// each run, where its call was made, and its transcript is split between them.
 pub fn load(path: &Path) -> Loaded {
     let Ok(file) = std::fs::read_to_string(path) else { return Loaded::default() };
     let subagents = path.with_extension("").join("subagents");
-    let (rows, context) = rows(&file, false, &subagents, 0);
+    let mut calls = first_calls(&subagents);
+    let (runs, context, _) = rows(&file, false, &mut calls);
+    let mut rows: Vec<Kind> = runs.into_iter().flat_map(|r| r.rows).collect();
+    let mut loaded = HashMap::new();
+    fill(&mut rows, &subagents, &mut calls, &mut loaded, 0);
     Loaded { rows, context }
+}
+
+/// Where Claude Code keeps the subagents' transcripts of session `session` run in `project`.
+pub fn subagents_dir(home: &Path, project: &Path, session: &str) -> PathBuf {
+    project_dir(home, project).join(session).join("subagents")
+}
+
+/// The `Agent` call that first started agent `agent`, from the `meta.json` Claude Code keeps
+/// beside its transcript.
+pub fn agent_first_call(subagents: &Path, agent: &str) -> Option<String> {
+    agent_meta(subagents, agent)["toolUseId"].as_str().map(str::to_owned)
+}
+
+/// Agent `agent`'s saved runs, oldest first, as rows (`subagents` is `subagents_dir`).
+pub fn agent_runs(subagents: &Path, agent: &str) -> Vec<Run> {
+    if !plain_id(agent) { return Vec::new(); }
+    let Ok(text) = std::fs::read_to_string(subagents.join(format!("agent-{agent}.jsonl"))) else { return Vec::new() };
+    let mut calls = first_calls(subagents);
+    let (mut runs, ..) = rows(&text, true, &mut calls);
+    let mut loaded = HashMap::new();
+    for r in &mut runs { fill(&mut r.rows, subagents, &mut calls, &mut loaded, 1); }
+    runs
+}
+
+fn plain_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Every subagent's first call, by call: each `agent-<id>.meta.json` names its `toolUseId`.
+/// (A subagent's own transcript doesn't say which agent its `Agent` calls started.)
+fn first_calls(subagents: &Path) -> HashMap<String, String> {
+    let Ok(dir) = std::fs::read_dir(subagents) else { return HashMap::new() };
+    dir.flatten().filter_map(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let agent = name.strip_prefix("agent-")?.strip_suffix(".meta.json")?.to_owned();
+        let meta: Value = serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+        Some((meta["toolUseId"].as_str()?.to_owned(), agent))
+    }).collect()
+}
+
+/// A subagent's transcript as `fill` gives it out: its runs, the next to give, what it does
+/// and its model.
+struct AgentFile {
+    runs: Vec<Run>,
+    next: usize,
+    description: String,
+    model: Option<String>,
+}
+
+/// An agent's `meta.json` (null if there's none).
+fn agent_meta(subagents: &Path, agent: &str) -> Value {
+    if !plain_id(agent) { return Value::Null; }
+    std::fs::read_to_string(subagents.join(format!("agent-{agent}.meta.json"))).ok().and_then(|m| serde_json::from_str(&m).ok()).unwrap_or(Value::Null)
 }
 
 /// How deep subagents' transcripts are read (one a subagent started is one more).
 const MAX_DEPTH: usize = 4;
 
-/// A transcript's rows. `sidechain`: it's a subagent's own, whose lines are all marked so and
-/// whose first message is what it was asked.
-fn rows(file: &str, sidechain: bool, subagents: &Path, depth: usize) -> (Vec<Kind>, Option<(String, u64)>) {
-    let mut out: Vec<Kind> = Vec::new();
+/// One run of a subagent, as its transcript holds it: what it was asked (its first message, or
+/// the message that resumed it), and its rows.
+#[derive(Default)]
+pub struct Run {
+    pub prompt: Option<String>,
+    pub rows: Vec<Kind>,
+}
+
+/// Gives each subagent card in `rows` (and in theirs, down to `MAX_DEPTH`) its agent and its
+/// run's rows. An agent's runs go to its cards in order: its `Agent` call's card takes the
+/// first, each resume's card the next. `loaded` keeps each agent's runs not yet given out.
+fn fill(out: &mut [Kind], subagents: &Path, calls: &mut HashMap<String, String>, loaded: &mut HashMap<String, AgentFile>, depth: usize) {
+    if depth >= MAX_DEPTH { return; }
+    for k in out.iter_mut() {
+        let Kind::Agents(g) = k else { continue };
+        for a in g.iter_mut() {
+            if a.task.is_none() { a.task = calls.get(&a.call).cloned(); }
+            let Some(agent) = a.task.clone() else { continue };
+            let f = loaded.entry(agent.clone()).or_insert_with(|| {
+                let text = if plain_id(&agent) { std::fs::read_to_string(subagents.join(format!("agent-{agent}.jsonl"))).unwrap_or_default() } else { String::new() };
+                let (runs, _, model) = rows(&text, true, calls);
+                let description = agent_meta(subagents, &agent)["description"].as_str().unwrap_or_default().to_owned();
+                AgentFile { runs, next: 0, description, model }
+            });
+            // A resume names the agent, not what it does: the card says what its first did.
+            if a.description.is_empty() { a.description = f.description.clone(); } else if f.description.is_empty() { f.description = a.description.clone(); }
+            a.model = f.model.clone();
+            // A resume whose first run isn't here (made before this transcript) takes the run
+            // after it.
+            if f.next == 0 && a.resumed { f.next = 1.min(f.runs.len().saturating_sub(1)); }
+            let Some(run) = f.runs.get_mut(f.next) else { continue };
+            f.next += 1;
+            let mut inner = std::mem::take(&mut run.rows);
+            a.prompt = run.prompt.take();
+            fill(&mut inner, subagents, calls, loaded, depth + 1);
+            a.items = inner.into_iter().map(|kind| Item { id: 0, rev: 0, kind }).collect();
+        }
+    }
+}
+
+/// A transcript's runs (one, for a session's own; one per run for a subagent's), how full its
+/// context was at the end, and the model of its last reply. `sidechain`:
+/// it's a subagent's own, whose lines are all marked so, whose first message is what it was
+/// asked, and where a message from the agent that started it (or another) starts a run.
+/// `calls` gets the agents its `Agent` calls started, as their results say.
+fn rows(file: &str, sidechain: bool, calls: &mut HashMap<String, String>) -> (Vec<Run>, Option<(String, u64)>, Option<String>) {
+    let mut runs = vec![Run::default()];
     let mut context = None;
-    // Agent calls and the subagent each one ran, from its result.
-    let mut ran: Vec<(String, String)> = Vec::new();
+    let mut last_model = None;
     let mut asked = false;
     for line in file.lines() {
         if !(line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"")) { continue; }
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
         if !sidechain && v["isSidechain"].as_bool() == Some(true) { continue; }
+        let run = runs.len() - 1;
+        let out = &mut runs[run].rows;
         match v["type"].as_str() {
             Some("user") => {
                 // A turn the CLI started itself, to report on background work: the divider
                 // the app showed, not a message from the person.
                 if let Some(n) = notification(&v) {
-                    if let Some(call) = &n.call { finish_agent(&mut out, call, &n); }
+                    if let Some(call) = &n.call { finish_agent(out, call, &n); }
                     out.push(Kind::Wake(n.summary));
                     continue;
                 }
+                // A resume: the message another agent sent this one starts its next run.
+                if sidechain && let Some(m) = resume_message(&v) {
+                    runs.push(Run { prompt: Some(m), rows: Vec::new() });
+                    continue;
+                }
                 if let Some(p) = prompt_in(&v, sidechain) {
-                    // A subagent's first message is what it was asked (the card's title says it).
-                    if sidechain && !asked { asked = true; continue; }
+                    // A subagent's first message is what it was asked (its card shows it).
+                    if sidechain && !asked {
+                        asked = true;
+                        runs[run].prompt = Some(p);
+                        continue;
+                    }
                     out.push(Kind::User(p));
                     continue;
                 }
                 for b in v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
                     let call = b["tool_use_id"].as_str().unwrap_or_default();
                     let state = if b["is_error"].as_bool() == Some(true) { ToolState::Failed } else { ToolState::Ok };
-                    if let Some(agent) = v["toolUseResult"]["agentId"].as_str() { ran.push((call.to_owned(), agent.to_owned())); }
-                    set_result(&mut out, call, state, output_text(&b["content"]));
+                    let text = output_text(&b["content"]);
+                    if let Some(agent) = v["toolUseResult"]["agentId"].as_str() { calls.insert(call.to_owned(), agent.to_owned()); }
+                    // A `SendMessage` that resumed an agent: that agent's next run, its card here.
+                    let resumed = v["toolUseResult"]["resumedAgentId"].as_str().map(str::to_owned)
+                        .or_else(|| serde_json::from_str::<Value>(text.trim()).ok().and_then(|j| j["resumedAgentId"].as_str().map(str::to_owned)));
+                    if let Some(agent) = resumed { resume_card(out, call, &agent); }
+                    set_result(out, call, state, text);
                 }
             }
             Some("assistant") => {
                 let model = v["message"]["model"].as_str().filter(|m| !m.starts_with('<'));
+                if let Some(m) = model { last_model = Some(m.to_owned()); }
                 if let (Some(m), Some(n)) = (model, crate::harness::claude::context_tokens(&v["message"]["usage"])) {
                     context = Some((m.to_owned(), n));
                 }
@@ -225,7 +343,7 @@ fn rows(file: &str, sidechain: bool, subagents: &Path, depth: usize) -> (Vec<Kin
                             let name = b["name"].as_str().unwrap_or("tool").to_owned();
                             if crate::app::agent_tool(&name) {
                                 // A call with no result in the file was cut off.
-                                let agent = Agent { id: 0, call, description: tool_detail(&b["input"]), state: ToolState::Failed, output: String::new(), items: Vec::new() };
+                                let agent = Agent::new(0, call, tool_detail(&b["input"]), ToolState::Failed);
                                 match out.last_mut() {
                                     Some(Kind::Agents(g)) => g.push(agent),
                                     _ => out.push(Kind::Agents(vec![agent])),
@@ -248,15 +366,30 @@ fn rows(file: &str, sidechain: bool, subagents: &Path, depth: usize) -> (Vec<Kin
             _ => {}
         }
     }
-    if depth < MAX_DEPTH {
-        for (call, agent) in ran {
-            let Some(a) = agents_mut(&mut out).find(|a| a.call == call) else { continue };
-            let Ok(text) = std::fs::read_to_string(subagents.join(format!("agent-{agent}.jsonl"))) else { continue };
-            let (inner, _) = rows(&text, true, subagents, depth + 1);
-            a.items = inner.into_iter().map(|kind| Item { id: 0, rev: 0, kind }).collect();
-        }
-    }
-    (out, context)
+    (runs, context, last_model)
+}
+
+/// The message that resumed a subagent, from its transcript's line for it: one from the agent
+/// that started it (`coordinator`) or another (`peer`), without the CLI's frame around it.
+fn resume_message(v: &Value) -> Option<String> {
+    let kind = v["origin"]["kind"].as_str()?;
+    if !matches!(kind, "coordinator" | "peer") { return None; }
+    if let Some(body) = v["origin"]["body"].as_str().filter(|b| !b.trim().is_empty()) { return Some(body.trim().to_owned()); }
+    let text = match &v["message"]["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        _ => return None,
+    };
+    Some(crate::app::resume_text(&text))
+}
+
+/// The tool row of `SendMessage` call `call`, which resumed agent `agent`, as that run's card.
+fn resume_card(rows: &mut [Kind], call: &str, agent: &str) {
+    let Some(k) = rows.iter_mut().rev().find(|k| matches!(k, Kind::Tool { call: c, .. } if c == call)) else { return };
+    let mut a = Agent::new(0, call.to_owned(), String::new(), ToolState::Ok);
+    a.task = Some(agent.to_owned());
+    a.resumed = true;
+    *k = Kind::Agents(vec![a]);
 }
 
 /// Every subagent card in `rows` (not those inside cards).
@@ -425,5 +558,63 @@ mod tests {
         assert_eq!((g[1].state, g[1].output.as_str()), (ToolState::Ok, "SLOW_DONE"), "the background agent's end, from its notification");
         assert!(matches!(&rows[3], Kind::Wake(w) if w == "Agent \"Slow echo\" completed"));
         assert_eq!(rows.iter().filter(|k| matches!(k, Kind::User(_))).count(), 1);
+    }
+
+    /// A saved session where an agent was resumed with SendMessage (as 2.1.319 saves it): a
+    /// card for each run, where its call was made, each with its own part of the agent's
+    /// transcript and what it was asked; an agent it started (known by its `meta.json`, since a
+    /// subagent's transcript doesn't say) gets its rows too.
+    #[test]
+    fn a_resumed_agent_comes_back_as_a_card_per_run() {
+        let dir = std::env::temp_dir().join(format!("yoke-history-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("s1/subagents")).unwrap();
+        let main = [
+            r#"{"type":"user","message":{"role":"user","content":"Start a helper"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"description":"Echo helper","prompt":"echo ONE","run_in_background":true}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a1","content":"Async agent launched successfully."}]},"toolUseResult":{"agentId":"x1","isAsync":true}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>x1</task-id>\n<tool-use-id>a1</tool-use-id>\n<status>completed</status>\n<summary>Agent \"Echo helper\" completed</summary>\n<result>ONE</result>\n</task-notification>"},"origin":{"kind":"task-notification"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"Send it another"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"s1","name":"SendMessage","input":{"to":"x1","message":"echo TWO"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"s1","content":"{\"success\":true,\"message\":\"Resuming agent x1\",\"resumedAgentId\":\"x1\"}"}]},"toolUseResult":{"success":true,"resumedAgentId":"x1"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>x1</task-id>\n<tool-use-id>s1</tool-use-id>\n<status>completed</status>\n<summary>Agent \"Echo helper\" completed</summary>\n<result>TWO</result>\n</task-notification>"},"origin":{"kind":"task-notification"}}"#,
+        ].join("\n");
+        let sub = [
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"echo ONE"}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"echo ONE"}}]}}"#,
+            r#"{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","tool_use_id":"b1","content":"ONE"}]}}"#,
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"<system-reminder>\n<tools-used-before-summary>Bash</tools-used-before-summary>\n</system-reminder>"}}"#,
+            r#"{"type":"user","isSidechain":true,"origin":{"kind":"coordinator"},"message":{"role":"user","content":"The coordinator sent a message while you were working:\necho TWO\n\nAddress this before completing your current task."}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-5-5","content":[{"type":"tool_use","id":"n1","name":"Agent","input":{"description":"Inner helper","prompt":"echo TWO"}}]}}"#,
+            r#"{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","tool_use_id":"n1","content":"TWO"}]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-5-5","content":[{"type":"text","text":"TWO"}]}}"#,
+        ].join("\n");
+        let inner = [
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"echo TWO"}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"echo TWO"}}]}}"#,
+            r#"{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","tool_use_id":"c1","content":"TWO"}]}}"#,
+        ].join("\n");
+        std::fs::write(dir.join("s1.jsonl"), &main).unwrap();
+        std::fs::write(dir.join("s1/subagents/agent-x1.jsonl"), &sub).unwrap();
+        std::fs::write(dir.join("s1/subagents/agent-x1.meta.json"), r#"{"description":"Echo helper","toolUseId":"a1"}"#).unwrap();
+        std::fs::write(dir.join("s1/subagents/agent-y1.jsonl"), &inner).unwrap();
+        std::fs::write(dir.join("s1/subagents/agent-y1.meta.json"), r#"{"description":"Inner helper","toolUseId":"n1","parentAgentId":"x1"}"#).unwrap();
+        let rows = load(&dir.join("s1.jsonl")).rows;
+        let runs = agent_runs(&dir.join("s1/subagents"), "x1");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cards: Vec<&Agent> = rows.iter().filter_map(|k| match k { Kind::Agents(g) => Some(g), _ => None }).flatten().collect();
+        assert_eq!(cards.len(), 2, "a card per run, no SendMessage row");
+        assert!(!rows.iter().any(|k| matches!(k, Kind::Tool { .. })));
+        let (one, two) = (cards[0], cards[1]);
+        assert_eq!((one.task.as_deref(), one.resumed, two.task.as_deref(), two.resumed), (Some("x1"), false, Some("x1"), true));
+        assert_eq!((two.description.as_str(), two.call.as_str()), ("Echo helper", "s1"));
+        assert_eq!((one.prompt.as_deref(), two.prompt.as_deref()), (Some("echo ONE"), Some("echo TWO")));
+        assert_eq!(one.items.len(), 1, "its Bash row; the reminder isn't a message");
+        assert_eq!((two.state, two.output.as_str()), (ToolState::Ok, "TWO"), "the resumed run's end, from its notification");
+        assert_eq!(two.model.as_deref(), Some("claude-haiku-5-5"));
+        let Kind::Agents(g) = &two.items[0].kind else { panic!("the inner agent's card") };
+        assert_eq!((g[0].task.as_deref(), g[0].items.len()), (Some("y1"), 1), "its own Bash row, from its transcript");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].prompt.as_deref(), Some("echo TWO"));
     }
 }

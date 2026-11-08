@@ -280,6 +280,16 @@ pub fn run(s: &mut App, c: Cmd, tx: &mut Tx) -> bool {
             _ => s.close_usage(),
         }
     }
+    // An agent open over the thread: Esc goes back (to the agent it was opened from, or the
+    // thread where it was), and the prompt is the thread's.
+    if s.open_agent_view().is_some() {
+        match c {
+            Cmd::Stop => { s.close_agent(); return true; }
+            // The composer's own commands are the thread's.
+            Cmd::FocusPrompt | Cmd::Steer | Cmd::HarnessMenu | Cmd::ModelMenu | Cmd::EffortMenu | Cmd::AccessMenu => s.agent_view.clear(),
+            _ => {}
+        }
+    }
     match c {
         Cmd::NewThread => { s.new_thread(); }
         Cmd::OpenFolder => s.choose_folder(tx),

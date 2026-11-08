@@ -1,5 +1,6 @@
 //! The window: sidebar of threads, and a main pane with the transcript over the composer.
 
+pub mod agent_view;
 pub mod agents;
 pub mod composer;
 pub mod diff;
@@ -48,9 +49,18 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
             // transcript's last row clears the composer (as last laid out) at the bottom.
             Some(_) => {
                 let dock = rune::memo::layout_with("composer-dock", |r| r[3]).unwrap_or(150.0);
-                main.child(col().key("thread-pane").w_full().grow(1.0).min_h(0.0)
-                    .child(transcript::view(s, k, (s.theme, dark), dock))
-                    .child(composer::view(s, k, true, &mut layer).pin(Some(0.0), None, Some(0.0), Some(0.0))))
+                let mut conversation = transcript::view(s, k, (s.theme, dark), dock);
+                let mut composer = composer::view(s, k, true, &mut layer).pin(Some(0.0), None, Some(0.0), Some(0.0));
+                // An agent opened over the thread covers it; the thread stays laid out underneath,
+                // out of sight and out of reach, so going back finds it scrolled where it was.
+                let agent = agent_view::view(s, k, (s.theme, dark));
+                if agent.is_some() {
+                    conversation = conversation.inert().opacity(0.0);
+                    composer = composer.inert().opacity(0.0);
+                }
+                let mut pane = col().key("thread-pane").w_full().grow(1.0).min_h(0.0).child(conversation).child(composer);
+                if let Some(a) = agent { pane = pane.child(a.pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))); }
+                main.child(pane)
             }
             None if s.projects.is_empty() => main.child(no_projects(s, k)),
             None => main.child(hero(s, k, &mut layer)).child(composer::view(s, k, false, &mut layer)),

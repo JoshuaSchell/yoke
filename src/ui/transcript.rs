@@ -61,7 +61,7 @@ pub fn view(s: &App, k: &Kit, look: (Theme, bool), clear: f32) -> El {
         )
 }
 
-fn item_view(s: &App, t: &Thread, item: &Item, k: &Kit, look: (Theme, bool)) -> El {
+pub(crate) fn item_view(s: &App, t: &Thread, item: &Item, k: &Kit, look: (Theme, bool)) -> El {
     let streaming = matches!(item.kind, Kind::Assistant { streaming: true, .. });
     let open = s.expanded.contains(&item.id);
     // What a file row's button opens it in; its name is in the button's tooltip.
@@ -115,7 +115,7 @@ fn last_turn_end(t: &Thread, item: u64) -> bool {
     t.items.iter().rev().find(|i| matches!(i.kind, Kind::TurnEnd { .. })).is_some_and(|i| i.id == item)
 }
 
-fn user(m: &str, k: &Kit) -> El {
+pub(crate) fn user(m: &str, k: &Kit) -> El {
     let c = &k.c;
     row().w_full().justify_end().child(
         col().max_w(MAX_W * 0.78).px(14.0).py(10.0).radius(16.0).fill(c.surface_raised_base).border(1.0, c.border_weak)

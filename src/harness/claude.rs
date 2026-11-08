@@ -93,6 +93,12 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
             match v["parent_tool_use_id"].as_str().filter(|id| !id.is_empty()) {
                 None => out.extend(message(v, p, None)),
                 Some(parent) => {
+                    // The model its replies come from, for its view's header: once per agent.
+                    if let Some(m) = v["message"]["model"].as_str().filter(|m| v["type"] == "assistant" && !m.starts_with('<'))
+                        && p.sub_model.get(parent).map(String::as_str) != Some(m) {
+                            p.sub_model.insert(parent.to_owned(), m.to_owned());
+                            out.push(Event::Sub { parent: parent.to_owned(), event: Box::new(Event::Model(m.into())) });
+                        }
                     for e in message(v, p, Some(parent)) {
                         if matches!(e, Event::TextDelta(_) | Event::Text(_) | Event::ToolStart { .. } | Event::ToolEnd { .. }) {
                             out.push(Event::Sub { parent: parent.to_owned(), event: Box::new(e) });
@@ -474,6 +480,43 @@ mod tests {
         assert_eq!(ev.iter().filter(|e| matches!(e, Event::TurnStart)).count(), 2);
         assert_eq!(ev.iter().filter(|e| matches!(e, Event::Done { error: None, .. })).count(), 2);
         assert!(!p.turn_open);
+    }
+
+    /// An agent resumed with SendMessage (2.1.319, trimmed): the CLI starts the same task again
+    /// with the SendMessage call, and its progress and end name that call, but the resumed
+    /// run's own lines still name the `Agent` call that first started it (the app routes them
+    /// to the resume's card). A subagent's model comes once.
+    #[test]
+    fn a_resumed_agent_is_the_same_task_with_the_resumes_call() {
+        let (ev, _) = replay(include_str!("fixtures/claude-resume.jsonl"));
+        let (agent, first, resume) = ("a1cf368fa2a708ef5", "toolu_01NTAtgnsJaDz3L25Rd9Fj6u", "toolu_01VqSccapNG4bawJZhZqDZJt");
+        let started: Vec<(&str, Option<&str>)> = ev.iter().filter_map(|e| match e { Event::TaskStarted(t) if t.kind == "local_agent" => Some((t.id.as_str(), t.call.as_deref())), _ => None }).collect();
+        assert_eq!(started, [(agent, Some(first)), (agent, Some(resume))]);
+        let starts: Vec<&str> = ev.iter().filter_map(|e| match e { Event::ToolStart { name, .. } => Some(name.as_str()), _ => None }).collect();
+        assert_eq!(starts, ["Agent", "ToolSearch", "SendMessage"], "the main conversation's calls");
+        let after = ev.iter().position(|e| matches!(e, Event::TaskStarted(t) if t.call.as_deref() == Some(resume))).unwrap();
+        let later: Vec<&str> = ev[after..].iter().filter_map(|e| match e { Event::Sub { parent, event } if matches!(**event, Event::ToolStart { .. }) => Some(parent.as_str()), _ => None }).collect();
+        assert_eq!(later, [first], "the resumed run's Bash call names the first Agent call");
+        let models: Vec<&Event> = ev.iter().filter(|e| matches!(e, Event::Sub { event, .. } if matches!(**event, Event::Model(_)))).collect();
+        assert_eq!(models, [&Event::Sub { parent: first.into(), event: Box::new(Event::Model("claude-haiku-5-5".into())) }]);
+        let done: Vec<&str> = ev.iter().filter_map(|e| match e { Event::TaskDone { id, summary, .. } if id == agent => Some(summary.as_str()), _ => None }).collect();
+        assert_eq!(done, ["ONE", "TWO"], "each run ends");
+    }
+
+    /// An agent's own agent (2.1.319, trimmed): its call is one of the outer agent's, its task
+    /// says whose it is, and its lines name its own call; resumed by the outer agent, its lines
+    /// still do.
+    #[test]
+    fn a_subagents_own_agent_is_its_child() {
+        let (ev, _) = replay(include_str!("fixtures/claude-nested-agents.jsonl"));
+        let (outer, inner, inner_call, send) = ("a5943f3b3913e0cfb", "abe546a24f5ce04f7", "toolu_01TqV4roZfDjAyhvHJutxiuL", "toolu_01VvAYh2PMZfTxcNNVprfGfA");
+        let outer_call = "toolu_01W96BWsM9Awvo9gydKjq6cR";
+        assert!(ev.iter().any(|e| matches!(e, Event::Sub { parent, event } if parent == outer_call && matches!(&**event, Event::ToolStart { id, name, .. } if id == inner_call && name == "Agent"))));
+        assert!(ev.iter().any(|e| matches!(e, Event::Sub { parent, event } if parent == outer_call && matches!(&**event, Event::ToolStart { id, name, .. } if id == send && name == "SendMessage"))));
+        let inner_runs: Vec<(Option<&str>, Option<&str>)> = ev.iter().filter_map(|e| match e { Event::TaskStarted(t) if t.id == inner => Some((t.call.as_deref(), t.parent_task.as_deref())), _ => None }).collect();
+        assert_eq!(inner_runs, [(Some(inner_call), Some(outer)), (Some(send), Some(outer))]);
+        let inner_bash: Vec<&str> = ev.iter().filter_map(|e| match e { Event::Sub { parent, event } => match &**event { Event::ToolStart { name, detail, .. } if name == "Bash" && detail.contains("echo") => Some(parent.as_str()), _ => None }, _ => None }).collect();
+        assert_eq!(inner_bash, [inner_call, inner_call], "both runs' Bash calls name the inner Agent call");
     }
 
     /// A background command (2.1.319, trimmed): its call returns at once, the turn ends, and

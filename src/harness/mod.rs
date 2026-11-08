@@ -233,8 +233,9 @@ pub enum Event {
     /// A turn starts in the process (Claude Code's `system/init`): the answer to a message, or
     /// one the CLI starts itself to report on background work that finished.
     TurnStart,
-    /// One of a subagent's own events (its text, tool calls and results), for the card of the
-    /// tool call `parent` that started it.
+    /// One of a subagent's own events (its text, tool calls and results, and its `Model`), for
+    /// the agent whose lines name tool call `parent` (the `Agent` call that first started it,
+    /// even in a run a `SendMessage` resumed).
     Sub { parent: String, event: Box<Event> },
     /// A task started: a subagent, or a shell command (foreground or background).
     TaskStarted(TaskStart),
@@ -356,6 +357,8 @@ pub struct ParseState {
     streamed_text: bool,
     /// Claude: the same, per subagent (by the tool call that started it).
     sub_streamed: std::collections::HashMap<String, bool>,
+    /// Claude: each subagent's model as last reported (by the call its lines name).
+    sub_model: std::collections::HashMap<String, String>,
     /// Claude: the session's model (`system/init`), to pick its window from `result`.
     model: Option<String>,
     /// Claude: a turn is under way (from `system/init` to its `result`).
