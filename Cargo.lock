@@ -2414,7 +2414,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -3059,7 +3059,7 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=5fa812c615d39a241a7c2f48e52d6269c6525622#5fa812c615d39a241a7c2f48e52d6269c6525622"
+source = "git+https://github.com/JoshuaSchell/rune?rev=961c0af834b67e39c5e2ba75c65a40f66bc12ee6#961c0af834b67e39c5e2ba75c65a40f66bc12ee6"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -3137,7 +3137,7 @@ dependencies = [
 [[package]]
 name = "rune-kit"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=5fa812c615d39a241a7c2f48e52d6269c6525622#5fa812c615d39a241a7c2f48e52d6269c6525622"
+source = "git+https://github.com/JoshuaSchell/rune?rev=961c0af834b67e39c5e2ba75c65a40f66bc12ee6#961c0af834b67e39c5e2ba75c65a40f66bc12ee6"
 dependencies = [
  "pulldown-cmark",
  "rune",
@@ -3148,12 +3148,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/JoshuaSchell/rune?rev=5fa812c615d39a241a7c2f48e52d6269c6525622#5fa812c615d39a241a7c2f48e52d6269c6525622"
+source = "git+https://github.com/JoshuaSchell/rune?rev=961c0af834b67e39c5e2ba75c65a40f66bc12ee6#961c0af834b67e39c5e2ba75c65a40f66bc12ee6"
 
 [[package]]
 name = "rune-notify"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=5fa812c615d39a241a7c2f48e52d6269c6525622#5fa812c615d39a241a7c2f48e52d6269c6525622"
+source = "git+https://github.com/JoshuaSchell/rune?rev=961c0af834b67e39c5e2ba75c65a40f66bc12ee6#961c0af834b67e39c5e2ba75c65a40f66bc12ee6"
 dependencies = [
  "block2 0.5.1",
  "objc2 0.5.3",
@@ -3164,7 +3164,7 @@ dependencies = [
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=5fa812c615d39a241a7c2f48e52d6269c6525622#5fa812c615d39a241a7c2f48e52d6269c6525622"
+source = "git+https://github.com/JoshuaSchell/rune?rev=961c0af834b67e39c5e2ba75c65a40f66bc12ee6#961c0af834b67e39c5e2ba75c65a40f66bc12ee6"
 dependencies = [
  "wgpu",
 ]
@@ -3172,7 +3172,7 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=5fa812c615d39a241a7c2f48e52d6269c6525622#5fa812c615d39a241a7c2f48e52d6269c6525622"
+source = "git+https://github.com/JoshuaSchell/rune?rev=961c0af834b67e39c5e2ba75c65a40f66bc12ee6#961c0af834b67e39c5e2ba75c65a40f66bc12ee6"
 dependencies = [
  "taffy",
 ]
@@ -3180,7 +3180,7 @@ dependencies = [
 [[package]]
 name = "rune-theme-opencode"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=5fa812c615d39a241a7c2f48e52d6269c6525622#5fa812c615d39a241a7c2f48e52d6269c6525622"
+source = "git+https://github.com/JoshuaSchell/rune?rev=961c0af834b67e39c5e2ba75c65a40f66bc12ee6#961c0af834b67e39c5e2ba75c65a40f66bc12ee6"
 dependencies = [
  "rune",
  "rune-kit",
@@ -4596,7 +4596,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
