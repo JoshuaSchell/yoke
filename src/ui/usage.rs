@@ -227,16 +227,26 @@ pub fn page(s: &App, k: &Kit) -> El {
         .on_pick(|s: &mut App, i: usize, _: &mut Tx| s.set_usage_days(USAGE_PERIODS[i].0))
         .build(k)
         .key("usage-period");
-    let spend_head = row().w_full().gap(12.0)
-        .child(section_title(k, "Spend at API prices", Some("What Claude Code's tokens would cost on the API, from its transcripts: terminal sessions and this app's alike. On a subscription it measures use; it isn't a bill.")).grow(1.0).min_w(0.0))
-        .child(col().pt(18.0).child(periods));
+    let title = section_title(k, "Spend at API prices", Some("What Claude Code's tokens would cost on the API, from its transcripts: terminal sessions and this app's alike. On a subscription it measures use; it isn't a bill."));
+    // Beside the title, or under it once the page (as last laid out) is too narrow for both.
+    let width = rune::memo::layout_with("usage-page", |r| r[2]);
+    let narrow = width.is_some_and(|w| w < 560.0);
+    // Four tiles need about 150 points each before their figures are cut.
+    let paired = width.is_some_and(|w| w < 640.0);
+    let spend_head = if narrow {
+        col().w_full().gap(12.0).child(title).child(row().px(4.0).child(periods))
+    } else {
+        row().w_full().gap(12.0)
+            .child(title.grow(1.0).min_w(0.0))
+            .child(col().pt(18.0).child(periods))
+    };
 
-    let mut page = col().w_full().max_w(W).gap(12.0)
+    let mut page = col().key("usage-page").w_full().max_w(W).gap(12.0)
         .child(head)
         .child(section_title(k, "Plan limits", Some("Read from Claude Code (as /usage shows them) every 5 minutes and after each turn.")))
         .child(limits_card(s, now, k))
         .child(spend_head)
-        .child(kpis(&sum, s.usage_days, k));
+        .child(kpis(&sum, s.usage_days, paired, k));
     if s.usage_days > 1 {
         page = page.child(card(k, vec![chart(&sum, k)]));
     }
@@ -279,7 +289,8 @@ fn limits_card(s: &App, now: SystemTime, k: &Kit) -> El {
 }
 
 /// Cost, tokens, cache share and messages for the period, as stat tiles.
-fn kpis(sum: &Summary, days: u32, k: &Kit) -> El {
+/// Four tiles in a row, or two rows of two when `paired` (a page too narrow for four).
+fn kpis(sum: &Summary, days: u32, paired: bool, k: &Kit) -> El {
     let c = &k.c;
     let per_day = if days > 1 { format!("{} a day on average", dollars(sum.cost / days as f64)) } else { "so far today".into() };
     let input = sum.tokens.input + sum.tokens.cache_read + sum.tokens.cache_write + sum.tokens.cache_write_1h;
@@ -291,11 +302,17 @@ fn kpis(sum: &Summary, days: u32, k: &Kit) -> El {
             .child(text(value).font(TextStyle { size: 24.0, line_height: 30.0, ..k.ty.body_medium }).color(c.text_strong).truncate())
             .child(text(note).font(TextStyle { size: 12.0, line_height: 16.0, ..k.ty.body }).color(c.text_faint).truncate())
     };
-    row().w_full().gap(10.0)
-        .child(tile("kpi-cost", "Cost", dollars(sum.cost), per_day))
-        .child(tile("kpi-tokens", "Tokens", compact(sum.tokens.total()), format!("{} out", compact(sum.tokens.output))))
-        .child(tile("kpi-cache", "Read from cache", cached, "of input tokens".into()))
-        .child(tile("kpi-messages", "Responses", compact(sum.messages as u64), format!("{} model{}", sum.models.len(), if sum.models.len() == 1 { "" } else { "s" })))
+    let cost = tile("kpi-cost", "Cost", dollars(sum.cost), per_day);
+    let tokens = tile("kpi-tokens", "Tokens", compact(sum.tokens.total()), format!("{} out", compact(sum.tokens.output)));
+    let cache = tile("kpi-cache", "Read from cache", cached, "of input tokens".into());
+    let messages = tile("kpi-messages", "Responses", compact(sum.messages as u64), format!("{} model{}", sum.models.len(), if sum.models.len() == 1 { "" } else { "s" }));
+    if paired {
+        col().w_full().gap(10.0)
+            .child(row().w_full().gap(10.0).child(cost).child(tokens))
+            .child(row().w_full().gap(10.0).child(cache).child(messages))
+    } else {
+        row().w_full().gap(10.0).child(cost).child(tokens).child(cache).child(messages)
+    }
 }
 
 /// Cost by day: one column a day from a single baseline, one hue, the largest day labelled,
