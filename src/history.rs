@@ -21,12 +21,44 @@ pub struct Session {
     pub path: PathBuf,
 }
 
+/// Claude Code's own folder: `$CLAUDE_CONFIG_DIR` when set, as the CLI reads it, else `~/.claude`.
+pub fn claude_home() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) { return Some(PathBuf::from(d)); }
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".claude"))
+}
+
 /// Where Claude Code keeps `project`'s sessions: the path with every character that isn't a
 /// letter or digit turned into `-` (`/Users/josh/rune` → `-Users-josh-rune`).
 pub fn dir(project: &Path) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
+    Some(project_dir(&claude_home()?, project))
+}
+
+fn project_dir(home: &Path, project: &Path) -> PathBuf {
     let name: String = project.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    Some(PathBuf::from(home).join(".claude/projects").join(name))
+    home.join("projects").join(name)
+}
+
+/// Everything Claude Code keeps for session `id` of `project` under `home`: the transcript, the
+/// folder beside it (subagents, tool results), its file-edit snapshots and its shell
+/// environment. Empty for an id that isn't a plain session id, so a bad one can't reach
+/// anything else.
+pub fn session_files(home: &Path, project: &Path, id: &str) -> Vec<PathBuf> {
+    let plain = !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !plain { return Vec::new(); }
+    let dir = project_dir(home, project);
+    vec![dir.join(format!("{id}.jsonl")), dir.join(id), home.join("file-history").join(id), home.join("session-env").join(id)]
+}
+
+/// Deletes session `id`'s files (`session_files`). A symlink goes, not what it points at.
+/// Returns whether nothing is left of them.
+pub fn remove(home: &Path, project: &Path, id: &str) -> bool {
+    let mut gone = true;
+    for path in session_files(home, project, id) {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        let removed = if meta.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        if removed.is_err() && std::fs::symlink_metadata(&path).is_ok() { gone = false; }
+    }
+    gone
 }
 
 /// The project's sessions, newest first.
@@ -130,9 +162,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn removing_a_session_takes_its_files_and_nothing_else() {
+        let home = std::env::temp_dir().join(format!("rune-code-remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let project = Path::new("/Users/josh/my.app");
+        let id = "88998ad8-25b9-43da-99f0-81bfef07d76f";
+        let dir = project_dir(&home, project);
+        for d in [dir.join(id).join("subagents"), home.join("file-history").join(id), home.join("session-env").join(id), dir.join("memory")] {
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("f"), "x").unwrap();
+        }
+        std::fs::write(dir.join(format!("{id}.jsonl")), "{}").unwrap();
+        std::fs::write(dir.join("other.jsonl"), "{}").unwrap();
+
+        assert!(session_files(&home, project, "../../etc").is_empty() && session_files(&home, project, "").is_empty());
+        assert!(remove(&home, project, id));
+        assert!(session_files(&home, project, id).iter().all(|p| !p.exists()));
+        assert!(dir.join("other.jsonl").exists() && dir.join("memory/f").exists(), "the project's other files stay");
+        assert!(remove(&home, project, id), "nothing left is still done");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn project_folder_name() {
-        let d = dir(Path::new("/Users/josh/my.app")).unwrap();
-        assert!(d.ends_with(".claude/projects/-Users-josh-my-app"), "{d:?}");
+        let d = project_dir(Path::new("/h/.claude"), Path::new("/Users/josh/my.app"));
+        assert_eq!(d, Path::new("/h/.claude/projects/-Users-josh-my-app"));
     }
 
     #[test]

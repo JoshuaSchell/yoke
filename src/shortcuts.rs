@@ -233,6 +233,12 @@ pub fn dispatch(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         record(s, ev);
         return true;
     }
+    // The delete dialog is modal: Escape (the Stop key) shuts it rather than stopping a turn
+    // behind it, and no other shortcut reaches past it. Return presses its Delete button.
+    if s.confirm_delete.is_some() {
+        if ev.key == rune::Key::Escape { s.confirm_delete = None; return true; }
+        return false;
+    }
     for c in ALL {
         if s.keys.matches(c, ev) && run(s, c, tx) {
             return true;
@@ -281,7 +287,7 @@ pub fn run(s: &mut App, c: Cmd, tx: &mut Tx) -> bool {
         }
         Cmd::DeleteThread => {
             let Some(id) = s.selected else { return false };
-            s.delete(id);
+            s.ask_delete(id);
         }
         Cmd::Stop => {
             let Some(id) = s.selected.filter(|id| s.is_running(*id)) else { return false };

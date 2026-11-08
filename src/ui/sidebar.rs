@@ -4,7 +4,7 @@
 
 use rune::{El, Icon, Tx, col, el, icon, row, text};
 use rune_kit::shell::{Sidebar, SidebarRow};
-use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
+use rune_kit::{Button, ButtonVariant, ControlSize, Dialog, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::{icons, provider_icons};
 
 use crate::app::{App, Lane, SETTLED_PAGE, Thread};
@@ -148,7 +148,7 @@ fn thread_row(s: &App, t: &Thread, lane: Lane, k: &Kit) -> El {
         _ => {}
     }
     let delete_key = s.keys.label(Cmd::DeleteThread);
-    actions = actions.child(action(&icons::CLOSE_SMALL, "Delete thread", &delete_key, k).on_press_tx(move |s: &mut App, _: &mut Tx| s.delete(id)).key("delete"));
+    actions = actions.child(action(&icons::CLOSE_SMALL, "Delete thread", &delete_key, k).on_press_tx(move |s: &mut App, _: &mut Tx| s.ask_delete(id)).key("delete"));
     let trailing = el().key("trailing").min_w(META_W).h(ROW_H - 12.0).child(meta).child(actions);
 
     let mut r = SidebarRow::new(t.title.clone())
@@ -169,6 +169,25 @@ fn thread_row(s: &App, t: &Thread, lane: Lane, k: &Kit) -> El {
     // In the list, a thread that wants nothing of you fades back, so the ones that do stand
     // out (as in T3 Code).
     if lane == Lane::Inbox && st.is_none() && !t.busy && s.selected != Some(id) { built.opacity(DIM) } else { built }
+}
+
+/// Asks before deleting a thread (the row's ✕, or ⇧⌘⌫), naming what goes with it. Return
+/// deletes; Escape, Cancel or a click outside keeps it.
+pub fn delete_dialog(s: &App, k: &Kit, layer: &mut Vec<El>) {
+    let Some(id) = s.confirm_delete else { return };
+    let Some(t) = s.threads.iter().find(|t| t.id == id) else { return };
+    let what = if s.saved_session(id).is_some() {
+        format!("\u{201c}{}\u{201d} and its Claude Code transcript are deleted from this computer. This can't be undone.", t.title)
+    } else {
+        format!("\u{201c}{}\u{201d} is removed from Rune Code. This can't be undone.", t.title)
+    };
+    let buttons = row().key("delete-buttons").w_full().padding(16.0).gap(8.0).justify_end()
+        .child(Button::new("Cancel").variant(ButtonVariant::Ghost).on_press(|s: &mut App| s.confirm_delete = None).build(k).key("delete-cancel"))
+        .child(Button::new("Delete").variant(ButtonVariant::Danger).on_press(move |s: &mut App| s.delete(id)).build(k).default_button().key("delete-confirm"));
+    Dialog::new("delete", "Delete thread?").description(what).width(400.0).fit().open(true)
+        .on_close(|s: &mut App| s.confirm_delete = None)
+        .child(buttons)
+        .build(k, layer);
 }
 
 /// A small hover button on a row. Pointer only: in the list the arrows step through rows.

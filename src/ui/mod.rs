@@ -85,6 +85,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
         .child(sidebar_toggle(s, cx.titlebar_inset(), attention, sidebar_key, cx.is_reduced_motion(), k));
     // Images dropped anywhere in the window go to the composer; anything else is refused with
     // a note there.
+    sidebar::delete_dialog(s, k, &mut layer);
     rune_kit::root(window, layer)
         .on_drop_files(|s: &mut App, files: &[std::path::PathBuf], _: &mut Tx| s.attach(files))
         .accepts_extensions(&crate::app::IMAGE_EXTENSIONS)

@@ -389,6 +389,50 @@ mod tests {
         assert!(lane_ids(&rt.state, Lane::Inbox).contains(&102));
     }
 
+    /// The row's ✕ asks first: Escape keeps the thread, Return deletes it and its Claude Code
+    /// session's files.
+    #[test]
+    fn delete_asks_then_takes_the_session_files() {
+        let home = std::env::temp_dir().join(format!("rune-code-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let sid = "5f5aefca-fd04-4499-9f53-1b734ef86e56";
+        let mut app = new_app();
+        crate::app::scenes::demo(&mut app);
+        app.claude_home = Some(home.clone());
+        let t = app.threads.iter_mut().find(|t| t.id == 102).unwrap();
+        (t.harness, t.session) = (Harness::Claude, Some(sid.into()));
+        let files = crate::history::session_files(&home, &app.project.path, sid);
+        std::fs::create_dir_all(&files[1]).unwrap();
+        std::fs::write(&files[0], "{}").unwrap();
+        let mut rt = headless(app);
+
+        let press_x = |rt: &mut Runtime<App>, at: f64| {
+            let (x, y) = rt.find("thread-102").unwrap();
+            rt.pointer_move(x, y);
+            for i in 1..30 { rt.frame(at + i as f64 / 60.0); }
+            let (bx, by) = rt.find("thread-102/trailing/actions/delete").unwrap();
+            rt.pointer_down(bx, by);
+            rt.pointer_up(bx, by);
+            rt.frame(at + 0.6);
+        };
+        press_x(&mut rt, 0.0);
+        assert_eq!(rt.state.confirm_delete, Some(102));
+        assert!(rt.find("delete-dialog").is_some(), "the dialog shows");
+        rt.key(key(Key::Escape));
+        rt.frame(1.0);
+        assert_eq!(rt.state.confirm_delete, None);
+        assert!(rt.state.threads.iter().any(|t| t.id == 102), "Escape keeps it");
+
+        press_x(&mut rt, 2.0);
+        rt.key(key(Key::Enter));
+        rt.frame(3.0);
+        assert!(!rt.state.threads.iter().any(|t| t.id == 102), "Return deletes it");
+        let start = Instant::now();
+        while files.iter().any(|f| f.exists()) && start.elapsed() < Duration::from_secs(3) { std::thread::sleep(Duration::from_millis(20)); }
+        assert!(files.iter().all(|f| !f.exists()), "its session's files are gone");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// Saved sessions untouched for a week land settled, unless settled or kept by hand.
     #[test]
     fn old_sessions_land_settled() {

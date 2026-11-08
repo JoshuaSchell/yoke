@@ -156,6 +156,11 @@ pub struct App {
     /// Settled (true) or kept in the inbox (false) by hand, by session id, so the choice
     /// outlives the app and beats `AUTO_SETTLE`.
     settled_by_hand: HashMap<String, bool>,
+    /// The thread the delete dialog asks about (the row's ✕, or ⇧⌘⌫).
+    pub confirm_delete: Option<ThreadId>,
+    /// Claude Code's folder, where deleting a thread deletes its session (`history::remove`).
+    /// `None` in tests unless one sets a scratch folder.
+    pub(crate) claude_home: Option<PathBuf>,
     events: Receiver<(ThreadId, Event)>,
     sender: Sender<(ThreadId, Event)>,
     discovered: Receiver<(Harness, Vec<ModelOpt>)>,
@@ -416,6 +421,8 @@ impl App {
             unseen: 0,
             next_sweep: 0.0,
             settled_by_hand,
+            confirm_delete: None,
+            claude_home: if cfg!(test) { None } else { history::claude_home() },
             events,
             sender,
             discovered,
@@ -915,7 +922,25 @@ impl App {
         self.draft.focused = true;
     }
 
+    /// The row's ✕, or ⇧⌘⌫: asks before `delete`, since it can't be undone.
+    pub fn ask_delete(&mut self, id: ThreadId) {
+        if self.threads.iter().any(|t| t.id == id) {
+            self.open_menu = None;
+            self.confirm_delete = Some(id);
+        }
+    }
+
+    /// The Claude Code session deleting thread `id` deletes from disk, if it has one.
+    pub fn saved_session(&self, id: ThreadId) -> Option<&str> {
+        self.threads.iter().find(|t| t.id == id).filter(|t| t.harness == Harness::Claude).and_then(|t| t.session.as_deref())
+    }
+
+    /// Deletes the thread, and with it its Claude Code session: the transcript, its subagent
+    /// and tool output, and its file snapshots (`history::remove`), so it doesn't come back
+    /// next launch or sit on disk. Other harnesses' threads leave the app only.
     pub fn delete(&mut self, id: ThreadId) {
+        self.confirm_delete = None;
+        let session = self.saved_session(id).map(str::to_owned);
         if self.selected == Some(id) {
             // Like settling: go on to the thread below.
             let order = self.sidebar_order();
@@ -924,9 +949,21 @@ impl App {
                 if let Some(n) = next { self.select(n); }
             }
         }
-        if let Some(r) = self.running.remove(&id) { r.stop(); }
+        let running = self.running.remove(&id);
+        if let Some(r) = &running { r.stop(); }
         self.threads.retain(|t| t.id != id);
         if self.selected == Some(id) { self.selected = None; }
+        let Some(session) = session else { return };
+        if self.settled_by_hand.remove(&session).is_some() {
+            let _ = self.prefs.set(SETTLED_KEY, &self.settled_by_hand);
+        }
+        let Some(home) = self.claude_home.clone() else { return };
+        let project = self.project.path.clone();
+        std::thread::spawn(move || {
+            // The killed CLI may not have exited yet; let it go before its files do.
+            if running.is_some() { std::thread::sleep(Duration::from_millis(300)); }
+            history::remove(&home, &project, &session);
+        });
     }
 
     /// Switches the new-thread composer to `h`, with its default model and effort.
