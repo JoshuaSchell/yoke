@@ -87,7 +87,7 @@ impl Cmd {
     pub fn title(self) -> &'static str {
         match self {
             Cmd::NewThread => "New thread",
-            Cmd::OpenFolder => "Open a folder",
+            Cmd::OpenFolder => "Add a project",
             Cmd::ToggleSidebar => "Show or hide the sidebar",
             Cmd::Settings => "Open Settings",
             Cmd::Usage => "Show usage and plan limits",

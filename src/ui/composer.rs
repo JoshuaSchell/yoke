@@ -24,7 +24,7 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         Some(_) if running && steers => format!("Steer {}…", h.name()),
         Some(_) if running => format!("Queue a follow-up for {}…", h.name()),
         Some(_) => format!("Reply to {}…", h.name()),
-        None => format!("Ask {} anything about {}…", h.name(), s.project.name),
+        None => format!("Ask {} anything about {}…", h.name(), s.project().map_or("this project", |p| p.name.as_str())),
     };
     let field = text_input(&s.draft, style)
         .key("prompt")
@@ -141,7 +141,8 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         let stop = if stop_key.is_empty() { String::new() } else { format!("  ·  {stop_key} stop") };
         format!("{} {}{other}{stop}", first.1, first.0)
     } else {
-        format!("{}  ·  {send_key} send  ·  {newline} newline", s.project.path.display())
+        let path = s.project().map_or_else(String::new, |p| p.path.display().to_string());
+        format!("{path}  ·  {send_key} send  ·  {newline} newline")
     };
     let hint = text(hint).font(k.ty.text_xsmall).color(c.text_faint).truncate();
     let mut stack = col().w_full().max_w(MAX_W).gap(8.0).items_center();

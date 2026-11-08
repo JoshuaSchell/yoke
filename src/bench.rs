@@ -133,7 +133,7 @@ fn summary(name: &str, v: &[Sample]) {
 }
 
 fn new_app() -> App {
-    App::new(std::env::current_dir().unwrap(), rune::prefs::Prefs::memory())
+    App::new(Some(std::env::current_dir().unwrap()), rune::prefs::Prefs::memory())
 }
 
 fn runtime(app: App) -> Runtime<App> {

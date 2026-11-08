@@ -23,20 +23,15 @@ use rune::{AppSpec, Chrome, MenuItem, Tx};
 
 use app::App;
 
-/// The folder to open: one named on the command line, else the working directory when run from
-/// a shell, else the folder open last time, else home. A launch from the Dock, Finder or a
-/// desktop launcher starts in `/` or home, which is never the project you meant.
+/// The projects are the ones saved in prefs (on the first launch, the folders Claude Code has
+/// sessions in). A folder named on the command line is added and opened; otherwise the one
+/// used last is. Where the app was started from doesn't matter, as with any desktop app.
 fn init() -> App {
     let mut prefs = Prefs::open(app::APP_ID);
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from);
+    app::seed_projects(&mut prefs);
     let arg = rune::extra_args().iter().find(|a| !a.starts_with('-')).map(PathBuf::from);
-    let cwd = std::env::current_dir().ok().filter(|p| p.parent().is_some() && Some(p) != home.as_ref());
-    let last = prefs.get::<String>(app::LAST_PROJECT_KEY).map(PathBuf::from).filter(|p| p.is_dir());
-    let project = arg.or(cwd).or(last).or(home).unwrap_or_else(|| PathBuf::from("."));
-    let project = project.canonicalize().unwrap_or(project);
-    let _ = prefs.set(app::LAST_PROJECT_KEY, &project.to_string_lossy().into_owned());
     std::thread::spawn(app::purge_old_pastes);
-    App::new(project, prefs)
+    App::new(arg, prefs)
 }
 
 /// The app icon, small enough to decode at launch. A packaged app's own icon (the bundle's on
@@ -114,7 +109,7 @@ fn main() {
     if let Ok(k) = keys.spec(shortcuts::Cmd::Settings).parse() {
         settings = settings.key_equivalent(k);
     }
-    let mut open = MenuItem::new("Open Folder…", |s: &mut App, tx: &mut Tx| s.choose_folder(tx)).id("open-folder").menu("File");
+    let mut open = MenuItem::new("Add Project…", |s: &mut App, tx: &mut Tx| s.choose_folder(tx)).id("open-folder").menu("File");
     if let Ok(k) = keys.spec(shortcuts::Cmd::OpenFolder).parse() {
         open = open.key_equivalent(k);
     }
@@ -135,7 +130,7 @@ mod tests {
     }
 
     fn new_app() -> App {
-        App::new(std::env::current_dir().unwrap(), rune::prefs::Prefs::memory())
+        App::new(Some(std::env::current_dir().unwrap()), rune::prefs::Prefs::memory())
     }
 
     fn runtime() -> Runtime<App> {
@@ -401,7 +396,7 @@ mod tests {
         app.claude_home = Some(home.clone());
         let t = app.threads.iter_mut().find(|t| t.id == 102).unwrap();
         (t.harness, t.session) = (Harness::Claude, Some(sid.into()));
-        let files = crate::history::session_files(&home, &app.project.path, sid);
+        let files = crate::history::session_files(&home, app.current.as_ref().unwrap(), sid);
         std::fs::create_dir_all(&files[1]).unwrap();
         std::fs::write(&files[0], "{}").unwrap();
         let mut rt = headless(app);
@@ -440,11 +435,12 @@ mod tests {
         use crate::app::Lane;
         let mut app = new_app();
         let _ = app.prefs.set("settled", &std::collections::HashMap::from([("kept".to_owned(), false), ("done".to_owned(), true)]));
-        let app = App::new(std::env::current_dir().unwrap(), app.prefs);
+        let app = App::new(Some(std::env::current_dir().unwrap()), app.prefs);
         let mut app = app;
         let week = Duration::from_secs(8 * 24 * 3600);
         let s = |id: &str, ago: Duration| crate::history::Session { id: id.into(), title: id.into(), modified: SystemTime::now() - ago, path: "/nonexistent".into() };
-        app.land_sessions(vec![s("old", week), s("new", Duration::from_secs(60)), s("kept", week), s("done", Duration::ZERO)]);
+        let here = app.current.clone().unwrap();
+        app.land_sessions(&here, vec![s("old", week), s("new", Duration::from_secs(60)), s("kept", week), s("done", Duration::ZERO)]);
         let title = |l| app.lane_threads(l).iter().map(|t| t.title.clone()).collect::<Vec<_>>();
         assert_eq!(title(Lane::Inbox), ["new", "kept"]);
         assert_eq!(title(Lane::Settled), ["done", "old"]);
@@ -582,28 +578,67 @@ mod tests {
         assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("Cost by day")));
     }
 
-    /// ⌘O asks for a folder; picking one makes it the project, empties the sidebar of the old
-    /// folder's threads and saves it for the next launch. Cancelling changes nothing.
+    /// ⌘O asks for a folder and adds it as a project, starting a new thread there; the
+    /// other projects' threads stay. Cancelling changes nothing.
     #[test]
-    fn command_o_opens_another_folder() {
+    fn command_o_adds_a_project() {
         use rune::FileDialogKind;
         let mut rt = headless(new_app());
+        let here = rt.state.current.clone().unwrap();
         rt.state.threads.push(crate::app::Thread::new(99, "old".into(), Harness::Claude, "Default".into()));
         rt.key(cmd('o'));
         rt.frame(1.0 / 60.0);
-        assert_eq!(rt.file_dialog().map(|(kind, o)| (kind, o.title.clone())), Some((FileDialogKind::Folder, "Open Folder".into())));
+        assert_eq!(rt.file_dialog().map(|(kind, o)| (kind, o.title.clone())), Some((FileDialogKind::Folder, "Add Project".into())));
         rt.resolve_file_dialog(None).unwrap();
         rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.threads.len(), 1, "cancelling keeps the project");
+        assert_eq!(rt.state.projects.len(), 1, "cancelling adds nothing");
 
         let dir = std::env::temp_dir().canonicalize().unwrap();
         rt.key(cmd('o'));
         rt.frame(1.0 / 60.0);
         rt.resolve_file_dialog(Some(dir.clone())).unwrap();
         rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.project.path, dir);
-        assert!(rt.state.threads.iter().all(|t| t.id != 99), "the old folder's threads go");
+        assert_eq!(rt.state.projects.iter().map(|p| p.path.clone()).collect::<Vec<_>>(), [here.clone(), dir.clone()]);
+        assert_eq!(rt.state.current.as_ref(), Some(&dir));
+        assert!(rt.state.selected.is_none(), "a new thread in the new project");
+        assert!(rt.state.threads.iter().any(|t| t.id == 99), "the first project's threads stay");
         assert_eq!(rt.state.prefs.get::<String>(crate::app::LAST_PROJECT_KEY), Some(dir.to_string_lossy().into_owned()));
+        assert_eq!(rt.state.prefs.get::<Vec<String>>(crate::app::PROJECTS_KEY).unwrap().len(), 2);
+    }
+
+    /// Each project lists its own threads under its name; picking a thread makes its project
+    /// the current one; a shut group keeps only the selected thread; removing a project takes
+    /// its threads out of the sidebar.
+    #[test]
+    fn projects_group_their_threads() {
+        use crate::app::Thread;
+        let mut rt = headless(new_app());
+        let a = rt.state.current.clone().unwrap();
+        let b = std::env::temp_dir().canonicalize().unwrap();
+        rt.update(|s, _| s.add_project(b.clone()));
+        for (id, project, ago) in [(1, &a, 10), (2, &b, 5), (3, &b, 20)] {
+            let mut t = Thread::new(id, format!("t{id}"), Harness::Claude, "Default".into());
+            t.project = project.clone();
+            t.updated = std::time::SystemTime::now() - Duration::from_secs(ago);
+            rt.state.threads.push(t);
+        }
+        rt.frame(0.1);
+        assert_eq!(rt.state.inbox_order(), [1, 2, 3], "grouped by project, newest first in each");
+        let group = format!("project-{}", b.display());
+        assert!(rt.find(&format!("{group}/thread-2")).is_some(), "thread 2 is under its project");
+
+        rt.update(|s, _| s.select(2));
+        assert_eq!(rt.state.current.as_ref(), Some(&b));
+        rt.update(|s, _| s.toggle_project(&b));
+        assert_eq!(rt.state.inbox_order(), [1, 2], "a shut group keeps the selected thread");
+        rt.update(|s, _| s.select(1));
+        assert_eq!(rt.state.current.as_ref(), Some(&a));
+        assert_eq!(rt.state.inbox_order(), [1]);
+
+        rt.update(|s, _| { s.remove_project(&b); });
+        rt.frame(0.2);
+        assert!(rt.state.threads.iter().all(|t| t.project != b));
+        assert_eq!(rt.state.prefs.get::<Vec<String>>(crate::app::PROJECTS_KEY), Some(vec![a.to_string_lossy().into_owned()]));
     }
 
     #[test]
@@ -776,7 +811,7 @@ mod tests {
         assert_eq!((app.model.as_str(), app.effort.as_str()), (opus.value.as_str(), "high"), "switching back takes Claude's");
 
         let prefs = std::mem::replace(&mut app.prefs, rune::prefs::Prefs::memory());
-        let mut again = App::new(std::env::current_dir().unwrap(), prefs);
+        let mut again = App::new(Some(std::env::current_dir().unwrap()), prefs);
         assert_eq!(again.defaults.harness, Some(Harness::Codex));
         assert_eq!(again.default_model(Harness::Claude), opus.value);
         assert_eq!(again.default_effort(Harness::Claude), "high");

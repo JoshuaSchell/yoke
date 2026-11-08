@@ -61,6 +61,44 @@ pub fn remove(home: &Path, project: &Path, id: &str) -> bool {
     gone
 }
 
+/// The folders Claude Code has sessions for, most recently used first, read from each
+/// session's `cwd` (the folder names it keeps them under can't be turned back into paths).
+/// Folders that are gone, home itself, and temporary folders are left out.
+pub fn projects() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Vec::new() };
+    let Ok(dirs) = std::fs::read_dir(home.join(".claude/projects")) else { return Vec::new() };
+    let mut found: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for d in dirs.flatten() {
+        let Ok(files) = std::fs::read_dir(d.path()) else { continue };
+        let newest = files.flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+            .max_by_key(|(t, _)| *t);
+        let Some((when, file)) = newest else { continue };
+        let Some(cwd) = session_cwd(&file) else { continue };
+        if !cwd.is_dir() || cwd == home || cwd.parent().is_none() || temporary(&cwd) { continue; }
+        if found.iter().any(|(_, p)| *p == cwd) { continue; }
+        found.push((when, cwd));
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// The folder the session ran in: the first line that says.
+fn session_cwd(file: &Path) -> Option<PathBuf> {
+    use std::io::BufRead;
+    let f = std::io::BufReader::new(std::fs::File::open(file).ok()?);
+    f.lines().map_while(Result::ok).take(200)
+        .filter(|l| l.contains("\"cwd\""))
+        .find_map(|l| serde_json::from_str::<Value>(&l).ok()?["cwd"].as_str().map(PathBuf::from))
+}
+
+fn temporary(p: &Path) -> bool {
+    let tmp = std::env::temp_dir();
+    let tmp = tmp.canonicalize().unwrap_or(tmp);
+    p.starts_with(&tmp) || ["/tmp", "/private/tmp", "/var/folders", "/private/var/folders"].iter().any(|t| p.starts_with(t))
+}
+
 /// The project's sessions, newest first.
 pub fn list(project: &Path) -> Vec<Session> {
     let Some(dir) = dir(project) else { return Vec::new() };

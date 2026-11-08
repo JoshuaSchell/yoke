@@ -18,11 +18,11 @@ Nord dark and Gruvbox light:
 ## Run
 
 ```sh
-cargo run --release                 # opens on the current folder
-cargo run --release -- ~/code/app   # or on another project folder
+cargo run --release                 # opens on the project used last
+cargo run --release -- ~/code/app   # or adds and opens a project folder
 ```
 
-**⌘O** (or clicking the folder in the toolbar) opens another folder. Started without a folder (from the Dock, Finder or a launcher), the app opens the folder it had open last.
+The sidebar lists every project, as T3 Code does, each with its threads under its name. **⌘O** (or the + beside Projects) adds a project, the + on a project starts a thread in it, and the × under the pointer takes it out of the sidebar (its folder and saved sessions stay). On the first launch, the folders Claude Code has sessions in become the projects, temporary folders aside. Where the app is started from doesn't matter: it opens the project used last.
 
 ## Package
 
@@ -35,7 +35,7 @@ On Windows the same command builds an NSIS installer and on Linux a `.deb` and a
 
 - **Return** sends and **Shift-Return** adds a newline (or, with Settings › Chat › Send with set to ⌘ Return, **⌘Return** sends and Return adds a newline). **Esc** stops a running turn, killing the CLI's whole process group so a tool command it started can't keep the turn alive.
 - **While a turn runs**, Return **queues** the message: queued messages sit above the prompt and go in order when the turn ends. **⌘Return** (or the ↗ button on a queued message) **steers**: it stops the turn and sends the message straight away on the same session. After Esc the queue waits until you send from it. Settings › Chat › Follow-ups can make sending steer instead; the Steer key (⌘Return, or ⇧⌘Return when ⌘Return sends) then queues.
-- **⌘N** starts a new thread, **⌘O** opens another folder, **⇧⌘U** shows usage and plan limits, **⇧⌘B** shows or hides the sidebar, **⇧⌘P** shows frame stats, and **⌘,** opens Settings. Settings takes over the main pane, with its pages down the left as in T3 Code; Esc, Done or picking a thread closes it. The pages:
+- **⌘N** starts a new thread, **⌘O** adds a project, **⇧⌘U** shows usage and plan limits, **⇧⌘B** shows or hides the sidebar, **⇧⌘P** shows frame stats, and **⌘,** opens Settings. Settings takes over the main pane, with its pages down the left as in T3 Code; Esc, Done or picking a thread closes it. The pages:
   - **Appearance**: theme, and light, dark or the system's.
   - **New threads**: what a new thread starts with: the agent (CLI), the access level, and each agent's model and reasoning effort. ⌘N and the first screen at launch start from these; switching agent on the new-thread screen takes that agent's; the composer can still change them before you send. Reset goes back to the CLIs' own defaults.
   - **Chat**: Send with (Return, or ⌘ Return for long prompts) and Follow-ups (queue or steer while a turn runs).
@@ -75,7 +75,7 @@ The gauge in the toolbar (**⇧⌘U**), or the one in the composer while Claude 
 
 ## Uninstall
 
-Rune Code keeps one small file of its own, `prefs.json` (shortcuts, appearance, theme, new-thread defaults, the send and follow-up settings, the last folder, settled threads, the model lists, favorite models, the last plan-limits reading and Claude's prices), in `dev.rune-code` in the platform's config folder. Pasted screenshots wait in the temp folder's `rune-code-pastes` and are deleted a day later, at the next launch. On macOS, the system also keeps a GPU shader cache for the app.
+Rune Code keeps one small file of its own, `prefs.json` (shortcuts, appearance, theme, new-thread defaults, the send and follow-up settings, the projects and the last one used, settled threads, the model lists, favorite models, the last plan-limits reading and Claude's prices), in `dev.rune-code` in the platform's config folder. Pasted screenshots wait in the temp folder's `rune-code-pastes` and are deleted a day later, at the next launch. On macOS, the system also keeps a GPU shader cache for the app.
 
 | Installed with | Remove the app | Remove its data |
 | --- | --- | --- |
@@ -104,11 +104,11 @@ This works the way the Claude Agent SDK talks to the CLI. The prompt goes in on 
   - **Settled**, below it: threads you're done with. **⇧⌘S** settles the open thread and goes on to the next one in the inbox, so you can work down to "All caught up". Hovering a row shows ✓ (settle) or ↩ (back to the inbox) and × (delete). A settled thread comes back to the inbox as soon as it does anything: a message sent, an approval asked, or a turn finished. Threads untouched for 7 days settle on their own (T3 Code's default): checked at most once a minute while the app is in use, and otherwise only when the next one is due, so an idle window doesn't wake for it. Running, asking or queued threads, and ones you moved back to the inbox by hand, never auto-settle. The shelf is shut by default, scrolls on its own once it's 320 points tall, lists 30 at a time, and still shows the thread you're reading when shut. What you settle is saved by session id in prefs, so it holds across launches. **× (or ⇧⌘⌫) deletes** after asking (Return deletes, Esc keeps it): the thread goes, and for a Claude Code thread so do its session's files, so it doesn't come back next launch. That means the transcript (`~/.claude/projects/<folder>/<id>.jsonl`), the folder beside it (subagent and tool output), and `file-history/<id>` and `session-env/<id>` (in `$CLAUDE_CONFIG_DIR` when that's set). It's gone from `claude --resume` too. The project's `memory/` folder isn't touched. Codex and OpenCode threads only leave the app.
   - While the window isn't focused, a thread that finishes, fails or asks for approval posts a system notification (clicking it opens the thread) and counts on the Dock icon's badge, which clears when you come back. Notifications need the bundled app (`cargo packager --release`); `cargo run` gets the badge only. Linux gets neither yet.
   - With the sidebar hidden, a badge on the sidebar button's corner says something wants you: amber for an approval, red for a failure, the accent colour for a finished turn.
-- The toolbar starts with a "folder › thread title" breadcrumb, as T3 Code's header does.
+- The toolbar starts with a "project › thread title" breadcrumb, as T3 Code's header does.
 - Claude Code threads carry Claude's spark in its terracotta, the mark T3 Code uses (from its MIT-licensed `Icons.tsx`), instead of the OpenCode icon set's Anthropic "A".
 - **Themes**: OpenCode, Nord and Gruvbox, each in light and dark (Settings › Appearance › Theme; Mode picks light, dark or the system's). Nord and Gruvbox keep the OpenCode kit's fonts, spacing and shadows and recolour it: every grey in OpenCode's palette maps by its lightness onto the theme's own ramp, and the accent, status and code colours come from the theme (`src/ui/theme.rs`).
 - Settings › Agents counts the models each installed CLI reported. "Default" (let the CLI choose) isn't counted, and a CLI that isn't installed shows none.
-- The sidebar also lists the project's saved Claude Code sessions (`~/.claude/projects/<folder>/*.jsonl`), from the terminal or earlier runs, titled as Claude Code titles them; opening one reads its transcript, and replying resumes it.
+- The sidebar also lists each project's saved Claude Code sessions (`~/.claude/projects/<folder>/*.jsonl`), from the terminal or earlier runs, titled as Claude Code titles them; opening one reads its transcript, and replying resumes it.
 - Drop images (PNG, JPEG, GIF, WebP) anywhere on the window, or paste a screenshot into the prompt, to attach them. Claude Code gets them as image blocks; Codex as `--image`; OpenCode gets the paths in the prompt.
 - A transcript that streams Markdown as it arrives: code fences are syntax-coloured and tables, lists and inline code render. Text is selectable.
 - Tool calls appear as rows: icon, tool name, a one-line summary and a running/ok/failed status. Click a row to see its output.

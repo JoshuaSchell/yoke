@@ -1,7 +1,7 @@
 //! App state: threads, their transcripts, the composer, and applying harness events.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -33,6 +33,9 @@ const WORKING_OPEN_KEY: &str = "sidebar.working-open";
 /// The folder last open, which a launch from the Dock or a launcher (no folder argument, no
 /// useful working directory) opens again.
 pub const LAST_PROJECT_KEY: &str = "project.last";
+/// The sidebar's projects, as folder paths in the order added, and the ones shut.
+pub const PROJECTS_KEY: &str = "projects";
+const COLLAPSED_KEY: &str = "projects.collapsed";
 /// The plan limits last read, so the gauge has numbers at launch.
 const LIMITS_KEY: &str = "usage.limits";
 /// LiteLLM's Claude prices (`usage::trim_prices`) and when they were fetched (epoch seconds).
@@ -75,7 +78,11 @@ pub fn purge_old_pastes() {
 
 pub struct App {
     pub sidebar: PaneState,
-    pub project: Project,
+    /// Every project in the sidebar, in the order added. Threads keep the folder they run in.
+    pub projects: Vec<Project>,
+    /// The project new threads start in: the selected thread's, else the last one chosen.
+    /// `None` only with no projects at all.
+    pub current: Option<PathBuf>,
     /// Newest first.
     pub threads: Vec<Thread>,
     /// `None` is the new-thread screen.
@@ -164,7 +171,8 @@ pub struct App {
     events: Receiver<(ThreadId, Event)>,
     sender: Sender<(ThreadId, Event)>,
     discovered: Receiver<(Harness, Vec<ModelOpt>)>,
-    sessions: Option<Receiver<Vec<history::Session>>>,
+    sessions: Receiver<(PathBuf, Vec<history::Session>)>,
+    sessions_tx: Sender<(PathBuf, Vec<history::Session>)>,
     discover_tx: Sender<(Harness, Vec<ModelOpt>)>,
     waker: Option<Waker>,
     running: HashMap<ThreadId, Running>,
@@ -237,6 +245,23 @@ impl Appearance {
 pub struct Project {
     pub name: String,
     pub path: PathBuf,
+    /// Its group in the sidebar is shut.
+    pub collapsed: bool,
+}
+
+impl Project {
+    pub fn new(path: PathBuf) -> Project {
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        Project { name, path, collapsed: false }
+    }
+}
+
+/// On the first launch with no saved projects, the folders Claude Code has sessions in
+/// become the sidebar's projects, so earlier threads are there from the start.
+pub fn seed_projects(prefs: &mut Prefs) {
+    if prefs.get::<Vec<String>>(PROJECTS_KEY).is_some() { return; }
+    let found: Vec<String> = history::projects().into_iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let _ = prefs.set(PROJECTS_KEY, &found);
 }
 
 pub struct Thread {
@@ -247,6 +272,8 @@ pub struct Thread {
     /// The model the harness reported (`claude-opus-5-5`), once it has.
     pub resolved_model: Option<String>,
     pub session: Option<String>,
+    /// The folder it runs in. Empty (a test's thread) counts as the current project.
+    pub project: PathBuf,
     pub items: Vec<Item>,
     pub busy: bool,
     pub unread: bool,
@@ -299,6 +326,7 @@ impl Thread {
             model,
             resolved_model: None,
             session: None,
+            project: PathBuf::new(),
             items: Vec::new(),
             busy: false,
             unread: false,
@@ -341,12 +369,27 @@ pub enum Kind {
 impl App {
     /// `prefs` holds the shortcuts, appearance and last model lists: `Prefs::open(APP_ID)` for
     /// the app, `Prefs::memory()` for tests.
-    pub fn new(project: PathBuf, prefs: Prefs) -> App {
+    /// `open` is a folder to open as a project (added if it's new), else the last one used.
+    pub fn new(open: Option<PathBuf>, prefs: Prefs) -> App {
         let (sender, events) = channel();
         let (discover_tx, discovered) = channel();
+        let (sessions_tx, sessions) = channel();
         let installed = harness::detect();
         let harness = installed.iter().find(|(_, p)| p.is_some()).map_or(Harness::Claude, |(h, _)| *h);
-        let name = project.file_name().map_or_else(|| project.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let collapsed: Vec<String> = prefs.get(COLLAPSED_KEY).unwrap_or_default();
+        let mut projects: Vec<Project> = prefs.get::<Vec<String>>(PROJECTS_KEY).unwrap_or_default().into_iter()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .map(|p| Project { collapsed: collapsed.contains(&p.to_string_lossy().into_owned()), ..Project::new(p) })
+            .collect();
+        let open = open.filter(|p| p.is_dir()).map(|p| p.canonicalize().unwrap_or(p));
+        if let Some(p) = &open && !projects.iter().any(|x| &x.path == p) {
+            projects.push(Project::new(p.clone()));
+        }
+        let last = prefs.get::<String>(LAST_PROJECT_KEY).map(PathBuf::from);
+        let current = open
+            .or(last.filter(|l| projects.iter().any(|p| &p.path == l)))
+            .or_else(|| projects.first().map(|p| p.path.clone()));
         let mut draft = TextEdit::new("");
         draft.focused = true;
         let models = harness::ALL.into_iter()
@@ -373,7 +416,8 @@ impl App {
         let usage_days = prefs.get::<u32>(USAGE_DAYS_KEY).filter(|d| USAGE_PERIODS.iter().any(|(p, _)| p == d)).unwrap_or(7);
         let mut app = App {
             sidebar: PaneState::new(272.0).range(200.0, 480.0),
-            project: Project { name, path: project },
+            projects,
+            current,
             threads: Vec::new(),
             selected: None,
             draft,
@@ -426,7 +470,8 @@ impl App {
             events,
             sender,
             discovered,
-            sessions: None,
+            sessions,
+            sessions_tx,
             discover_tx,
             waker: None,
             running: HashMap::new(),
@@ -463,7 +508,7 @@ impl App {
         let (tx, rx) = channel();
         self.limits_rx = Some(rx);
         self.limits_asked = Some(Instant::now());
-        let (cwd, wake) = (self.project.path.clone(), self.waker.clone());
+        let (cwd, wake) = (self.work_dir(), self.waker.clone());
         std::thread::spawn(move || {
             let _ = tx.send(limits::probe(&bin, &cwd));
             if let Some(w) = wake { w(); }
@@ -585,19 +630,27 @@ impl App {
         let _ = self.prefs.set(USAGE_DAYS_KEY, &days);
     }
 
-    /// Lists the project's Claude Code sessions off the UI thread; `drain` adds them as threads.
+    /// Lists every project's Claude Code sessions off the UI thread; `drain` adds them as
+    /// threads.
     pub fn load_sessions(&mut self) {
-        let (tx, rx) = channel();
-        self.sessions = Some(rx);
-        let (project, wake) = (self.project.path.clone(), self.waker.clone());
+        let paths: Vec<PathBuf> = self.projects.iter().map(|p| p.path.clone()).collect();
+        self.load_sessions_of(paths);
+    }
+
+    fn load_sessions_of(&self, paths: Vec<PathBuf>) {
+        let (tx, wake) = (self.sessions_tx.clone(), self.waker.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(history::list(&project));
-            if let Some(w) = wake { w(); }
+            for p in paths {
+                let list = history::list(&p);
+                let _ = tx.send((p, list));
+                if let Some(w) = &wake { w(); }
+            }
         });
     }
 
-    /// Adds sessions no thread has yet, newest first among the threads.
-    pub(crate) fn land_sessions(&mut self, list: Vec<history::Session>) {
+    /// Adds `project`'s sessions no thread has yet, newest first among the threads.
+    pub(crate) fn land_sessions(&mut self, project: &Path, list: Vec<history::Session>) {
+        if !self.projects.iter().any(|p| p.path == project) { return; }
         for x in list {
             if self.threads.iter().any(|t| t.session.as_deref() == Some(x.id.as_str())) { continue; }
             let id = self.id();
@@ -605,6 +658,7 @@ impl App {
             let idle = x.modified.elapsed().is_ok_and(|d| d >= AUTO_SETTLE);
             t.settled = self.settled_by_hand.get(&x.id).copied().unwrap_or(idle);
             t.session = Some(x.id);
+            t.project = project.to_owned();
             t.saved = Some(x.path);
             t.updated = x.modified;
             self.threads.push(t);
@@ -642,7 +696,7 @@ impl App {
     /// answers.
     pub fn discover_models(&self) {
         for (h, bin) in self.installed.iter().filter_map(|(h, p)| Some((*h, p.clone()?))) {
-            let (tx, cwd, wake) = (self.discover_tx.clone(), self.project.path.clone(), self.waker.clone());
+            let (tx, cwd, wake) = (self.discover_tx.clone(), self.work_dir(), self.waker.clone());
             std::thread::spawn(move || {
                 if let Some(list) = models::discover(h, &bin, &cwd) {
                     let _ = tx.send((h, list));
@@ -708,38 +762,95 @@ impl App {
         self.running.contains_key(&id)
     }
 
-    /// Asks for a folder (⌘O) and opens it as the project.
+    /// Asks for a folder (⌘O) and adds it as a project.
     pub fn choose_folder(&mut self, tx: &mut Tx) {
         self.open_menu = None;
-        let directory = self.project.path.parent().map(PathBuf::from);
-        let options = rune::FileDialogOptions { title: "Open Folder".into(), directory, ..Default::default() };
+        let directory = self.current.as_ref().and_then(|p| p.parent()).map(PathBuf::from);
+        let options = rune::FileDialogOptions { title: "Add Project".into(), directory, ..Default::default() };
         tx.open_folder(options, |s: &mut App, result, _: &mut Tx| match result {
-            Ok(Some(path)) => { s.open_project(path); }
+            Ok(Some(path)) => s.add_project(path),
             Ok(None) => {}
             Err(e) => s.composer_error = Some(format!("Couldn't open a folder: {e}")),
         });
     }
 
-    /// Makes `path` the project: its saved sessions replace the threads, and it's what the next
-    /// launch opens. Refused while a turn runs, since a turn's thread would leave the sidebar
-    /// still working in the old folder.
-    pub fn open_project(&mut self, path: PathBuf) -> bool {
-        if !self.running.is_empty() {
-            self.composer_error = Some("Stop the running turns before opening another folder.".into());
+    /// The project new threads start in.
+    pub fn project(&self) -> Option<&Project> {
+        let path = self.thread().map(|t| t.project.as_path()).filter(|p| !p.as_os_str().is_empty()).or(self.current.as_deref())?;
+        self.projects.iter().find(|p| p.path == path)
+    }
+
+    /// Where background asks (models, plan limits) run: the current project, else home.
+    fn work_dir(&self) -> PathBuf {
+        self.current.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// The folder thread `t`'s turns run in.
+    pub fn run_dir(&self, t: &Thread) -> Option<PathBuf> {
+        Some(t.project.clone()).filter(|p| !p.as_os_str().is_empty()).or_else(|| self.current.clone())
+    }
+
+    /// Whether thread `t` is in the project at `path`.
+    pub fn in_project(&self, t: &Thread, path: &Path) -> bool {
+        if t.project.as_os_str().is_empty() { self.current.as_deref() == Some(path) } else { t.project == path }
+    }
+
+    /// Adds `path` to the sidebar (or opens its group if it's there) and starts a new thread
+    /// in it. Its saved sessions come in as threads.
+    pub fn add_project(&mut self, path: PathBuf) {
+        let path = path.canonicalize().unwrap_or(path);
+        match self.projects.iter_mut().find(|p| p.path == path) {
+            Some(p) => p.collapsed = false,
+            None => {
+                self.projects.push(Project::new(path.clone()));
+                self.load_sessions_of(vec![path.clone()]);
+            }
+        }
+        self.composer_error = None;
+        self.save_projects();
+        self.new_thread_in(path);
+    }
+
+    /// Takes the project out of the sidebar, with its threads. Its folder and Claude Code's
+    /// saved sessions stay; adding it again brings them back. Refused while one of its turns runs.
+    pub fn remove_project(&mut self, path: &Path) -> bool {
+        let threads: Vec<ThreadId> = self.threads.iter().filter(|t| self.in_project(t, path)).map(|t| t.id).collect();
+        if threads.iter().any(|id| self.is_running(*id)) {
+            self.composer_error = Some("Stop the project's running turns before removing it.".into());
             return false;
         }
-        let path = path.canonicalize().unwrap_or(path);
-        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-        let _ = self.prefs.set(LAST_PROJECT_KEY, &path.to_string_lossy().into_owned());
-        self.project = Project { name, path };
-        self.threads.clear();
-        self.expanded.clear();
-        self.ready.clear();
-        self.attachments.clear();
-        self.composer_error = None;
-        self.new_thread();
-        self.load_sessions();
+        self.threads.retain(|t| !threads.contains(&t.id));
+        if self.selected.is_some_and(|id| threads.contains(&id)) { self.selected = None; }
+        self.projects.retain(|p| p.path != path);
+        if self.current.as_deref() == Some(path) {
+            self.current = self.projects.first().map(|p| p.path.clone());
+        }
+        self.save_projects();
         true
+    }
+
+    pub fn toggle_project(&mut self, path: &Path) {
+        if let Some(p) = self.projects.iter_mut().find(|p| p.path == path) { p.collapsed = !p.collapsed; }
+        self.save_projects();
+    }
+
+    /// A new thread in the project at `path` (its "+" in the sidebar).
+    pub fn new_thread_in(&mut self, path: PathBuf) {
+        self.set_current(path);
+        self.new_thread();
+    }
+
+    fn set_current(&mut self, path: PathBuf) {
+        if self.current.as_ref() == Some(&path) { return; }
+        let _ = self.prefs.set(LAST_PROJECT_KEY, &path.to_string_lossy().into_owned());
+        self.current = Some(path);
+    }
+
+    fn save_projects(&mut self) {
+        let paths: Vec<String> = self.projects.iter().map(|p| p.path.to_string_lossy().into_owned()).collect();
+        let shut: Vec<String> = self.projects.iter().filter(|p| p.collapsed).map(|p| p.path.to_string_lossy().into_owned()).collect();
+        let _ = self.prefs.set(PROJECTS_KEY, &paths);
+        let _ = self.prefs.set(COLLAPSED_KEY, &shut);
     }
 
     /// ⌘N: the new-thread screen, with the composer back on the new-thread defaults.
@@ -797,6 +908,19 @@ impl App {
         v
     }
 
+    /// Project `path`'s inbox threads as its group lists them: all while it's open; while
+    /// it's shut, only the selected one, so the thread you're reading keeps its row.
+    pub fn project_inbox(&self, p: &Project) -> Vec<&Thread> {
+        self.lane_threads(Lane::Inbox).into_iter()
+            .filter(|t| self.in_project(t, &p.path) && (!p.collapsed || self.selected == Some(t.id)))
+            .collect()
+    }
+
+    /// The inbox in the sidebar's order: each project's group in turn.
+    pub fn inbox_order(&self) -> Vec<ThreadId> {
+        self.projects.iter().flat_map(|p| self.project_inbox(p)).map(|t| t.id).collect()
+    }
+
     /// The settled threads the shelf lists: up to `settled_shown` while it's open; while it's
     /// shut, only the selected one, so the thread you're reading keeps its row.
     pub fn settled_listed(&self) -> Vec<&Thread> {
@@ -818,7 +942,7 @@ impl App {
 
     /// Every thread row in the sidebar, top to bottom: the inbox, Working, then Settled.
     pub fn sidebar_order(&self) -> Vec<ThreadId> {
-        let mut v: Vec<ThreadId> = self.lane_threads(Lane::Inbox).iter().map(|t| t.id).collect();
+        let mut v = self.inbox_order();
         v.extend(self.working_listed().iter().map(|t| t.id));
         v.extend(self.settled_listed().iter().map(|t| t.id));
         v
@@ -828,7 +952,7 @@ impl App {
     /// goes on to the next one in the inbox, as in T3 Code, or the new-thread screen at inbox
     /// zero. A running thread can't settle: it would come straight back when it finished.
     pub fn settle(&mut self, id: ThreadId) -> bool {
-        let inbox: Vec<ThreadId> = self.lane_threads(Lane::Inbox).iter().map(|t| t.id).collect();
+        let inbox = self.inbox_order();
         let Some(t) = self.thread_mut(id).filter(|t| !t.busy && t.asks.is_empty() && !t.settled) else { return false };
         t.settled = true;
         t.unread = false;
@@ -919,6 +1043,9 @@ impl App {
             self.model = t.model.clone();
         }
         self.next_id = fresh;
+        if let Some(p) = self.thread().map(|t| t.project.clone()).filter(|p| !p.as_os_str().is_empty()) {
+            self.set_current(p);
+        }
         self.draft.focused = true;
     }
 
@@ -941,6 +1068,8 @@ impl App {
     pub fn delete(&mut self, id: ThreadId) {
         self.confirm_delete = None;
         let session = self.saved_session(id).map(str::to_owned);
+        // The folder Claude Code filed the session under: the one the thread ran in.
+        let folder = self.threads.iter().find(|t| t.id == id).map(|t| self.run_dir(t));
         if self.selected == Some(id) {
             // Like settling: go on to the thread below.
             let order = self.sidebar_order();
@@ -957,8 +1086,7 @@ impl App {
         if self.settled_by_hand.remove(&session).is_some() {
             let _ = self.prefs.set(SETTLED_KEY, &self.settled_by_hand);
         }
-        let Some(home) = self.claude_home.clone() else { return };
-        let project = self.project.path.clone();
+        let (Some(home), Some(Some(project))) = (self.claude_home.clone(), folder) else { return };
         std::thread::spawn(move || {
             // The killed CLI may not have exited yet; let it go before its files do.
             if running.is_some() { std::thread::sleep(Duration::from_millis(300)); }
@@ -998,7 +1126,13 @@ impl App {
             Some(id) => self.start_turn(id, q, tx),
             None => {
                 let id = self.id();
-                self.threads.insert(0, Thread::new(id, harness::first_line(&q.text, 60), self.harness, q.model.clone()));
+                let Some(project) = self.current.clone() else {
+                    self.composer_error = Some("Add a project first (⌘O).".into());
+                    return;
+                };
+                let mut t = Thread::new(id, harness::first_line(&q.text, 60), self.harness, q.model.clone());
+                t.project = project;
+                self.threads.insert(0, t);
                 self.selected = Some(id);
                 self.start_turn(id, q, tx);
             }
@@ -1056,7 +1190,7 @@ impl App {
     fn start_turn(&mut self, id: ThreadId, q: Queued, tx: &mut Tx) {
         self.wake(id);
         let item = self.id();
-        let cwd = self.project.path.clone();
+        let Some(cwd) = self.threads.iter().find(|t| t.id == id).and_then(|t| self.run_dir(t)) else { return };
         let peer_messages = self.defaults.peer_messages;
         let Some(t) = self.thread_mut(id) else { return };
         let shown = if q.images.is_empty() { q.text.clone() } else {
@@ -1136,10 +1270,9 @@ impl App {
             changed = true;
             self.land_models(h, list);
         }
-        if let Some(list) = self.sessions.as_ref().and_then(|r| r.try_recv().ok()) {
-            self.sessions = None;
+        while let Ok((project, list)) = self.sessions.try_recv() {
             changed = true;
-            self.land_sessions(list);
+            self.land_sessions(&project, list);
         }
         while let Ok((id, e)) = self.events.try_recv() {
             changed = true;

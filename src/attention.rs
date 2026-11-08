@@ -111,7 +111,7 @@ mod tests {
     use crate::harness::{Event, Harness};
 
     fn app() -> App {
-        App::new(std::env::current_dir().unwrap(), rune::prefs::Prefs::memory())
+        App::new(Some(std::env::current_dir().unwrap()), rune::prefs::Prefs::memory())
     }
 
     fn thread(id: u64, idle_days: u64) -> Thread {

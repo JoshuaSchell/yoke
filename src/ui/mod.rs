@@ -32,11 +32,11 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     } else if s.usage_open {
         main.child(usage::page(s, k))
     } else {
-        let body = match s.thread() {
-            Some(_) => transcript::view(s, k, (s.theme, dark)),
-            None => hero(s, k),
-        };
-        main.child(body).child(composer::view(s, k, &mut layer))
+        match s.thread() {
+            Some(_) => main.child(transcript::view(s, k, (s.theme, dark))).child(composer::view(s, k, &mut layer)),
+            None if s.projects.is_empty() => main.child(no_projects(s, k)),
+            None => main.child(hero(s, k)).child(composer::view(s, k, &mut layer)),
+        }
     };
     if s.hud {
         let items = s.threads.iter().map(|t| t.items.len()).sum();
@@ -47,7 +47,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     // The toolbar band is 48 points tall inside the card, which starts `FRAME` down, so its
     // middle is 32 down. The traffic lights sit 24 down, where macOS apps put them; the
     // toolbar's contents lift `FRAME` to line up with them.
-    let crumbs = breadcrumb(&s.project.name, &title, k).offset(0.0, -FRAME);
+    let crumbs = breadcrumb(s.project().map_or("No project", |p| p.name.as_str()), &title, k).offset(0.0, -FRAME);
     let (hud_key, settings_key, sidebar_key) = (s.keys.label(Cmd::FrameStats), s.keys.label(Cmd::Settings), s.keys.label_static(Cmd::ToggleSidebar));
     let hud_button = IconButton::new(&icons::WINDOW_ANALYTICS)
         .variant(IconButtonVariant::GhostMuted)
@@ -219,7 +219,23 @@ fn hero(s: &App, k: &Kit) -> El {
     col().key("hero").w_full().grow(1.0).min_h(0.0).center().gap(10.0).px(24.0)
         .child(sidebar::avatar(h, k).size(36.0, 36.0).radius(10.0))
         .child(text("What should we build?").font(rune::TextStyle { size: 26.0, line_height: 32.0, ..k.ty.body_medium }).color(c.text_strong))
-        .child(text(format!("{}  ·  {}", s.project.name, found)).font(k.ty.small).color(c.text_faint))
+        .child(text(format!("{}  ·  {}", s.project().map_or("", |p| p.name.as_str()), found)).font(k.ty.small).color(c.text_faint))
+}
+
+/// The main pane with no projects yet (a first launch with no Claude Code history).
+fn no_projects(s: &App, k: &Kit) -> El {
+    let c = &k.c;
+    let key = s.keys.label(Cmd::OpenFolder);
+    let add = rune_kit::Button::new("Add project")
+        .variant(rune_kit::ButtonVariant::Contrast)
+        .on_press_tx(|s: &mut App, tx: &mut Tx| s.choose_folder(tx))
+        .build(k)
+        .key("add-first-project");
+    col().key("hero").w_full().grow(1.0).min_h(0.0).center().gap(12.0).px(24.0)
+        .child(rune::icon(&icons::FOLDER, 28.0).color(c.icon_weaker))
+        .child(text("Add a project to start").font(rune::TextStyle { size: 22.0, line_height: 28.0, ..k.ty.body_medium }).color(c.text_strong))
+        .child(text(if key.is_empty() { "Pick a folder for the agents to work in.".to_owned() } else { format!("Pick a folder for the agents to work in ({key}).") }).font(k.ty.small).color(c.text_faint))
+        .child(add)
 }
 
 fn ms(n: u64) -> Duration {

@@ -7,7 +7,7 @@ use rune_kit::shell::{Sidebar, SidebarRow};
 use rune_kit::{Button, ButtonVariant, ControlSize, Dialog, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::{icons, provider_icons};
 
-use crate::app::{App, Lane, SETTLED_PAGE, Thread};
+use crate::app::{App, Lane, Project, SETTLED_PAGE, Thread};
 use crate::harness::Harness;
 use crate::shortcuts::Cmd;
 
@@ -55,18 +55,23 @@ fn ago(t: &Thread) -> String {
 }
 
 /// The second line: why the thread is where it is, then which agent and model.
-fn subtitle(t: &Thread, k: &Kit) -> (String, Option<rune::Color>) {
+/// On the shelves, which hold every project's threads, it starts with the project.
+fn subtitle(s: &App, t: &Thread, lane: Lane, k: &Kit) -> (String, Option<rune::Color>) {
     let model = t.resolved_model.as_deref().unwrap_or(if t.model == crate::harness::models::DEFAULT { "" } else { t.model.as_str() });
     let who = if model.is_empty() { t.harness.name().to_owned() } else { format!("{} · {model}", t.harness.name()) };
+    let project = match s.projects.iter().find(|p| s.in_project(t, &p.path)) {
+        Some(p) if lane != Lane::Inbox => format!("{} · ", p.name),
+        _ => String::new(),
+    };
     let queued = if t.queue.is_empty() { String::new() } else { format!(" · {} queued", t.queue.len()) };
     if !t.asks.is_empty() {
         return (format!("Wants to use {}", t.asks[0].ask.tool), Some(k.c.warning.icon));
     }
     if t.busy {
         let secs = t.turn_started.map_or(0, |s| s.elapsed().as_secs());
-        return (format!("Working {}{queued}", crate::ui::transcript::duration(secs as f64)), None);
+        return (format!("{project}Working {}{queued}", crate::ui::transcript::duration(secs as f64)), None);
     }
-    (format!("{who}{queued}"), None)
+    (format!("{project}{who}{queued}"), None)
 }
 
 /// The status labels' icons, one outline family at 24 × 24 and 2-point strokes (the shapes
@@ -112,7 +117,7 @@ fn status_label(st: Status, k: &Kit) -> El {
 fn thread_row(s: &App, t: &Thread, lane: Lane, k: &Kit) -> El {
     let c = &k.c;
     let id = t.id;
-    let (sub, tint) = subtitle(t, k);
+    let (sub, tint) = subtitle(s, t, lane, k);
     // On the title's line, flush right: why the thread wants you (as T3 Code shows it), else
     // how long ago it last did something. A spinner on the subtitle's line while it works.
     // Under the pointer they give way to the row's actions.
@@ -210,20 +215,24 @@ pub fn view(s: &App, k: &Kit) -> El {
         .build(k)
         .key("new-thread");
 
-    let inbox = s.lane_threads(Lane::Inbox);
     let working = s.lane_threads(Lane::Working);
     let settled_count = s.threads.iter().filter(|t| App::lane(t) == Lane::Settled).count();
 
-    let mut bar = Sidebar::new().label("Threads").inset(0.0).header_gap(4.0).header_padding(0.0, 12.0).row_gap(2.0).header(new);
+    let add = action(&icons::PLUS_SMALL, "Add project", &s.keys.label(Cmd::OpenFolder), k)
+        .on_press_tx(|s: &mut App, tx: &mut Tx| s.choose_folder(tx))
+        .key("add-project");
+    let mut bar = Sidebar::new().label("Threads").inset(0.0).header_gap(4.0).header_padding(0.0, 12.0).row_gap(2.0).header(new)
+        .child(rune_kit::shell::SidebarHeader::new("Projects").action(add).build(k).key("projects-header"));
 
-    // The threads that want you go straight under the header, with no heading of their own
-    // (as in T3 Code): it's the list, not one section of it.
-    let mut list = col().key("inbox").role("group").label("Inbox").w_full().gap(2.0).children(inbox.iter().map(|t| thread_row(s, t, Lane::Inbox, k)));
-    if inbox.is_empty() {
-        let note = if s.threads.is_empty() { "No threads yet" } else { "All caught up" };
-        list = list.child(row().key("inbox-empty").w_full().h(28.0).px(8.0).center_y().child(text(note).font(k.ty.small).color(c.text_faint)));
+    // Each project's threads that want you, under its name (as T3 Code groups them). The
+    // Working and Settled shelves at the foot hold every project's.
+    for p in &s.projects {
+        bar = bar.child(project_group(s, p, k));
     }
-    bar = bar.child(list);
+    if s.projects.is_empty() {
+        bar = bar.child(row().key("projects-empty").w_full().h(28.0).px(8.0).center_y()
+            .child(text("No projects yet").font(k.ty.small).color(c.text_faint)));
+    }
 
     let list = bar.build(k).grow(1.0).shrink().min_h(0.0);
     let mut side = col().key("sidebar-inbox").w_full().h_full().min_h(0.0).child(list);
@@ -235,6 +244,55 @@ pub fn view(s: &App, k: &Kit) -> El {
         side = side.child(settled_shelf(s, settled_count, k));
     }
     side
+}
+
+/// A project's group: its name (pressing it opens or shuts the group), a "+" for a new thread
+/// in it and, under the pointer, a button that takes it out of the sidebar; then its threads.
+fn project_group(s: &App, p: &Project, k: &Kit) -> El {
+    let c = &k.c;
+    let path = p.path.clone();
+    let inbox = s.project_inbox(p);
+    let current = s.selected.is_none() && !s.settings && s.current.as_ref() == Some(&p.path);
+    let mut actions = row().gap(2.0).center_y();
+    actions = actions.child({
+        let path = path.clone();
+        action(&icons::CLOSE_SMALL, "Remove project", "", k)
+            .on_press_tx(move |s: &mut App, _: &mut Tx| { s.remove_project(&path); })
+            .key("remove")
+            .group_opacity(0.0, 1.0)
+    });
+    actions = actions.child({
+        let path = path.clone();
+        action(&icons::PLUS_SMALL, &format!("New thread in {}", p.name), "", k)
+            .on_press_tx(move |s: &mut App, _: &mut Tx| s.new_thread_in(path.clone()))
+            .key("new")
+    });
+    let glyph = if p.collapsed { k.glyph.triangle_right } else { k.glyph.triangle_down };
+    let head = {
+        let path = path.clone();
+        row().key("head").w_full().h(28.0).pl(8.0).pr(4.0).gap(6.0).center_y().radius(k.radius.md)
+            .fill(if current { c.surface_hover } else { rune::Color::TRANSPARENT })
+            .cursor(rune::Cursor::Pointer)
+            .role("button").label(p.name.clone()).help(p.path.display().to_string()).expanded(!p.collapsed)
+            .focusable(false)
+            .child(icon(&icons::FOLDER, 14.0).color(c.icon_weaker))
+            .child(text(p.name.clone()).font(k.ty.ui_medium).color(c.text_base).truncate().shrink().min_w(0.0))
+            .child(icon(glyph, 12.0).color(c.icon_faint).group_opacity(0.0, 1.0))
+            .child(el().grow(1.0))
+            .child(actions)
+            .on_press(move |s: &mut App| s.toggle_project(&path))
+            .hover_group()
+    };
+    let mut group = col().key(format!("project-{}", p.path.display())).role("group").label(p.name.clone()).w_full().gap(2.0)
+        .motion(k.motion.disclosure)
+        .child(head)
+        .children(inbox.iter().map(|t| thread_row(s, t, Lane::Inbox, k)));
+    if inbox.is_empty() && !p.collapsed {
+        let any = s.threads.iter().any(|t| s.in_project(t, &p.path));
+        group = group.child(row().key("empty").w_full().h(24.0).pl(28.0).center_y()
+            .child(text(if any { "All caught up" } else { "No threads yet" }).font(k.ty.small).color(c.text_faint)));
+    }
+    group
 }
 
 /// The Working shelf: threads with a turn running and nothing asked of you, as in T3 Code.
