@@ -2589,7 +2589,7 @@ dependencies = [
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=250597b0a591881b5c0138370cbd5f405ed710db#250597b0a591881b5c0138370cbd5f405ed710db"
+source = "git+https://github.com/JoshuaSchell/rune?rev=1a105febc679d59c073b3995e63bd06192b964f1#1a105febc679d59c073b3995e63bd06192b964f1"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2667,7 +2667,7 @@ dependencies = [
 [[package]]
 name = "rune-kit"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=250597b0a591881b5c0138370cbd5f405ed710db#250597b0a591881b5c0138370cbd5f405ed710db"
+source = "git+https://github.com/JoshuaSchell/rune?rev=1a105febc679d59c073b3995e63bd06192b964f1#1a105febc679d59c073b3995e63bd06192b964f1"
 dependencies = [
  "pulldown-cmark",
  "rune",
@@ -2678,12 +2678,12 @@ dependencies = [
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/JoshuaSchell/rune?rev=250597b0a591881b5c0138370cbd5f405ed710db#250597b0a591881b5c0138370cbd5f405ed710db"
+source = "git+https://github.com/JoshuaSchell/rune?rev=1a105febc679d59c073b3995e63bd06192b964f1#1a105febc679d59c073b3995e63bd06192b964f1"
 
 [[package]]
 name = "rune-notify"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=250597b0a591881b5c0138370cbd5f405ed710db#250597b0a591881b5c0138370cbd5f405ed710db"
+source = "git+https://github.com/JoshuaSchell/rune?rev=1a105febc679d59c073b3995e63bd06192b964f1#1a105febc679d59c073b3995e63bd06192b964f1"
 dependencies = [
  "block2 0.5.1",
  "objc2 0.5.3",
@@ -2694,7 +2694,7 @@ dependencies = [
 [[package]]
 name = "rune-staging"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=250597b0a591881b5c0138370cbd5f405ed710db#250597b0a591881b5c0138370cbd5f405ed710db"
+source = "git+https://github.com/JoshuaSchell/rune?rev=1a105febc679d59c073b3995e63bd06192b964f1#1a105febc679d59c073b3995e63bd06192b964f1"
 dependencies = [
  "wgpu",
 ]
@@ -2702,7 +2702,7 @@ dependencies = [
 [[package]]
 name = "rune-taffy"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=250597b0a591881b5c0138370cbd5f405ed710db#250597b0a591881b5c0138370cbd5f405ed710db"
+source = "git+https://github.com/JoshuaSchell/rune?rev=1a105febc679d59c073b3995e63bd06192b964f1#1a105febc679d59c073b3995e63bd06192b964f1"
 dependencies = [
  "taffy",
 ]
@@ -2710,7 +2710,7 @@ dependencies = [
 [[package]]
 name = "rune-theme-opencode"
 version = "0.0.1"
-source = "git+https://github.com/JoshuaSchell/rune?rev=250597b0a591881b5c0138370cbd5f405ed710db#250597b0a591881b5c0138370cbd5f405ed710db"
+source = "git+https://github.com/JoshuaSchell/rune?rev=1a105febc679d59c073b3995e63bd06192b964f1#1a105febc679d59c073b3995e63bd06192b964f1"
 dependencies = [
  "rune",
  "rune-kit",
