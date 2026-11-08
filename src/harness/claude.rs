@@ -45,6 +45,19 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
                 }).to_string()),
             }
         }
+        // Answers to our own requests: only a refused model, effort or mode change is news.
+        Some("control_response") => {
+            let r = &v["response"];
+            let what = match r["request_id"].as_str() {
+                Some("yoke-model") => Some("switch the model"),
+                Some("yoke-effort") => Some("change the effort"),
+                Some(id) if id.starts_with("yoke-mode") => Some("change the access level"),
+                _ => None,
+            };
+            if let Some(what) = what && r["subtype"] == "error" {
+                out.push(Event::Error(format!("Claude Code couldn't {what}: {}", r["error"].as_str().unwrap_or("it refused"))));
+            }
+        }
         Some("control_cancel_request") => {
             if let Some(id) = s("request_id") { out.push(Event::AskCancelled { request_id: id.into() }); }
         }
@@ -52,7 +65,15 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
         // CLI starts itself once background work it was waiting on has finished.
         Some("system") if s("subtype") == Some("init") => {
             p.turn_open = true;
+            // A new turn's messages haven't streamed yet.
+            p.streamed_text = false;
+            p.sub_streamed.clear();
             out.push(Event::TurnStart);
+            let caps = v["capabilities"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>();
+            if !p.tracks && caps.contains(&"msg_lifecycle_v1") {
+                p.tracks = true;
+                out.push(Event::TracksMessages);
+            }
             if let Some(id) = s("session_id") { out.push(Event::Session(id.into())); }
             if let Some(m) = s("model") {
                 p.model = Some(m.to_owned());
@@ -396,7 +417,7 @@ mod tests {
     #[test]
     fn a_prompt_starting_with_a_dash_isnt_an_option() {
         use crate::harness::{Access, DEFAULT_EFFORT, Harness, Turn};
-        let turn = Turn { harness: Harness::Codex, prompt: "--dangerously-bypass-approvals-and-sandbox".into(), model: crate::harness::models::DEFAULT.into(), effort: DEFAULT_EFFORT.into(), access: Access::ReadOnly, resume: None, cwd: ".".into(), images: Vec::new(), peer_messages: false };
+        let turn = Turn { harness: Harness::Codex, prompt: "--dangerously-bypass-approvals-and-sandbox".into(), model: crate::harness::models::DEFAULT.into(), effort: DEFAULT_EFFORT.into(), access: Access::ReadOnly, resume: None, cwd: ".".into(), images: Vec::new(), peer_messages: false, live: false, uuid: None };
         let args = |h: Harness| h.command(std::path::Path::new("cli"), &turn).get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
         let codex = args(Harness::Codex);
         assert_eq!(&codex[codex.len() - 2..], ["--", "--dangerously-bypass-approvals-and-sandbox"]);

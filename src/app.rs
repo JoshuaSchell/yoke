@@ -268,8 +268,9 @@ pub struct App {
     /// Claude Code's folder, where deleting a thread deletes its session (`history::remove`).
     /// `None` in tests unless one sets a scratch folder.
     pub(crate) claude_home: Option<PathBuf>,
-    events: Receiver<(ThreadId, Event)>,
-    sender: Sender<(ThreadId, Event)>,
+    /// Harness events, by thread and the run of its CLI that sent them (`gens`).
+    events: Receiver<((ThreadId, u64), Event)>,
+    sender: Sender<((ThreadId, u64), Event)>,
     discovered: Receiver<(Harness, Vec<ModelOpt>)>,
     sessions: Receiver<Listed>,
     sessions_tx: Sender<Listed>,
@@ -283,6 +284,13 @@ pub struct App {
     discover_tx: Sender<(Harness, Vec<ModelOpt>)>,
     pub(crate) waker: Option<Waker>,
     running: HashMap<ThreadId, Running>,
+    /// Threads whose CLI (Claude Code's) stays alive between turns.
+    live: HashMap<ThreadId, Live>,
+    /// Each thread's current CLI run: events from one it has replaced are dropped.
+    gens: HashMap<ThreadId, u64>,
+    next_gen: u64,
+    /// `IDLE`, `IDLE_PINNED` and `STOP_GRACE`, shorter in tests.
+    pub(crate) timing: (Duration, Duration, Duration),
     /// Threads whose turn just ended with queued messages to send next.
     ready: Vec<ThreadId>,
     next_id: u64,
@@ -305,10 +313,9 @@ pub enum Alert {
 pub enum StopWhat {
     /// Stop (Esc, or the stop button).
     Turn,
-    /// Steer the draft in now (⌘↩).
-    Steer,
-    /// Send queued message `qid` now.
-    SendNow(u64),
+    /// A message that needs a new CLI (another access level, effort back to the default, a
+    /// changed setting) where the live one still runs work in the background.
+    Restart,
     /// The background line's "Stop all".
     Background,
     /// Quitting Yoke.
@@ -322,10 +329,45 @@ pub struct Queued {
     pub text: String,
     pub model: String,
     pub effort: String,
-    pub access: Access,
+    // The access level isn't kept: a message runs at the one shown when it starts.
     pub images: Vec<PathBuf>,
     /// Other files (and folders) attached: named in the prompt for the agent to read.
     pub files: Vec<PathBuf>,
+    /// Steered into the live CLI (its uuid): it shows here until the CLI takes it in.
+    pub sent: Option<String>,
+}
+
+/// A live CLI (Claude Code's, one per thread): what it was started with or switched to, so a
+/// message that wants something else switches it or, where it can't be switched, restarts it.
+pub struct Live {
+    pub model: String,
+    pub effort: String,
+    pub access: Access,
+    pub peer_messages: bool,
+    pub cwd: PathBuf,
+    /// The CLI's last sign of life, or the last message sent: it's ended after a while idle.
+    pub active: Instant,
+    /// It reports each message's progress (`Event::TracksMessages`).
+    pub tracks: bool,
+    /// A Stop (an interrupt) was sent; if the turn hasn't ended by then, it's forced.
+    pub stop_by: Option<Instant>,
+    /// Messages sent to it that it hasn't answered yet: their uuids, and whether it has taken
+    /// each in (`Event::Lifecycle`).
+    pub sent: Vec<(String, bool)>,
+}
+
+/// An idle live CLI is ended after this long without a sign of life (T3 Code's 30 minutes), or
+/// while it still runs work in the background, after `IDLE_PINNED` (T3's 4 hours).
+pub const IDLE: Duration = Duration::from_secs(30 * 60);
+pub const IDLE_PINNED: Duration = Duration::from_secs(4 * 60 * 60);
+/// How long a Stop waits for the CLI to end the turn before it's forced (T3 Code's 10 s).
+pub const STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// A message's uuid, for the CLI's `command_lifecycle` lines.
+fn new_uuid(n: u64) -> String {
+    let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+    let (a, b) = (t.as_nanos() as u64 ^ (std::process::id() as u64) << 32, n.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    format!("{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}", a >> 32, a >> 16 & 0xffff, a & 0xfff, b >> 52, b & 0xffff_ffff_ffff)
 }
 
 /// A file waiting in the composer, and for an image the thumbnail decoding from it.
@@ -495,6 +537,9 @@ pub struct Thread {
     /// The turn under way is one the CLI started itself (after background work), not the
     /// answer to a message: its diff is the message's turn's.
     pub woken: bool,
+    /// Why the queue's next message doesn't go on its own (it would restart the CLI, ending
+    /// its background work): its ↗ asks.
+    pub held: Option<String>,
 }
 
 /// A question from the CLI, shown on the row (`item`) of the tool it's about.
@@ -542,6 +587,7 @@ impl Thread {
             woke: Vec::new(),
             cost_seen: None,
             woken: false,
+            held: None,
         }
     }
 
@@ -635,6 +681,30 @@ fn find_tool_mut<'a>(items: &'a mut [Item], call: &str) -> Option<&'a mut Item> 
         }
     }
     None
+}
+
+/// A message as the transcript shows it: its text, and what was attached.
+fn shown(q: &Queued) -> String {
+    if q.images.is_empty() && q.files.is_empty() { return q.text.clone(); }
+    let names: Vec<String> = q.images.iter().chain(&q.files).map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())).collect();
+    format!("{}\n\nAttached: {}", q.text, names.join(", "))
+}
+
+/// The thread's CLI is gone: nothing it ran goes on, and nothing waits for an answer from it.
+fn process_gone(t: &mut Thread) {
+    t.asks.clear();
+    fail_running(&mut t.items);
+    let now = Instant::now();
+    for x in t.tasks.iter_mut().filter(|x| x.running()) {
+        x.status = TaskStatus::Stopped;
+        x.ended = Some(now);
+    }
+    t.background.clear();
+    t.woke.clear();
+    t.cost_seen = None;
+    // A steered message it never took in waits in the queue again.
+    for q in &mut t.queue { q.sent = None; }
+    t.rev += 1;
 }
 
 /// Where the current turn's rows start: after the last message sent.
@@ -1032,6 +1102,10 @@ impl App {
             discover_tx,
             waker: None,
             running: HashMap::new(),
+            live: HashMap::new(),
+            gens: HashMap::new(),
+            next_gen: 0,
+            timing: (IDLE, IDLE_PINNED, STOP_GRACE),
             ready: Vec::new(),
             next_id: 1,
         };
@@ -1407,7 +1481,25 @@ impl App {
         self.thread().map_or(self.harness, |t| t.harness)
     }
 
+    /// A turn is under way on thread `id` (or its one-shot CLI hasn't exited yet). A live CLI
+    /// waiting for the next message isn't running.
     pub fn is_running(&self, id: ThreadId) -> bool {
+        self.threads.iter().any(|t| t.id == id && t.busy) || (self.running.contains_key(&id) && !self.live.contains_key(&id))
+    }
+
+    /// Which run of a CLI thread `id` is on (each new process is another).
+    #[cfg(test)]
+    pub fn gens_of(&self, id: ThreadId) -> u64 {
+        self.gens.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Thread `id` has a live CLI (Claude Code's), taking messages as they come.
+    pub fn is_live(&self, id: ThreadId) -> bool {
+        self.live.contains_key(&id) && self.running.contains_key(&id)
+    }
+
+    /// Thread `id`'s CLI is alive (running a turn, working in the background, or waiting).
+    pub fn has_process(&self, id: ThreadId) -> bool {
         self.running.contains_key(&id)
     }
 
@@ -1570,10 +1662,12 @@ impl App {
     /// saved sessions stay; adding it again brings them back. Refused while one of its turns runs.
     pub fn remove_project(&mut self, path: &Path) -> bool {
         let threads: Vec<ThreadId> = self.threads.iter().filter(|t| self.in_project(t, path)).map(|t| t.id).collect();
-        if threads.iter().any(|id| self.is_running(*id)) {
+        if threads.iter().any(|id| self.is_running(*id) || self.background_of(*id)) {
             self.composer_error = Some("Stop the project's running turns before removing it.".into());
             return false;
         }
+        // Their CLIs, waiting for a next message, go with them.
+        for id in &threads { self.end_process(*id); }
         self.threads.retain(|t| !threads.contains(&t.id));
         if self.selected.is_some_and(|id| threads.contains(&id)) { self.selected = None; }
         self.projects.retain(|p| p.path != path);
@@ -1905,6 +1999,7 @@ impl App {
         }
         let running = self.running.remove(&id);
         if let Some(r) = &running { r.stop(); }
+        self.live.remove(&id);
         if let (Some(dir), Some(t)) = (&self.store, self.threads.iter().find(|t| t.id == id))
             && let (true, Some(s)) = (store::keeps(t), &t.session) {
                 store::remove(dir, t.harness, s);
@@ -1939,7 +2034,7 @@ impl App {
         if text.is_empty() { text = if files.is_empty() { "See the attached image." } else { "See the attached files." }.into(); }
         self.draft.clear();
         let id = self.id();
-        Some(Queued { id, text, model: self.model.clone(), effort: self.effort.clone(), access: self.access, images, files })
+        Some(Queued { id, text, model: self.model.clone(), effort: self.effort.clone(), images, files, sent: None })
     }
 
     /// Whether agents may work in `project` without asking first: you trusted it (or a folder
@@ -1983,7 +2078,7 @@ impl App {
                     t.rev += 1;
                 }
             }
-            Some(id) => self.start_turn(id, q, tx),
+            Some(id) => self.start_turn(id, q, tx, true),
             None => {
                 let id = self.id();
                 let Some(project) = self.current.clone() else {
@@ -2010,7 +2105,7 @@ impl App {
                 }
                 self.threads.insert(0, t);
                 self.selected = Some(id);
-                self.start_turn(id, q, tx);
+                self.start_turn(id, q, tx, true);
             }
         }
     }
@@ -2019,37 +2114,27 @@ impl App {
     /// mid-turn, so the turn stops and the message goes straight away on the same session; the
     /// agent sees the conversation so far and the new instruction. With nothing running it's
     /// an ordinary send.
+    ///
+    /// A live CLI (Claude Code's) takes the message into the running turn instead, with
+    /// nothing stopped: what the turn waits on moves to the background, and the message goes
+    /// with priority `now`, so the CLI ends the turn at its next step and answers it.
     pub fn steer(&mut self, tx: &mut Tx) {
         match self.selected.filter(|id| self.is_running(*id)) {
-            // Steering restarts the CLI, which would end its background work: ask first, the
-            // draft kept.
-            Some(id) if self.background_of(id) => {
-                if !self.draft.text.trim().is_empty() || !self.attachments.is_empty() { self.confirm_stop = Some((id, StopWhat::Steer)); }
+            Some(id) => {
+                let Some(q) = self.take_draft() else { return };
+                if let Some(t) = self.thread_mut(id) {
+                    t.queue.insert(0, q);
+                }
+                self.steer_queue(id);
             }
-            Some(id) => self.steer_now(id),
             None => self.send(tx),
         }
     }
 
-    fn steer_now(&mut self, id: ThreadId) {
-        let Some(q) = self.take_draft() else { return };
-        if let Some(t) = self.thread_mut(id) {
-            t.queue.insert(0, q);
-        }
-        self.steer_queue(id);
-    }
-
     /// Sends queued message `qid` now: steering the running turn, or starting a turn if none runs.
     pub fn send_queued_now(&mut self, id: ThreadId, qid: u64, tx: &mut Tx) {
-        if self.background_of(id) {
-            self.confirm_stop = Some((id, StopWhat::SendNow(qid)));
-            return;
-        }
-        self.send_queued_now_anyway(id, qid, tx);
-    }
-
-    fn send_queued_now_anyway(&mut self, id: ThreadId, qid: u64, tx: &mut Tx) {
         let Some(t) = self.thread_mut(id) else { return };
+        if t.queue.iter().any(|q| q.id == qid && q.sent.is_some()) { return; }
         let Some(i) = t.queue.iter().position(|q| q.id == qid) else { return };
         let q = t.queue.remove(i);
         t.queue.insert(0, q);
@@ -2058,19 +2143,40 @@ impl App {
             self.steer_queue(id);
         } else {
             let q = self.thread_mut(id).unwrap().queue.remove(0);
-            self.start_turn(id, q, tx);
+            self.start_turn(id, q, tx, true);
         }
     }
 
     pub fn unqueue(&mut self, id: ThreadId, qid: u64) {
         if let Some(t) = self.thread_mut(id) {
-            t.queue.retain(|q| q.id != qid);
+            t.queue.retain(|q| q.id != qid || q.sent.is_some());
             t.rev += 1;
         }
     }
 
-    /// Stops the running turn so the queue's first message goes as soon as it has exited.
+    /// Sends the queue's first message now: into a live CLI's running turn (`steer`), or by
+    /// stopping a one-shot CLI so it goes as soon as that has exited.
     fn steer_queue(&mut self, id: ThreadId) {
+        if self.live.contains_key(&id) {
+            let n = self.id();
+            let uuid = new_uuid(n);
+            let Some(t) = self.thread_mut(id) else { return };
+            let Some(q) = t.queue.iter_mut().find(|q| q.sent.is_none()) else { return };
+            q.sent = Some(uuid.clone());
+            let line = harness::user_message(&with_files(&q.text, &q.files), &q.images, Some(&uuid), Some("now"));
+            t.steering = true;
+            t.rev += 1;
+            let tracks = self.live.get(&id).is_some_and(|l| l.tracks);
+            if let Some(l) = self.live.get_mut(&id) { l.sent.push((uuid.clone(), false)); l.active = Instant::now(); }
+            if let Some(r) = self.running.get(&id) {
+                // Nothing the turn waits on is stopped: it moves to the background.
+                r.background_tasks(None);
+                r.send(&line);
+            }
+            // A CLI that doesn't say when it takes a message in: show it as sent now.
+            if !tracks { self.apply(id, Event::Lifecycle { uuid, state: "started".into() }); }
+            return;
+        }
         if let Some(t) = self.thread_mut(id) {
             t.steering = true;
             t.rev += 1;
@@ -2078,28 +2184,53 @@ impl App {
         if let Some(r) = self.running.get(&id) { r.stop(); }
     }
 
-    fn start_turn(&mut self, id: ThreadId, q: Queued, tx: &mut Tx) {
+    /// Starts a turn with `q`: into the thread's live CLI when it has one (switching its
+    /// model, effort or access first), else in a new CLI process. `asked`: the person sent it
+    /// just now, so a restart that would end background work asks; otherwise it waits.
+    fn start_turn(&mut self, id: ThreadId, q: Queued, tx: &mut Tx, asked: bool) {
         self.wake(id);
-        let item = self.id();
         let Some(cwd) = self.threads.iter().find(|t| t.id == id).and_then(|t| self.run_dir(t)) else { return };
         let peer_messages = self.defaults.peer_messages;
         // A queued message runs at the access shown now, not when it was queued: lowering the
         // picker reaches what's waiting too.
         let access = self.access;
+        let Some(h) = self.threads.iter().find(|t| t.id == id).map(|t| t.harness) else { return };
+        let access_for = access.for_harness(h);
+        if self.live.contains_key(&id) && self.running.contains_key(&id) {
+            let l = &self.live[&id];
+            // What a live CLI can't switch to: another folder or setting, read only in or out
+            // (plan mode without the prompt tool), or effort back to the CLI's own default.
+            let restart = l.cwd != cwd || l.peer_messages != peer_messages
+                || (l.access == Access::ReadOnly) != (access_for == Access::ReadOnly)
+                || (q.effort != l.effort && q.effort == harness::DEFAULT_EFFORT);
+            if !restart {
+                self.send_live(id, q, access_for, cwd, tx);
+                return;
+            }
+            if self.threads.iter().any(|t| t.id == id && t.has_background()) {
+                // As T3 Code refuses: replacing the CLI would end its background work.
+                let t = self.thread_mut(id).unwrap();
+                t.queue.insert(0, q);
+                t.held = Some("waits: it needs Claude Code restarted, which would stop the background work".into());
+                t.rev += 1;
+                if asked { self.confirm_stop = Some((id, StopWhat::Restart)); }
+                return;
+            }
+            self.end_process(id);
+        }
+        let item = self.id();
+        let n = self.id();
         let Some(t) = self.thread_mut(id) else { return };
-        let shown = if q.images.is_empty() && q.files.is_empty() { q.text.clone() } else {
-            let names: Vec<String> = q.images.iter().chain(&q.files).map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())).collect();
-            format!("{}\n\nAttached: {}", q.text, names.join(", "))
-        };
-        t.items.push(Item { id: item, rev: 0, kind: Kind::User(shown) });
+        t.items.push(Item { id: item, rev: 0, kind: Kind::User(shown(&q)) });
         t.woken = false;
+        t.held = None;
         t.model = q.model.clone();
         t.rev += 1;
         t.failed = false;
         t.updated = SystemTime::now();
-        let turn = Turn { harness: t.harness, prompt: with_files(&q.text, &q.files), model: q.model, effort: q.effort, access: q.access, resume: t.session.clone(), cwd, images: q.images, peer_messages };
-        let turn = Turn { access, ..turn };
-        let h = t.harness;
+        let live = h == Harness::Claude;
+        let uuid = live.then(|| new_uuid(n));
+        let turn = Turn { harness: t.harness, prompt: with_files(&q.text, &q.files), model: q.model.clone(), effort: q.effort.clone(), access, resume: t.session.clone(), cwd: cwd.clone(), images: q.images, peer_messages, live, uuid: uuid.clone() };
         let Some(bin) = self.binary(h) else {
             let e = self.id();
             let t = self.thread_mut(id).unwrap();
@@ -2107,16 +2238,68 @@ impl App {
             return;
         };
         let waker = self.waker.clone().unwrap_or_else(|| std::sync::Arc::new(|| {}));
+        self.next_gen += 1;
+        let tag = (id, self.next_gen);
+        self.gens.insert(id, self.next_gen);
         // The folder's snapshot before the turn (for its diff) is taken just before the CLI starts.
-        let cwd = turn.cwd.clone();
         let running = match self.begin_checkpoint(id, &cwd) {
-            Some(snapshot) => harness::spawn_after(snapshot, &bin, turn, id, self.sender.clone(), waker),
-            None => harness::spawn(&bin, turn, id, self.sender.clone(), waker),
+            Some(snapshot) => harness::spawn_after(snapshot, &bin, turn, tag, self.sender.clone(), waker),
+            None => harness::spawn(&bin, turn, tag, self.sender.clone(), waker),
         };
         self.running.insert(id, running);
+        if live {
+            self.live.insert(id, Live {
+                model: q.model, effort: q.effort, access: access_for, peer_messages, cwd, active: Instant::now(), tracks: false, stop_by: None,
+                sent: uuid.into_iter().map(|u| (u, false)).collect(),
+            });
+        }
         if let Some(t) = self.thread_mut(id) {
             t.busy = true;
             t.turn_started = Some(Instant::now());
+        }
+        if self.selected == Some(id) { tx.scroll_to_bottom("transcript"); }
+        tx.wake_after(Duration::from_secs(1));
+    }
+
+    /// A message into thread `id`'s live CLI, which is waiting (or working in the
+    /// background): switched to the message's model, effort and access first, its folder's
+    /// snapshot taken for the turn's diff, then the message.
+    fn send_live(&mut self, id: ThreadId, q: Queued, access: Access, cwd: PathBuf, tx: &mut Tx) {
+        let (Some(r), Some(l)) = (self.running.get(&id), self.live.get_mut(&id)) else { return };
+        if q.model != l.model {
+            r.set_model(&q.model);
+            l.model = q.model.clone();
+        }
+        if q.effort != l.effort {
+            r.set_effort(&q.effort);
+            l.effort = q.effort.clone();
+        }
+        if access != l.access {
+            r.set_access(access);
+            l.access = access;
+        }
+        let r = r.clone();
+        let item = self.id();
+        let n = self.id();
+        let uuid = new_uuid(n);
+        let line = harness::user_message(&with_files(&q.text, &q.files), &q.images, Some(&uuid), None);
+        if let Some(l) = self.live.get_mut(&id) {
+            l.sent.push((uuid, false));
+            l.active = Instant::now();
+        }
+        let Some(t) = self.thread_mut(id) else { return };
+        t.items.push(Item { id: item, rev: 0, kind: Kind::User(shown(&q)) });
+        t.woken = false;
+        t.held = None;
+        t.model = q.model;
+        t.rev += 1;
+        t.failed = false;
+        t.updated = SystemTime::now();
+        t.busy = true;
+        t.turn_started = Some(Instant::now());
+        match self.begin_checkpoint(id, &cwd) {
+            Some(snapshot) => r.send_after(snapshot, line),
+            None => { r.send(&line); }
         }
         if self.selected == Some(id) { tx.scroll_to_bottom("transcript"); }
         tx.wake_after(Duration::from_secs(1));
@@ -2132,10 +2315,13 @@ impl App {
         let (id, a) = (t.id, a.for_harness(t.harness));
         let Some(r) = self.running.get(&id) else { return };
         // Read only can't be reached mid-turn: plan mode would refuse without the prompt tool.
+        // (A live CLI gets a new process for it with the next message.)
         if a == Access::ReadOnly { return; }
+        if self.live.get(&id).is_some_and(|l| l.access == Access::ReadOnly) { return; }
         r.set_access(a);
-        if a != Access::Full { return; }
         let covered: Vec<u64> = t.asks.iter().map(|p| p.item).collect();
+        if let Some(l) = self.live.get_mut(&id) { l.access = a; }
+        if a != Access::Full { return; }
         for item in covered { self.answer(id, item, Decision::Allow); }
     }
 
@@ -2161,7 +2347,21 @@ impl App {
 
     /// The person stops the running turn (Esc or the stop button). The queue waits. Stopping
     /// ends the CLI, and with it what it runs in the background: that asks first.
+    ///
+    /// A live CLI (Claude Code's) is interrupted instead: the turn ends and its background work
+    /// goes on. If the turn hasn't ended `STOP_GRACE` later, the stop is forced (asking first
+    /// while there's background work), as T3 Code's two-stage stop is.
     pub fn stop(&mut self, id: ThreadId) {
+        if self.live.contains_key(&id) && self.is_running(id) {
+            if let Some(r) = self.running.get(&id) { r.interrupt(); }
+            let grace = self.timing.2;
+            if let Some(l) = self.live.get_mut(&id) { l.stop_by.get_or_insert(Instant::now() + grace); }
+            if let Some(t) = self.thread_mut(id) {
+                t.stop_requested = true;
+                t.rev += 1;
+            }
+            return;
+        }
         if self.background_of(id) {
             self.confirm_stop = Some((id, StopWhat::Turn));
             return;
@@ -2174,11 +2374,22 @@ impl App {
             r.stop();
             if let Some(t) = self.thread_mut(id) { t.stop_requested = true; }
         }
+        if let Some(l) = self.live.get_mut(&id) { l.stop_by = None; }
     }
 
     /// Whether thread `id`'s CLI runs work in the background that ending it would stop.
     pub fn background_of(&self, id: ThreadId) -> bool {
-        self.is_running(id) && self.threads.iter().any(|t| t.id == id && t.has_background())
+        self.has_process(id) && self.threads.iter().any(|t| t.id == id && t.has_background())
+    }
+
+    /// Ends thread `id`'s CLI now, if it has one, and forgets it: what it ran is over.
+    fn end_process(&mut self, id: ThreadId) {
+        if let Some(r) = self.running.remove(&id) { r.stop(); }
+        self.live.remove(&id);
+        // Its run's events, its exit included, are dropped from here on.
+        self.next_gen += 1;
+        self.gens.insert(id, self.next_gen);
+        if let Some(t) = self.thread_mut(id) { process_gone(t); }
     }
 
     /// Stops one of thread `id`'s tasks (a subagent or command) and nothing else.
@@ -2196,8 +2407,15 @@ impl App {
         let Some((id, what)) = self.confirm_stop.take() else { return };
         match what {
             StopWhat::Turn => self.stop_now(id),
-            StopWhat::Steer => self.steer_now(id),
-            StopWhat::SendNow(qid) => self.send_queued_now_anyway(id, qid, tx),
+            StopWhat::Restart => {
+                // The CLI goes (its background work with it), and the held message starts a
+                // new one with what it asks for.
+                self.end_process(id);
+                if let Some(t) = self.thread_mut(id) { t.held = None; }
+                if let Some(q) = self.thread_mut(id).filter(|t| !t.queue.is_empty()).map(|t| t.queue.remove(0)) {
+                    self.start_turn(id, q, tx, true);
+                }
+            }
             StopWhat::Background => {
                 let tasks: Vec<String> = self.threads.iter().find(|t| t.id == id).map(|t| t.background.iter().map(|b| b.id.clone()).collect()).unwrap_or_default();
                 for task in tasks { self.stop_task(id, &task); }
@@ -2212,7 +2430,7 @@ impl App {
 
     /// The threads whose CLI is still at work: a turn, or work in the background.
     pub fn at_work(&self) -> Vec<&Thread> {
-        self.threads.iter().filter(|t| self.is_running(t.id) || t.busy || t.has_background()).collect()
+        self.threads.iter().filter(|t| t.busy || t.has_background()).collect()
     }
 
     /// Quitting: asks first while any thread's CLI is at work, since quitting ends it. True if
@@ -2250,25 +2468,66 @@ impl App {
             self.land_sessions(&l.project, l.claude);
             self.land_kept(&l.project, l.kept);
         }
-        while let Ok((id, e)) = self.events.try_recv() {
+        while let Ok(((id, run), e)) = self.events.try_recv() {
+            // From a CLI the thread has since replaced (or ended): over.
+            if self.gens.get(&id) != Some(&run) { continue; }
             changed = true;
+            if let Some(l) = self.live.get_mut(&id) { l.active = Instant::now(); }
             self.apply(id, e);
         }
+        changed |= self.live_timers();
         while let Ok((id, tok, stat)) = self.checkpoint_rx.try_recv() {
             changed = true;
             self.land_checkpoint(id, &tok, stat);
         }
         changed |= self.drain_diff();
         for id in std::mem::take(&mut self.ready) {
-            if let Some(t) = self.thread_mut(id).filter(|t| !t.queue.is_empty()) {
+            if let Some(t) = self.thread_mut(id).filter(|t| t.queue.first().is_some_and(|q| q.sent.is_none()) && !t.busy) {
                 let q = t.queue.remove(0);
-                self.start_turn(id, q, tx);
+                self.start_turn(id, q, tx, false);
                 changed = true;
             }
         }
-        if !self.running.is_empty() {
-            // The "Working… 12s" counter.
+        if self.threads.iter().any(|t| t.busy || t.has_background()) {
+            // The "Working… 12s" counter, and the background work's times.
             tx.wake_after(Duration::from_secs(1));
+        } else if let Some(next) = self.live.values().map(|l| l.active + self.timing.0).min() {
+            // An idle CLI is ended on time, without waking every second for it.
+            tx.wake_after(next.saturating_duration_since(Instant::now()) + Duration::from_millis(50));
+        }
+        changed
+    }
+
+    /// Live CLIs' clocks: a Stop the CLI hasn't honoured is forced (asking first while it runs
+    /// background work), and one idle for `IDLE` (with background work, `IDLE_PINNED`) is
+    /// ended: closing its stdin, or ending it with its background work. True if anything
+    /// changed.
+    fn live_timers(&mut self) -> bool {
+        let now = Instant::now();
+        let (idle_for, pinned_for, _) = self.timing;
+        let mut changed = false;
+        let ids: Vec<ThreadId> = self.live.keys().copied().collect();
+        for id in ids {
+            let (busy, background) = self.threads.iter().find(|t| t.id == id).map_or((false, false), |t| (t.busy, t.has_background()));
+            let Some(l) = self.live.get_mut(&id) else { continue };
+            if l.stop_by.is_some_and(|by| now >= by) {
+                l.stop_by = None;
+                if busy {
+                    changed = true;
+                    if background { self.confirm_stop = Some((id, StopWhat::Turn)); } else { self.stop_now(id); }
+                }
+                continue;
+            }
+            let idle = now.saturating_duration_since(l.active);
+            if busy || !l.sent.is_empty() || idle < idle_for || (background && idle < pinned_for) { continue; }
+            changed = true;
+            if background {
+                self.end_process(id);
+            } else if let Some(r) = self.running.get(&id) {
+                // It exits once its stdin closes; its exit lands as usual.
+                r.close_input();
+                if let Some(l) = self.live.get_mut(&id) { l.active = now + pinned_for; }
+            }
         }
         changed
     }
@@ -2308,12 +2567,46 @@ impl App {
     }
 
     fn apply_to(&mut self, id: ThreadId, e: Event, selected: bool, fresh: u64) {
-        let Some(t) = self.thread_mut(id) else { return };
+        // The thread alone, so the app's other fields (the live CLIs, alerts) stay reachable.
+        let Some(t) = self.threads.iter_mut().find(|t| t.id == id) else { return };
         t.rev += 1;
         match e {
             Event::Session(s) => t.session = Some(s),
             Event::Model(m) => t.resolved_model = Some(m),
-            Event::Thinking | Event::RateLimit(_) | Event::Lifecycle { .. } => {}
+            Event::Thinking | Event::RateLimit(_) => {}
+            Event::TracksMessages => {
+                if let Some(l) = self.live.get_mut(&id) { l.tracks = true; }
+            }
+            Event::Lifecycle { uuid, state } => {
+                let steered = t.queue.iter().position(|q| q.sent.as_deref() == Some(uuid.as_str()));
+                match state.as_str() {
+                    // The CLI takes a steered message in: it moves from the queue into the
+                    // transcript, where the turn now answers it.
+                    "started" => {
+                        if let Some(at) = steered {
+                            let q = t.queue.remove(at);
+                            end_stream(t);
+                            t.items.push(Item { id: fresh, rev: 0, kind: Kind::User(shown(&q)) });
+                            t.steering = false;
+                            t.model = q.model;
+                            if t.busy {
+                                // Folded into the running turn: that turn's diff is this one's now.
+                                if let Some(c) = t.checkpoints.last_mut().filter(|c| !c.ended) { c.prompt += 1; }
+                            } else {
+                                t.busy = true;
+                                t.turn_started = Some(Instant::now());
+                            }
+                        }
+                        if let Some(l) = self.live.get_mut(&id) && let Some(m) = l.sent.iter_mut().find(|m| m.0 == uuid) { m.1 = true; }
+                    }
+                    "completed" | "cancelled" => {
+                        // A steered message the CLI dropped (a Stop) waits in the queue again.
+                        if let Some(at) = steered { t.queue[at].sent = None; }
+                        if let Some(l) = self.live.get_mut(&id) { l.sent.retain(|m| m.0 != uuid); }
+                    }
+                    _ => {}
+                }
+            }
             Event::ContextUsed(n) => t.context = Some(n),
             Event::ContextWindow(w) => t.context_window = Some(w),
             Event::TurnStart => {
@@ -2387,6 +2680,13 @@ impl App {
             Event::ToolEnd { id: done, ok, output } => end_call(&mut t.items, &done, ok, output),
             Event::TaskStarted(ts) => {
                 if ts.ambient { return; }
+                // A steer waits for the turn to take it in: what the turn starts to wait on
+                // meanwhile moves to the background too (a command registers as a task only
+                // once it has run a moment, so the first request can miss it).
+                if !ts.background && ts.parent_task.is_none() && t.queue.iter().any(|q| q.sent.is_some())
+                    && let (Some(r), Some(call)) = (self.running.get(&id), ts.call.as_deref()) {
+                        r.background_tasks(Some(call));
+                    }
                 let kind = match ts.kind.as_str() {
                     "local_agent" => TaskKind::Agent,
                     "local_bash" => TaskKind::Command,
@@ -2457,20 +2757,49 @@ impl App {
                     t.items.push(Item { id: fresh, rev: 0, kind: Kind::Error(m) });
                 }
                 let secs = t.turn_started.map_or(0.0, |s| s.elapsed().as_secs_f64());
-                t.items.push(Item { id: fresh + 1, rev: 0, kind: Kind::TurnEnd { secs, cost_usd: cost, stopped: false } });
-                t.busy = false;
-                t.unread = !selected;
+                let live = self.live.get_mut(&id);
+                // A live CLI's turn ends here; what it was answering is answered.
+                let stopped = live.is_some() && std::mem::take(&mut t.stop_requested);
+                t.items.push(Item { id: fresh + 1, rev: 0, kind: Kind::TurnEnd { secs, cost_usd: cost, stopped } });
                 t.updated = SystemTime::now();
-                // A queue that goes on once the process exits (at once, with nothing in the
-                // background) means the work isn't over.
-                let next = !t.queue.is_empty() && !t.has_background();
+                let Some(l) = live else {
+                    // A one-shot CLI: the queue goes on once it exits (at once, with nothing in
+                    // the background), and then the work isn't over.
+                    t.busy = false;
+                    t.unread = !selected;
+                    let next = !t.queue.is_empty() && !t.has_background();
+                    let alert = if t.failed { Alert::Failed } else { Alert::Done };
+                    if !next { self.alerts.push((id, alert)); }
+                    return;
+                };
+                l.stop_by = None;
+                if l.tracks { l.sent.retain(|m| !m.1); } else { l.sent.clear(); }
+                // A steered message the CLI hasn't taken in yet: it answers that next.
+                if t.queue.iter().any(|q| q.sent.is_some()) {
+                    t.turn_started = Some(Instant::now());
+                    return;
+                }
+                t.busy = false;
+                t.steering = false;
+                t.unread = !selected;
+                // A message held for a restart goes once nothing runs in the background.
+                if t.held.is_some() && !t.has_background() { t.held = None; }
+                // The queue goes on, into the same CLI, unless the turn was stopped.
+                let next = !stopped && !t.queue.is_empty() && t.held.is_none();
+                if next { self.ready.push(id); }
                 let alert = if t.failed { Alert::Failed } else { Alert::Done };
-                if !next { self.alerts.push((id, alert)); }
+                if !next && !stopped { self.alerts.push((id, alert)); }
             }
             Event::Exited { code, stderr } => {
                 end_stream(t);
                 // A turn still under way when the process ended was cut short.
                 let cut = t.busy;
+                // A live CLI that died between turns says why, unless it was told to go.
+                if !cut && code.is_some_and(|c| c != 0) && !t.stop_requested {
+                    let msg = harness::first_line(stderr.trim().lines().last().unwrap_or(""), 400);
+                    let msg = if msg.is_empty() { format!("{} exited with status {}", t.harness.binary(), code.unwrap_or(-1)) } else { msg };
+                    t.items.push(Item { id: fresh, rev: 0, kind: Kind::Error(msg) });
+                }
                 if cut {
                     let stopped = code.is_none();
                     if !stopped && code != Some(0) {
@@ -2484,16 +2813,7 @@ impl App {
                 }
                 // Nothing is listening for answers any more, and whatever the process still ran
                 // (in the background too) ended with it.
-                t.asks.clear();
-                fail_running(&mut t.items);
-                let now = Instant::now();
-                for x in t.tasks.iter_mut().filter(|x| x.running()) {
-                    x.status = TaskStatus::Stopped;
-                    x.ended = Some(now);
-                }
-                t.background.clear();
-                t.woke.clear();
-                t.cost_seen = None;
+                process_gone(t);
                 t.busy = false;
                 if cut { t.unread = !selected; }
                 t.updated = SystemTime::now();
@@ -2506,6 +2826,7 @@ impl App {
                 // that ended with its result was told already.
                 let alert = (cut && !stopped_by_user && !advance).then_some(if t.failed { Alert::Failed } else { Alert::Done });
                 self.running.remove(&id);
+                self.live.remove(&id);
                 if advance { self.ready.push(id); }
                 if let Some(a) = alert { self.alerts.push((id, a)); }
             }
@@ -2765,7 +3086,7 @@ pub mod scenes {
         s.selected = Some(101);
         for text in ["Also check whether the font atlas is rebuilt on open.", "Then write up what you find in NOTES.md."] {
             let id = s.id();
-            let q = Queued { id, text: text.into(), model: models::DEFAULT.into(), effort: harness::DEFAULT_EFFORT.into(), access: Access::Edits, images: Vec::new(), files: Vec::new() };
+            let q = Queued { id, text: text.into(), model: models::DEFAULT.into(), effort: harness::DEFAULT_EFFORT.into(), images: Vec::new(), files: Vec::new(), sent: None };
             s.thread_mut(101).unwrap().queue.push(q);
         }
         s.draft = TextEdit::new("Skip the release build, debug is fine");
@@ -2831,13 +3152,10 @@ pub mod scenes {
     }
 
     /// The turn over, "Slow echo" still at work: the turn's end says so, and above the composer
-    /// what runs in the background, with a message queued behind it.
+    /// what runs in the background.
     pub fn background(s: &mut App) {
         let id = play(s, "Count the files in /tmp with one subagent, and run a slow echo in another in the background.", SUBAGENTS, 70);
         s.apply(id, Event::Done { cost_usd: Some(0.0082), error: None });
-        let q = s.id();
-        let t = s.thread_mut(id).unwrap();
-        t.queue.push(Queued { id: q, text: "Then tell me which of the two took longer.".into(), model: models::DEFAULT.into(), effort: harness::DEFAULT_EFFORT.into(), access: Access::Edits, images: Vec::new(), files: Vec::new() });
         s.alerts.clear();
     }
 
@@ -2847,11 +3165,25 @@ pub mod scenes {
         play(s, "Run `sleep 25; echo BG_DONE` in the background, say STARTED, and FINISHED once it's done.", BACKGROUND_BASH, usize::MAX);
     }
 
-    /// Steering while a subagent works in the background asks first.
+    /// A message steered into the running turn, waiting for the CLI to take it in.
+    pub fn steer(s: &mut App) {
+        agents(s);
+        let q = s.id();
+        let t = s.thread_mut(120).unwrap();
+        t.steering = true;
+        t.queue.push(Queued { id: q, text: "Skip the slow one, the count is enough".into(), model: models::DEFAULT.into(), effort: harness::DEFAULT_EFFORT.into(), images: Vec::new(), files: Vec::new(), sent: Some("u1".into()) });
+    }
+
+    /// A message that needs a new CLI (here, read only) while a subagent works in the
+    /// background asks first.
     pub fn stop_background(s: &mut App) {
         background(s);
-        s.draft = TextEdit::new("Actually, skip the slow one");
-        s.confirm_stop = Some((120, StopWhat::Steer));
+        let q = s.id();
+        let t = s.thread_mut(120).unwrap();
+        t.queue.push(Queued { id: q, text: "Now just read the counts back to me.".into(), model: models::DEFAULT.into(), effort: harness::DEFAULT_EFFORT.into(), images: Vec::new(), files: Vec::new(), sent: None });
+        t.held = Some("waits: it needs Claude Code restarted, which would stop the background work".into());
+        s.access = Access::ReadOnly;
+        s.confirm_stop = Some((120, StopWhat::Restart));
     }
 
     /// Quitting while threads are at work asks first.

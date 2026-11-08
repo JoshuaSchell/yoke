@@ -133,7 +133,7 @@ mod tests {
         let mut busy = thread(3, 9);
         busy.busy = true;
         let mut queued = thread(4, 9);
-        queued.queue.push(crate::app::Queued { id: 1, text: "x".into(), model: String::new(), effort: String::new(), access: crate::harness::Access::Ask, images: Vec::new(), files: Vec::new() });
+        queued.queue.push(crate::app::Queued { id: 1, text: "x".into(), model: String::new(), effort: String::new(), images: Vec::new(), files: Vec::new(), sent: None });
         s.threads = vec![thread(1, 8), thread(2, 2), busy, queued];
         let (moved, next) = s.auto_settle();
         assert!(moved);

@@ -501,7 +501,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let turn = crate::harness::Turn {
             harness: Harness::Claude, prompt: "hi".into(), model: "default".into(), effort: "default".into(),
-            access: crate::harness::Access::ReadOnly, resume: None, cwd: std::env::temp_dir(), images: Vec::new(), peer_messages: false,
+            access: crate::harness::Access::ReadOnly, resume: None, cwd: std::env::temp_dir(), images: Vec::new(), peer_messages: false, live: false, uuid: None,
         };
         let running = crate::harness::spawn_after(
             || std::thread::sleep(std::time::Duration::from_millis(200)),

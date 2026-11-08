@@ -111,6 +111,7 @@ const SCENES: &[Scene] = &[
     ("agents", app::scenes::agents),
     ("background", app::scenes::background),
     ("wake", app::scenes::wake),
+    ("steer", app::scenes::steer),
     ("stop-background", app::scenes::stop_background),
     ("quit", app::scenes::quit),
 ];
@@ -305,7 +306,7 @@ mod tests {
     }
 
     fn args(h: Harness, effort: &str) -> Vec<String> {
-        let turn = crate::harness::Turn { harness: h, prompt: "hi".into(), model: "Default".into(), effort: effort.into(), access: Access::Edits, resume: None, cwd: ".".into(), images: Vec::new(), peer_messages: true };
+        let turn = crate::harness::Turn { harness: h, prompt: "hi".into(), model: "Default".into(), effort: effort.into(), access: Access::Edits, resume: None, cwd: ".".into(), images: Vec::new(), peer_messages: true, live: false, uuid: None };
         h.command(std::path::Path::new("x"), &turn).get_args().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
@@ -1007,38 +1008,26 @@ mod tests {
         assert!(rt.state.keys.is_default(Cmd::NewThread));
     }
 
-    /// A stand-in `claude` speaking stream-json on stdin: it reads our `initialize` and the
-    /// prompt, answers at once, or after 10 s when the prompt says "slow". When it says
-    /// "approve" it asks to run a Bash command, waits for the answer, and reports it as the
-    /// tool's output ("allowed" or "denied"). Each test gets its own copy (`name`), so tests
-    /// running in parallel don't rewrite a script another is running.
+    /// A stand-in `claude` speaking stream-json on stdin, one process taking message after
+    /// message as the live CLI does (`src/harness/fixtures/fake_claude.py` says what each
+    /// message makes it do). Each test gets its own copy (`name`), so tests running in
+    /// parallel don't rewrite a script another is running; each start of it is logged in
+    /// `<copy>.runs`.
     fn fake_claude(name: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let dir = test_dir().join(format!("fake-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join(name);
-        std::fs::write(&bin, concat!(
-            "#!/bin/sh\n",
-            "read -r init\n",
-            "read -r msg\n",
-            "case \"$msg\" in *slow*) sleep 10 ;; esac\n",
-            "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"fake\"}'\n",
-            "case \"$msg\" in *approve*)\n",
-            "  echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"echo hi\"}}]}}'\n",
-            "  echo '{\"type\":\"control_request\",\"request_id\":\"r1\",\"request\":{\"subtype\":\"can_use_tool\",\"tool_name\":\"Bash\",\"input\":{\"command\":\"echo hi\"},\"tool_use_id\":\"t1\",\"permission_suggestions\":[]}}'\n",
-            "  mode=\n",
-            "  while read -r answer; do\n",
-            "    case \"$answer\" in *set_permission_mode*bypassPermissions*) mode='mode-bypassPermissions ' ;; *'\"request_id\":\"r1\"'*) break ;; esac\n",
-            "  done\n",
-            "  out=denied\n",
-            "  case \"$answer\" in *'\"behavior\":\"allow\"'*) out=\"${mode}allowed\" ;; esac\n",
-            "  echo '{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"'\"$out\"'\",\"is_error\":false}]}}'\n",
-            "  ;;\n",
-            "esac\n",
-            "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s1\"}'\n",
-        )).unwrap();
+        std::fs::write(&bin, include_str!("harness/fixtures/fake_claude.py")).unwrap();
+        let _ = std::fs::remove_file(bin.with_file_name(format!("{name}.runs")));
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         bin
+    }
+
+    /// How many times the stand-in `bin` was started.
+    fn runs(bin: &std::path::Path) -> usize {
+        let log = bin.with_file_name(format!("{}.runs", bin.file_name().unwrap().to_string_lossy()));
+        std::fs::read_to_string(log).map_or(0, |l| l.lines().count())
     }
 
     #[track_caller]
@@ -1061,8 +1050,10 @@ mod tests {
     #[test]
     fn follow_ups_queue_and_steer() {
         let mut app = new_app();
-        app.installed = vec![(Harness::Claude, Some(fake_claude("claude-queue")))];
+        let bin = fake_claude("claude-queue");
+        app.installed = vec![(Harness::Claude, Some(bin.clone()))];
         app.choose_harness(Harness::Claude);
+        app.model = "haiku".into();
         let mut rt = headless(app);
         let typed = |rt: &mut Runtime<App>, text: &str, k: KeyEvent| {
             rt.key(key(Key::Text(text.into())));
@@ -1080,26 +1071,91 @@ mod tests {
         assert_eq!(rt.state.thread().unwrap().queue.iter().map(|q| q.text.as_str()).collect::<Vec<_>>(), ["two", "three"]);
         assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("two")), "the queue shows above the prompt");
         let qid = rt.state.thread().unwrap().queue[0].id;
+        // Once the slow command runs (a task of the turn's).
+        pump_until(&mut rt, 30, |s| s.thread().unwrap().tasks.iter().any(|t| t.running()));
+        let steered = Instant::now();
         rt.update(|s, tx| s.send_queued_now(id, qid, tx));
-        // "two" starts once the slow turn is killed, then "three" after it.
+        // "two" goes into the running turn (its slow command moves to the background), then
+        // "three" after it, all into the one CLI.
         pump_until(&mut rt, 30, |s| s.thread().unwrap().queue.is_empty() && !s.is_running(id));
-        let slow = rt.state.thread().unwrap().items.iter().find_map(|i| match i.kind { Kind::TurnEnd { stopped, .. } => Some(stopped), _ => None });
-        assert_eq!(slow, Some(true), "steering killed the slow turn rather than waiting it out");
+        assert!(steered.elapsed() < Duration::from_secs(8), "steering didn't wait the slow command out");
         assert_eq!(user_messages(&rt.state), ["slow one", "two", "three"]);
+        let t = rt.state.thread().unwrap();
+        assert!(t.items.iter().all(|i| !matches!(i.kind, Kind::TurnEnd { stopped: true, .. })), "nothing was stopped");
+        assert!(t.has_background(), "the slow command goes on in the background");
+        let replies: Vec<&str> = t.items.iter().filter_map(|i| match &i.kind { Kind::Assistant { text, .. } => Some(text.as_str()), _ => None }).collect();
+        assert_eq!(replies, ["ok: two (haiku)", "ok: three (haiku)"]);
+        assert_eq!(runs(&bin), 1, "one CLI for the thread");
+        assert!(rt.state.has_process(id), "it waits for the next message");
 
-        // Esc stops a slow turn; what was queued behind it waits.
+        // Esc stops a slow turn (an interrupt); what was queued behind it waits, and the CLI
+        // lives on.
         typed(&mut rt, "slow again", key(Key::Enter));
         typed(&mut rt, "after", key(Key::Enter));
         rt.key(key(Key::Escape));
         rt.frame(1.0 / 60.0);
-        // Generous for a slow CI machine; what matters is that the turn was killed, not that
+        // Generous for a slow CI machine; what matters is that the turn was stopped, not that
         // its 10-second sleep ran out.
         pump_until(&mut rt, 30, |s| !s.is_running(id));
         rt.update(|s, tx| { s.drain(tx); });
         assert!(!rt.state.is_running(id));
-        let stopped = rt.state.thread().unwrap().items.iter().rev().find_map(|i| match i.kind { Kind::TurnEnd { stopped, .. } => Some(stopped), _ => None });
-        assert_eq!(stopped, Some(true), "Esc killed the turn");
-        assert_eq!(rt.state.thread().unwrap().queue.len(), 1, "the queue waits after a stop");
+        let t = rt.state.thread().unwrap();
+        let stopped = t.items.iter().rev().find_map(|i| match i.kind { Kind::TurnEnd { stopped, .. } => Some(stopped), _ => None });
+        assert_eq!(stopped, Some(true), "Esc stopped the turn");
+        assert!(!t.failed, "a stop isn't a failure");
+        assert_eq!(t.queue.len(), 1, "the queue waits after a stop");
+        assert!(rt.state.has_process(id) && runs(&bin) == 1, "the CLI lives on");
+    }
+
+    /// The real `claude` (haiku, a few cents): a command in the background outlives its turn,
+    /// a message meanwhile goes into the same CLI, the CLI's own turn follows once the command
+    /// is done, and a steer mid-turn moves the running command to the background instead of
+    /// waiting it out. `cargo test -- --ignored live_claude_background --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_claude_background_work_and_steering() {
+        let mut rt = runtime();
+        rt.state.access = Access::Full;
+        let dir = std::env::temp_dir().join(format!("yoke-live-bg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sleep = |n: u32, word: &str| format!("python3 -c \"import time; time.sleep({n}); print('{word}')\"");
+        turn(&mut rt, &format!("Run the Bash command `{}` with run_in_background set to true. Then reply STARTED only. When it finishes, reply FINISHED only.", sleep(12, "BG_DONE")));
+        let id = rt.state.selected.unwrap();
+        let run = rt.state.gens_of(id);
+        assert!(rt.state.thread().unwrap().has_background(), "the command runs on after the result");
+        eprintln!("background: {}", rt.state.thread().unwrap().background_counts());
+        let pong = turn(&mut rt, "Reply PONG only.");
+        assert!(pong.contains("PONG"), "{pong}");
+        assert_eq!(rt.state.gens_of(id), run, "the same CLI took it");
+        pump_until(&mut rt, 60, |s| s.thread().unwrap().items.iter().any(|i| matches!(i.kind, Kind::Wake(_))) && !s.is_running(id));
+        let t = rt.state.thread().unwrap();
+        let woke = t.items.iter().find_map(|i| match &i.kind { Kind::Wake(w) => Some(w.clone()), _ => None }).unwrap();
+        eprintln!("woke: {woke}; last reply: {:?}", replies(&rt.state).last());
+        assert!(!t.has_background());
+
+        // Steer mid-turn: the foreground command moves to the background.
+        rt.key(key(Key::Text(format!("Run the Bash command `{}` in the foreground (not in the background). Then reply DONE only.", sleep(25, "FG_DONE")))));
+        rt.frame(1.0 / 60.0);
+        rt.key(key(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        pump_until(&mut rt, 60, |s| s.thread().unwrap().items.iter().rev().take_while(|i| !matches!(i.kind, Kind::User(_))).any(|i| matches!(&i.kind, Kind::Tool { name, .. } if name == "Bash")));
+        std::thread::sleep(Duration::from_secs(1));
+        let steered = Instant::now();
+        rt.key(key(Key::Text("Reply STEERED only.".into())));
+        rt.frame(1.0 / 60.0);
+        rt.update(|s, tx| s.steer(tx));
+        pump_until(&mut rt, 60, |s| replies(s).iter().any(|r| r.contains("STEERED")) && !s.is_running(id));
+        eprintln!("steered in {:?}; background: {:?}", steered.elapsed(), rt.state.thread().unwrap().background_counts());
+        assert!(steered.elapsed() < Duration::from_secs(20), "didn't wait out the 25 s command");
+        assert_eq!(rt.state.gens_of(id), run, "still the same CLI");
+        assert_eq!(user_messages(&rt.state).last().map(String::as_str), Some("Reply STEERED only."));
+        // Esc while only background work runs stops nothing; Stop all does, through stop_task.
+        rt.update(|s, _| s.ask_stop_background(id));
+        rt.update(|s, tx| s.confirm_stop(tx));
+        pump_until(&mut rt, 60, |s| !s.thread().unwrap().has_background());
+        pump_until(&mut rt, 60, |s| !s.is_running(id));
+        assert_eq!(rt.state.gens_of(id), run);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Settings › New threads: the defaults show on the new-thread screen at once, ⌘N goes
@@ -1198,12 +1254,15 @@ mod tests {
         let id = rt.state.selected.expect("⌘↩ sent");
         assert!(rt.state.is_running(id));
 
-        // Sending into the running turn steers: it stops, and "now" goes straight away.
+        // Sending into the running turn steers: "now" goes straight in, the slow command moved
+        // to the background rather than stopped.
+        pump_until(&mut rt, 30, |s| s.thread().unwrap().tasks.iter().any(|t| t.running()));
+        let steered = Instant::now();
         typed(&mut rt, "now", enter(true, false));
         pump_until(&mut rt, 30, |s| s.thread().unwrap().queue.is_empty() && !s.is_running(id));
-        let slow = rt.state.thread().unwrap().items.iter().find_map(|i| match i.kind { Kind::TurnEnd { stopped, .. } => Some(stopped), _ => None });
-        assert_eq!(slow, Some(true), "steering killed the slow turn rather than waiting it out");
+        assert!(steered.elapsed() < Duration::from_secs(8), "steering didn't wait the slow command out");
         assert_eq!(user_messages(&rt.state), ["first\nslow", "now"]);
+        assert!(rt.state.thread().unwrap().has_background(), "the slow command goes on in the background");
 
         // ⇧⌘↩ does the other: it queues.
         typed(&mut rt, "slow again", enter(true, false));
@@ -1242,7 +1301,7 @@ mod tests {
         let t = rt.state.thread().expect("a thread started");
         assert!(matches!(&t.items[0].kind, Kind::User(m) if m.contains("Attached: shot.png, notes.txt")));
         assert_eq!(crate::app::with_files("look", std::slice::from_ref(&notes)), format!("look\n\nAttached files:\n- {}", notes.display()));
-        let turn = crate::harness::Turn { harness: Harness::Claude, prompt: "look".into(), model: "Default".into(), effort: crate::harness::DEFAULT_EFFORT.into(), access: Access::Edits, resume: None, cwd: ".".into(), images: vec![png], peer_messages: true };
+        let turn = crate::harness::Turn { harness: Harness::Claude, prompt: "look".into(), model: "Default".into(), effort: crate::harness::DEFAULT_EFFORT.into(), access: Access::Edits, resume: None, cwd: ".".into(), images: vec![png], peer_messages: true, live: false, uuid: None };
         let msg: serde_json::Value = serde_json::from_str(Harness::Claude.stdin_lines(&turn).last().unwrap()).unwrap();
         assert_eq!(msg["message"]["content"][0]["text"], "look");
         assert_eq!(msg["message"]["content"][1]["source"]["media_type"], "image/png");
@@ -1415,7 +1474,6 @@ mod tests {
         let id = app.selected.unwrap();
         let mut rt = headless(app);
         assert!(rt.elements().iter().any(|e| e.text.as_deref().is_some_and(|t| t.starts_with("Running in background · 1 agent"))));
-        assert!(rt.elements().iter().any(|e| e.text.as_deref().is_some_and(|t| t.contains("waits for the background work"))), "the queue says why it waits");
         assert!(rt.elements().iter().any(|e| e.text.as_deref().is_some_and(|t| t.contains("1 agent still running in the background"))), "and the turn's end");
         rt.update(|s, _| s.ask_stop_background(id));
         rt.frame(1.0 / 60.0);
@@ -1428,9 +1486,129 @@ mod tests {
         assert!(rt.state.may_quit());
     }
 
+    fn send_text(rt: &mut Runtime<App>, text: &str) {
+        rt.key(key(Key::Text(text.into())));
+        rt.frame(1.0 / 60.0);
+        rt.key(key(Key::Enter));
+        rt.frame(1.0 / 60.0);
+    }
+
+    fn replies(s: &App) -> Vec<String> {
+        s.thread().unwrap().items.iter().filter_map(|i| match &i.kind { Kind::Assistant { text, .. } => Some(text.clone()), _ => None }).collect()
+    }
+
+    /// One Claude Code process per thread: a message after a turn's result goes into it even
+    /// while it runs a command in the background, which goes on; once that's done the CLI
+    /// reports on it in a turn of its own, after a divider. A model or effort change switches
+    /// it live.
+    #[test]
+    fn one_live_cli_takes_every_message() {
+        let mut app = new_app();
+        let bin = fake_claude("claude-live");
+        app.installed = vec![(Harness::Claude, Some(bin.clone()))];
+        app.choose_harness(Harness::Claude);
+        let mut rt = headless(app);
+        send_text(&mut rt, "start something in the background");
+        let id = rt.state.selected.unwrap();
+        pump_until(&mut rt, 30, |s| !s.is_running(id));
+        assert!(rt.state.thread().unwrap().has_background(), "the command runs on");
+        send_text(&mut rt, "meanwhile");
+        pump_until(&mut rt, 30, |s| !s.is_running(id) && replies(s).len() == 2);
+        assert_eq!(replies(&rt.state)[1], "ok: meanwhile (fake)");
+        // The command finishes (1.5 s): the CLI's own turn, after a divider.
+        pump_until(&mut rt, 30, |s| replies(s).len() == 3 && !s.is_running(id));
+        let t = rt.state.thread().unwrap();
+        assert!(t.items.iter().any(|i| matches!(&i.kind, Kind::Wake(w) if w.contains("finished"))));
+        assert_eq!(replies(&rt.state)[2], "FINISHED");
+        assert!(!rt.state.thread().unwrap().has_background());
+        // Another model and effort: switched in the same CLI.
+        rt.update(|s, _| { s.model = "opus".into(); s.effort = "high".into(); });
+        send_text(&mut rt, "now on opus");
+        pump_until(&mut rt, 30, |s| replies(s).len() == 4 && !s.is_running(id));
+        assert_eq!(replies(&rt.state)[3], "ok: now on opus (opus)");
+        assert_eq!(runs(&bin), 1, "every message went into the one CLI");
+        let sent = std::fs::read_to_string(bin.with_file_name("claude-live.in")).unwrap();
+        assert!(sent.contains(r#""effortLevel":"high""#), "the effort was applied live: {sent}");
+        assert!(rt.state.has_process(id));
+    }
+
+    /// What a live CLI can't switch to (here, read only) needs a new one: with nothing in the
+    /// background it's replaced at once; with background work the message waits, and sending
+    /// it asks first.
+    #[test]
+    fn a_restart_never_ends_background_work_unasked() {
+        use crate::app::StopWhat;
+        let mut app = new_app();
+        let bin = fake_claude("claude-restart");
+        app.installed = vec![(Harness::Claude, Some(bin.clone()))];
+        app.choose_harness(Harness::Claude);
+        app.access = Access::Edits;
+        let mut rt = headless(app);
+        send_text(&mut rt, "hello");
+        let id = rt.state.selected.unwrap();
+        pump_until(&mut rt, 30, |s| !s.is_running(id));
+        rt.update(|s, _| s.access = Access::ReadOnly);
+        send_text(&mut rt, "read only now");
+        pump_until(&mut rt, 30, |s| !s.is_running(id) && replies(s).len() == 2);
+        assert_eq!(runs(&bin), 2, "a new CLI for read only");
+        // Background work, then a change that needs a restart: it waits, and asks.
+        rt.update(|s, _| s.access = Access::ReadOnly);
+        send_text(&mut rt, "background please");
+        pump_until(&mut rt, 30, |s| !s.is_running(id) && s.thread().unwrap().has_background());
+        rt.update(|s, _| s.access = Access::Edits);
+        send_text(&mut rt, "edit again");
+        assert_eq!(rt.state.confirm_stop, Some((id, StopWhat::Restart)), "it asks");
+        assert_eq!(rt.state.thread().unwrap().queue.len(), 1, "the message waits");
+        assert!(rt.state.thread().unwrap().has_background(), "the work goes on");
+        // Left waiting, it goes once the background work is done (and the CLI has reported).
+        rt.update(|s, _| s.confirm_stop = None);
+        pump_until(&mut rt, 30, |s| !s.is_running(id) && replies(s).iter().any(|r| r.starts_with("ok: edit again")));
+        assert_eq!(runs(&bin), 3);
+        assert!(replies(&rt.state).iter().any(|r| r == "FINISHED"), "the CLI reported on its work first");
+        // Or, confirmed, at once.
+        rt.update(|s, _| s.access = Access::Edits);
+        send_text(&mut rt, "background again");
+        pump_until(&mut rt, 30, |s| !s.is_running(id) && s.thread().unwrap().has_background());
+        rt.update(|s, _| s.access = Access::ReadOnly);
+        send_text(&mut rt, "read only again");
+        assert_eq!(rt.state.confirm_stop, Some((id, StopWhat::Restart)));
+        rt.update(|s, tx| s.confirm_stop(tx));
+        assert!(!rt.state.thread().unwrap().has_background(), "stopped with the old CLI");
+        pump_until(&mut rt, 30, |s| !s.is_running(id) && replies(s).iter().any(|r| r.starts_with("ok: read only again")));
+        assert_eq!(runs(&bin), 4);
+    }
+
+    /// An idle live CLI is ended after a while (`IDLE`); a Stop the CLI doesn't honour is
+    /// forced after `STOP_GRACE`.
+    #[test]
+    fn idle_clis_end_and_stops_are_forced() {
+        let mut app = new_app();
+        let bin = fake_claude("claude-idle");
+        app.installed = vec![(Harness::Claude, Some(bin.clone()))];
+        app.choose_harness(Harness::Claude);
+        app.timing = (Duration::from_millis(300), Duration::from_secs(3600), Duration::from_millis(300));
+        let mut rt = headless(app);
+        send_text(&mut rt, "hi");
+        let id = rt.state.selected.unwrap();
+        pump_until(&mut rt, 30, |s| !s.is_running(id));
+        assert!(rt.state.has_process(id));
+        pump_until(&mut rt, 30, |s| !s.has_process(id));
+        assert!(!rt.state.thread().unwrap().failed, "ending an idle CLI isn't a failure");
+        // The next message starts another, resuming the session.
+        send_text(&mut rt, "be stubborn");
+        rt.key(key(Key::Escape));
+        rt.frame(1.0 / 60.0);
+        let pressed = Instant::now();
+        pump_until(&mut rt, 30, |s| !s.is_running(id));
+        assert!(pressed.elapsed() < Duration::from_secs(8), "forced, not waited out");
+        let stopped = rt.state.thread().unwrap().items.iter().rev().find_map(|i| match i.kind { Kind::TurnEnd { stopped, .. } => Some(stopped), _ => None });
+        assert_eq!(stopped, Some(true));
+        assert_eq!(runs(&bin), 2);
+    }
+
     #[test]
     fn claude_takes_the_prompt_on_stdin_and_asks_over_stdio() {
-        let turn = |access| crate::harness::Turn { harness: Harness::Claude, prompt: "hi there".into(), model: "Default".into(), effort: crate::harness::DEFAULT_EFFORT.into(), access, resume: None, cwd: ".".into(), images: Vec::new(), peer_messages: true };
+        let turn = |access| crate::harness::Turn { harness: Harness::Claude, prompt: "hi there".into(), model: "Default".into(), effort: crate::harness::DEFAULT_EFFORT.into(), access, resume: None, cwd: ".".into(), images: Vec::new(), peer_messages: true, live: false, uuid: None };
         let claude_args = |access| -> Vec<String> {
             Harness::Claude.command(std::path::Path::new("x"), &turn(access)).get_args().map(|a| a.to_string_lossy().into_owned()).collect()
         };

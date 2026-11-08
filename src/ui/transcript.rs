@@ -531,7 +531,7 @@ fn el_rule(k: &Kit) -> El {
 fn working(t: &Thread, stop_key: &str, k: &Kit) -> El {
     let c = &k.c;
     let elapsed = t.turn_started.map_or(0.0, |s| s.elapsed().as_secs_f64());
-    let status = if !t.asks.is_empty() { "Waiting for approval…" } else if t.steering { "Steering…" } else { "Working…" };
+    let status = if !t.asks.is_empty() { "Waiting for approval…" } else if t.stop_requested { "Stopping…" } else if t.steering { "Steering…" } else { "Working…" };
     let mut r = row().key("working").gap(8.0).center_y().h(24.0).px(2.0)
         .child(Spinner::new().size(12.0).build(k))
         .child(text(format!("{status}  {}", duration(elapsed))).font(k.ty.small).color(c.text_muted));

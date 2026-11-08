@@ -63,7 +63,7 @@ pub fn view(s: &App, k: &Kit, floating: bool, layer: &mut Vec<El>) -> El {
                 .child(round(IconButton::new(&icons::ARROW_UP_RIGHT)
                     .variant(IconButtonVariant::GhostMuted)
                     .control_size(ControlSize::Large)
-                    .label("Steer: stop the turn and send this now")
+                    .label(if s.thread().is_some_and(|t| t.harness == crate::harness::Harness::Claude) { "Steer: send this into the turn now" } else { "Steer: stop the turn and send this now" })
                     .shortcut(&steer_key)
                     .on_press_tx(|s: &mut App, tx: &mut Tx| s.steer(tx))
                     .build(k))
@@ -169,7 +169,7 @@ pub fn view(s: &App, k: &Kit, floating: bool, layer: &mut Vec<El>) -> El {
         stack = stack.child(bg);
     }
     if let Some(t) = s.thread().filter(|t| !t.queue.is_empty()) {
-        stack = stack.child(queue(t, running, t.has_background(), &steer_key, k));
+        stack = stack.child(queue(t, running, s.is_live(t.id), &steer_key, k));
     }
     let dock = row().key("composer-dock").w_full().justify_center().px(24.0).pb(14.0).pt(4.0);
     let dock = if floating {
@@ -236,15 +236,18 @@ fn attachments(s: &App, k: &Kit) -> El {
 }
 
 /// Queued follow-ups, oldest first, tucked above the prompt. Each can go now (steering a
-/// running turn) or be removed. `background`: the turn is over but its CLI still runs work in
-/// the background, which the queue waits for.
-fn queue(t: &Thread, running: bool, background: bool, steer_key: &str, k: &Kit) -> El {
+/// running turn) or be removed; one steered into a live CLI (`live`) shows until the CLI takes
+/// it in.
+fn queue(t: &Thread, running: bool, live: bool, steer_key: &str, k: &Kit) -> El {
     let c = &k.c;
     let id = t.id;
+    let steering = t.queue.iter().filter(|q| q.sent.is_some()).count();
     let head = if t.preparing {
         "Making the worktree · sent when it's ready".to_owned()
-    } else if background && !running {
-        format!("{} queued · waits for the background work to finish, or stop it", t.queue.len())
+    } else if steering == t.queue.len() {
+        "Steering · Claude Code takes it in at the turn's next step".to_owned()
+    } else if let Some(why) = &t.held {
+        format!("{} queued · {why}", t.queue.len())
     } else if running {
         format!("{} queued · sent in order when the turn ends", t.queue.len())
     } else {
@@ -254,13 +257,18 @@ fn queue(t: &Thread, running: bool, background: bool, steer_key: &str, k: &Kit) 
         .child(text(head).font(k.ty.text_xsmall).color(c.text_faint).pl(4.0).pb(2.0));
     for q in &t.queue {
         let qid = q.id;
-        let now = IconButton::new(&icons::ARROW_UP_RIGHT)
-            .variant(IconButtonVariant::GhostMuted)
-            .label(if running { "Steer: stop the turn and send this now" } else { "Send now" })
-            .shortcut(if running { steer_key } else { "" })
-            .on_press_tx(move |s: &mut App, tx: &mut Tx| s.send_queued_now(id, qid, tx))
-            .build(k)
-            .key(format!("now-{qid}"));
+        let steer = if live { "Steer: send this into the turn now" } else { "Steer: stop the turn and send this now" };
+        let now = if q.sent.is_some() {
+            text("Steering…").font(k.ty.text_xsmall).color(c.text_muted).px(6.0).key(format!("now-{qid}"))
+        } else {
+            IconButton::new(&icons::ARROW_UP_RIGHT)
+                .variant(IconButtonVariant::GhostMuted)
+                .label(if running { steer } else { "Send now" })
+                .shortcut(if running { steer_key } else { "" })
+                .on_press_tx(move |s: &mut App, tx: &mut Tx| s.send_queued_now(id, qid, tx))
+                .build(k)
+                .key(format!("now-{qid}"))
+        };
         let remove = IconButton::new(&icons::CLOSE_SMALL)
             .variant(IconButtonVariant::GhostMuted)
             .label("Remove from queue")
@@ -272,7 +280,8 @@ fn queue(t: &Thread, running: bool, background: bool, steer_key: &str, k: &Kit) 
             .child(icon(&icons::ENTER, 13.0).color(c.icon_weaker))
             .child(text(harness::first_line(&q.text, 200)).font(k.ty.small).color(c.text_base).truncate().shrink().grow(1.0))
             .child(now)
-            .child(remove));
+            // One already at the CLI can't be taken back.
+            .child(if q.sent.is_some() { rune::el() } else { remove }));
     }
     list
 }

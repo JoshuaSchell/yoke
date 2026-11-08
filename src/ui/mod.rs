@@ -162,9 +162,8 @@ fn stop_dialog(s: &App, k: &Kit, layer: &mut Vec<El>) {
             let more = if t.background.len() > 4 { format!(" and {} more", t.background.len() - 4) } else { String::new() };
             let running = format!("Claude Code is still running {} in the background: {}{more}.", t.background_counts(), named.join(", "));
             let (why, action) = match what {
-                StopWhat::Turn => ("Stopping ends the CLI, and they stop with it.", "Stop all"),
-                StopWhat::Steer => ("Steering restarts the CLI, which stops them. Queue the message instead (Return) to send it once they're done.", "Stop and steer"),
-                StopWhat::SendNow(_) => ("Sending now restarts the CLI, which stops them. Left in the queue, it goes once they're done.", "Stop and send"),
+                StopWhat::Turn => ("It hasn't stopped the turn yet. Forcing the stop ends the CLI, and they stop with it.", "Force stop"),
+                StopWhat::Restart => ("This message needs Claude Code restarted (another access level or setting, or the CLI's own effort), which stops them. Wait for them to finish and send it then, or stop them.", "Stop and send"),
                 _ => ("What they've done so far stays.", "Stop them"),
             };
             ("Stop background work?", format!("{running} {why}"), action)

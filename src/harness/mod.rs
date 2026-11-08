@@ -183,16 +183,7 @@ impl Harness {
     /// as an argument (their stdin is closed).
     pub(crate) fn stdin_lines(self, t: &Turn) -> Vec<String> {
         match self {
-            Harness::Claude => vec![
-                initialize(),
-                serde_json::json!({
-                    "type": "user",
-                    "message": {"role": "user", "content": content(t)},
-                    // As the Agent SDK sends it; resuming is `--resume`'s job.
-                    "parent_tool_use_id": null,
-                    "session_id": "default"
-                }).to_string(),
-            ],
+            Harness::Claude => vec![initialize(), user_message(&t.prompt, &t.images, t.uuid.as_deref(), None)],
             Harness::Codex | Harness::OpenCode => Vec::new(),
         }
     }
@@ -258,6 +249,9 @@ pub enum Event {
     Background(Vec<BackgroundTask>),
     /// A message sent with a uuid moved on: `queued`, `started`, `completed` or `cancelled`.
     Lifecycle { uuid: String, state: String },
+    /// The CLI reports each message's progress (`msg_lifecycle_v1`), so `Lifecycle` can be
+    /// waited on.
+    TracksMessages,
     /// The process exited; always the last event of a run.
     Exited { code: Option<i32>, stderr: String },
 }
@@ -369,6 +363,8 @@ pub struct ParseState {
     /// Claude: how many tasks run in the background (`background_tasks_changed`), which the
     /// process stays alive for.
     background: usize,
+    /// Claude: `TracksMessages` was sent.
+    tracks: bool,
     /// Lines the parser wants written back to the CLI's stdin (refusing requests we don't
     /// handle, so the CLI doesn't wait on them).
     pub(crate) replies: Vec<String>,
@@ -390,6 +386,11 @@ pub struct Turn {
     /// message from a session in another permission mode for approval, which a thread here
     /// can't give, so it would expire unread.
     pub peer_messages: bool,
+    /// Claude Code: the process stays alive after the turn's result, for the thread's next
+    /// messages (`Running::send`), until its stdin closes or it's stopped.
+    pub live: bool,
+    /// The message's uuid, which the CLI's `command_lifecycle` lines name.
+    pub uuid: Option<String>,
 }
 
 /// The Agent SDK's `initialize` control request, with what Yoke renders declared:
@@ -423,15 +424,33 @@ fn image_block(path: &Path) -> Option<serde_json::Value> {
 }
 
 /// The prompt as message content: plain text, or text then image blocks.
-fn content(t: &Turn) -> serde_json::Value {
-    let blocks: Vec<serde_json::Value> = t.images.iter().filter_map(|p| image_block(p)).collect();
-    if blocks.is_empty() { return serde_json::Value::String(t.prompt.clone()); }
-    let mut all = vec![serde_json::json!({"type": "text", "text": t.prompt})];
+fn content(prompt: &str, images: &[PathBuf]) -> serde_json::Value {
+    let blocks: Vec<serde_json::Value> = images.iter().filter_map(|p| image_block(p)).collect();
+    if blocks.is_empty() { return serde_json::Value::String(prompt.to_owned()); }
+    let mut all = vec![serde_json::json!({"type": "text", "text": prompt})];
     all.extend(blocks);
     serde_json::Value::Array(all)
 }
 
-/// A running turn; dropping it doesn't stop it, `stop` does.
+/// A message for Claude Code's stdin (stream-json), as the Agent SDK sends it; resuming is
+/// `--resume`'s job. `uuid` names it in the CLI's `command_lifecycle` lines. `priority`
+/// `now` asks the CLI to end the running turn at its next step and take this one at once
+/// (steering); without one it waits its place.
+pub fn user_message(prompt: &str, images: &[PathBuf], uuid: Option<&str>, priority: Option<&str>) -> String {
+    let mut m = serde_json::json!({
+        "type": "user",
+        "message": {"role": "user", "content": content(prompt, images)},
+        "parent_tool_use_id": null,
+        "session_id": "default"
+    });
+    if let Some(u) = uuid { m["uuid"] = u.into(); }
+    if let Some(p) = priority { m["priority"] = p.into(); }
+    m.to_string()
+}
+
+/// A running turn (or a live CLI); dropping it doesn't stop it, `stop` does. A clone is
+/// another handle on the same process.
+#[derive(Clone)]
 pub struct Running {
     child: Arc<Mutex<Option<Child>>>,
     /// Stopped before its CLI started (while `spawn_after`'s work ran): it never starts.
@@ -439,6 +458,9 @@ pub struct Running {
     /// Open while the turn runs, for answering the CLI's questions; closed after its result
     /// so it exits.
     stdin: Arc<Mutex<Option<ChildStdin>>>,
+    /// Lines written before the CLI has its first ones (`stdin_lines`), held to go after them:
+    /// a message steered in while the CLI starts can't overtake its prompt. `None` once sent.
+    early: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl Running {
@@ -459,7 +481,76 @@ impl Running {
             "request_id": format!("yoke-mode-{}", a.claude_mode()),
             "request": {"subtype": "set_permission_mode", "mode": a.claude_mode()},
         }).to_string();
-        write_line(&self.stdin, &line)
+        self.send(&line)
+    }
+
+    /// Writes one line to a live CLI's stdin (a message). False if it's no longer listening.
+    pub fn send(&self, line: &str) -> bool {
+        if let Some(held) = self.early.lock().unwrap().as_mut() {
+            held.push(line.to_owned());
+            return true;
+        }
+        write_line(&self.stdin, line)
+    }
+
+    /// `send`, with `before` run first on a thread of its own (the folder's snapshot for the
+    /// turn's diff). What's written meanwhile (a Stop) is held to go after this line.
+    pub fn send_after(&self, before: impl FnOnce() + Send + 'static, line: String) {
+        let mine = {
+            let mut held = self.early.lock().unwrap();
+            let mine = held.is_none();
+            if mine { *held = Some(Vec::new()); }
+            mine
+        };
+        let me = self.clone();
+        std::thread::spawn(move || {
+            before();
+            let mut held = me.early.lock().unwrap();
+            if mine {
+                write_line(&me.stdin, &line);
+                for l in held.take().unwrap_or_default() {
+                    if !write_line(&me.stdin, &l) { break; }
+                }
+            } else {
+                match held.as_mut() {
+                    Some(v) => v.push(line),
+                    None => { write_line(&me.stdin, &line); }
+                }
+            }
+        });
+    }
+
+    fn control(&self, id: &str, request: serde_json::Value) -> bool {
+        self.send(&serde_json::json!({"type": "control_request", "request_id": id, "request": request}).to_string())
+    }
+
+    /// Ends the running turn as Claude Code's Esc does, sparing work in the background
+    /// (`perTaskStopAffordance`); messages the CLI holds for later are cancelled too.
+    pub fn interrupt(&self) -> bool {
+        self.control("yoke-interrupt", serde_json::json!({"subtype": "interrupt", "cancel_queued": true}))
+    }
+
+    /// Moves what the running turn waits on (subagents, commands) to the background, as
+    /// Ctrl+B does: only the task `call` started, or all of them. Nothing is stopped.
+    pub fn background_tasks(&self, call: Option<&str>) -> bool {
+        let mut r = serde_json::json!({"subtype": "background_tasks"});
+        if let Some(c) = call { r["tool_use_id"] = c.into(); }
+        self.control(&format!("yoke-background-{}", call.unwrap_or("all")), r)
+    }
+
+    /// Switches a live CLI's model (`set_model`).
+    pub fn set_model(&self, model: &str) -> bool {
+        self.control("yoke-model", serde_json::json!({"subtype": "set_model", "model": model}))
+    }
+
+    /// Switches a live CLI's reasoning effort (`apply_flag_settings`, `effortLevel`).
+    pub fn set_effort(&self, effort: &str) -> bool {
+        self.control("yoke-effort", serde_json::json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": effort}}))
+    }
+
+    /// Closes stdin: a live CLI ends once it has nothing left to do.
+    pub fn close_input(&self) {
+        *self.stdin.lock().unwrap() = None;
     }
 
     /// Stops one task (a subagent or a shell command) and nothing else: Claude Code's
@@ -470,12 +561,12 @@ impl Running {
             "request_id": format!("yoke-stop-{task}"),
             "request": {"subtype": "stop_task", "task_id": task},
         }).to_string();
-        write_line(&self.stdin, &line)
+        self.send(&line)
     }
 
     /// Answers the CLI's question `ask`. False if the CLI is no longer listening.
     pub fn answer(&self, ask: &AskRequest, d: &Decision) -> bool {
-        write_line(&self.stdin, &ask.reply(d))
+        self.send(&ask.reply(d))
     }
 }
 
@@ -510,7 +601,7 @@ pub fn find(name: &str) -> Option<PathBuf> {
 
 /// Starts `turn`, sending `(tag, event)` to `tx` and waking the UI after each batch.
 pub fn spawn<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Sender<(T, Event)>, wake: Waker) -> Running {
-    let running = Running { child: Arc::default(), stopped: Arc::default(), stdin: Arc::default() };
+    let running = Running { child: Arc::default(), stopped: Arc::default(), stdin: Arc::default(), early: Arc::new(Mutex::new(Some(Vec::new()))) };
     launch(bin, turn, tag, tx, wake, &running);
     running
 }
@@ -518,8 +609,8 @@ pub fn spawn<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Send
 /// `spawn`, with `before` run first on a thread of its own (a snapshot of the folder, say), so
 /// starting the turn doesn't wait on it. Stopped meanwhile, the CLI never starts.
 pub fn spawn_after<T: Clone + Send + 'static>(before: impl FnOnce() + Send + 'static, bin: &Path, turn: Turn, tag: T, tx: Sender<(T, Event)>, wake: Waker) -> Running {
-    let running = Running { child: Arc::default(), stopped: Arc::default(), stdin: Arc::default() };
-    let handle = Running { child: running.child.clone(), stopped: running.stopped.clone(), stdin: running.stdin.clone() };
+    let running = Running { child: Arc::default(), stopped: Arc::default(), stdin: Arc::default(), early: Arc::new(Mutex::new(Some(Vec::new()))) };
+    let handle = running.clone();
     let bin = bin.to_owned();
     std::thread::spawn(move || {
         before();
@@ -542,6 +633,7 @@ fn kill_group(c: &mut Child) {
 
 fn launch<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Sender<(T, Event)>, wake: Waker, running: &Running) {
     let harness = turn.harness;
+    let live = turn.live;
     let mut cmd = harness.command(bin, &turn);
     let input = harness.stdin_lines(&turn);
     let piped = if input.is_empty() { Stdio::null() } else { Stdio::piped() };
@@ -570,15 +662,18 @@ fn launch<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Sender<
                 if stopped.load(std::sync::atomic::Ordering::SeqCst) { kill_group(&mut c); }
                 *slot = Some(c);
             }
-            if !input.is_empty() {
-                // Its own thread, so a long prompt can't block on a full pipe.
-                let stdin = stdin.clone();
-                std::thread::spawn(move || {
-                    for line in &input {
-                        if !write_line(&stdin, line) { break; }
-                    }
-                });
-            }
+            // Its own thread, so a long prompt can't block on a full pipe. What was written
+            // meanwhile follows the first lines.
+            let (writer, early) = (stdin.clone(), running.early.clone());
+            std::thread::spawn(move || {
+                for line in &input {
+                    if !write_line(&writer, line) { break; }
+                }
+                let mut held = early.lock().unwrap();
+                for line in held.take().unwrap_or_default() {
+                    if !write_line(&writer, &line) { break; }
+                }
+            });
             let child = child.clone();
             let stdin = stdin.clone();
             std::thread::spawn(move || {
@@ -601,8 +696,9 @@ fn launch<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Sender<
                     // The turn has its result and nothing runs in the background: close stdin
                     // so a stream-json CLI exits. While background work runs it stays open, so
                     // a task can still be stopped on its own (`stop_task`); the CLI reports on
-                    // the work in a turn of its own once it's done, and exits after that.
-                    if done && !p.turn_open && p.background == 0 { *stdin.lock().unwrap() = None; }
+                    // the work in a turn of its own once it's done, and exits after that. A
+                    // live CLI's stays open for the thread's next message.
+                    if !live && done && !p.turn_open && p.background == 0 { *stdin.lock().unwrap() = None; }
                 }
                 *stdin.lock().unwrap() = None;
                 let stderr = err.join().unwrap_or_default();
