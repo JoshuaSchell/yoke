@@ -24,7 +24,7 @@ cargo run --release                 # opens on the project used last
 cargo run --release -- ~/code/app   # or adds and opens a project folder
 ```
 
-The sidebar lists every project's threads together, as T3 Code does, each row naming its project. The new-thread screen's headline picks the project ("What should we build in **yoke ▾**?"): click the name to search your projects, add one (or **⌘O**), or take one out with the × under the pointer (its folder and saved sessions stay). On the first launch, the folders Claude Code has sessions in become the projects, temporary folders aside. Where the app is started from doesn't matter: it opens the project used last.
+The sidebar lists every project's threads together, as T3 Code does, each row naming its project. Each row starts with its project's mark: the project's own icon when the folder has one (a favicon, or an app icon such as `assets/icon.png`), else its initials in a colour no other project has. ✎ on a project in the headline's picker sets it: automatic, an image, or letters and a colour. The new-thread screen's headline picks the project ("What should we build in **yoke ▾**?"): click the name to search your projects, add one (or **⌘O**), or take one out with the × under the pointer (its folder and saved sessions stay). On the first launch, the folders Claude Code has sessions in become the projects, temporary folders aside. Where the app is started from doesn't matter: it opens the project used last.
 
 ## Install
 

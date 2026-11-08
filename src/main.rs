@@ -10,7 +10,9 @@ mod bench;
 mod editors;
 mod harness;
 mod history;
+mod icon_editor;
 mod picker;
+mod project_icon;
 mod settings;
 mod store;
 mod updater;
@@ -95,6 +97,7 @@ const SCENES: &[Scene] = &[
     ("open-in", app::scenes::open_in),
     ("tools", app::scenes::tools),
     ("trust", app::scenes::trust),
+    ("icon", app::scenes::icon),
 ];
 
 fn main() {

@@ -9,7 +9,7 @@ use rune_kit::shell::{Sidebar, SidebarRow};
 use rune_kit::{Button, ButtonVariant, ControlSize, Dialog, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::{icons, provider_icons};
 
-use crate::app::{App, Lane, SETTLED_PAGE, Thread};
+use crate::app::{App, Lane, Project, SETTLED_PAGE, Thread};
 use crate::harness::Harness;
 use crate::shortcuts::Cmd;
 
@@ -46,6 +46,31 @@ pub fn avatar(h: Harness, k: &Kit) -> El {
     row().size(20.0, 20.0).radius(6.0).center().fill(k.c.layer_02).child(icon(provider_icon(h), 13.0).color(color))
 }
 
+/// A project's mark on a `size`-point tile, as T3 Code draws it: its image when it has one
+/// (and it has decoded), else its letters (chosen, or its initials) in its tint, on a wash of
+/// that tint.
+pub fn project_avatar(p: &Project, size: f32, k: &Kit) -> El {
+    let tile = row().key("project-avatar").size(size, size).radius(size * 0.3).center().a11y_hidden();
+    if let Some(img) = p.icon.as_ref().filter(|i| i.is_ready() && i.error().is_none()) {
+        return tile.pixels_fit(img.pixels(), rune::SurfaceFit::Fit);
+    }
+    let tint = crate::project_icon::tint(p.tint, k.dark);
+    let font = rune::TextStyle { size: (size * 0.48).round(), weight: 700.0, line_height: size, ..k.ty.mono };
+    let letters = match &p.choice {
+        crate::project_icon::Choice::Letters { text, .. } if !text.is_empty() => text.clone(),
+        _ => crate::project_icon::monogram(&p.name),
+    };
+    tile.fill(tint.alpha(0.16)).child(text(letters).font(font).color(tint))
+}
+
+/// A thread's mark: its project's, else (a thread in no project) its agent's.
+fn thread_avatar(s: &App, t: &Thread, k: &Kit) -> El {
+    match s.project_of(t) {
+        Some(p) => project_avatar(p, 20.0, k),
+        None => avatar(t.harness, k),
+    }
+}
+
 fn ago(t: &Thread) -> String {
     let s = t.updated.elapsed().map_or(0, |d| d.as_secs());
     match s {
@@ -66,7 +91,7 @@ fn subtitle(s: &App, t: &Thread, k: &Kit) -> (String, Option<rune::Color>) {
         (None, true) => t.harness.name().to_owned(),
         (None, false) => format!("{} · {model}", t.harness.name()),
     };
-    let project = match s.projects.iter().find(|p| s.in_project(t, &p.path)) {
+    let project = match s.project_of(t) {
         Some(p) if s.projects.len() > 1 => format!("{} · ", p.name),
         _ => String::new(),
     };
@@ -168,7 +193,7 @@ fn thread_row(s: &App, t: &Thread, lane: Lane, k: &Kit) -> El {
 
     let mut r = SidebarRow::new(t.title.clone())
         .height(ROW_H)
-        .avatar(avatar(t.harness, k))
+        .avatar(thread_avatar(s, t, k))
         .subtitle(sub)
         .trailing(trailing)
         .selected(s.selected == Some(id))

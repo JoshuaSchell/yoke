@@ -311,6 +311,7 @@ pub fn project_view(s: &App, k: &Kit, font: rune::TextStyle, layer: &mut Vec<El>
         .help("Choose the project")
         .fill(if open { c.surface_hover } else { rune::Color::TRANSPARENT })
         .hover(c.hover)
+        .children(s.project().map(|p| crate::ui::sidebar::project_avatar(p, (font.size * 0.85).round(), k)))
         .child(text(name).font(font).color(c.text_strong).truncate().shrink().min_w(0.0))
         .child(icon(&icons::CHEVRON_DOWN, 16.0).color(c.icon_weaker))
         .on_press(|s: &mut App| s.toggle_project_picker());
@@ -392,13 +393,26 @@ fn project_row(s: &App, p: &crate::app::Project, active: bool, k: &Kit) -> El {
         .role("option").label(p.name.clone()).checked(chosen)
         .fill(if active { c.hover } else { rune::Color::TRANSPARENT })
         .cursor(Cursor::Pointer).hover(c.hover)
-        .child(icon(&icons::FOLDER, 15.0).color(c.icon_weaker))
+        .child(crate::ui::sidebar::project_avatar(p, 20.0, k))
         .child(col().grow(1.0).shrink().min_w(0.0)
             .child(text(p.name.clone()).font(k.ty.ui_medium).color(c.text_strong).truncate())
             .child(text(crate::ui::tilde(&p.path)).font(k.ty.small).color(c.text_faint).truncate()));
     if chosen {
         line = line.child(icon(&icons::CHECK_SMALL, 14.0).color(c.icon_base));
     }
+    let edit = {
+        let path = p.path.clone();
+        rune_kit::IconButton::new(&icons::EDIT)
+            .control_size(rune_kit::ControlSize::Small)
+            .variant(rune_kit::IconButtonVariant::GhostMuted)
+            .label(format!("Change the icon of {}", p.name))
+            .help("Change icon")
+            .build(k)
+            .focusable(false)
+            .key("edit-icon")
+            .group_opacity(0.0, 1.0)
+            .on_press(move |s: &mut App| s.open_icon_editor(path.clone()))
+    };
     let path = p.path.clone();
-    line.child(remove).hover_group().on_press(move |s: &mut App| s.choose_project(path.clone()))
+    line.child(edit).child(remove).hover_group().on_press(move |s: &mut App| s.choose_project(path.clone()))
 }

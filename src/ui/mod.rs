@@ -2,6 +2,7 @@
 
 pub mod composer;
 pub mod hud;
+pub mod icon_editor;
 pub mod picker;
 #[cfg(target_os = "macos")]
 pub mod mac;
@@ -62,7 +63,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     // The toolbar band is 48 points tall inside the card, which starts `FRAME` down, so its
     // middle is 32 down. The traffic lights sit 24 down, where macOS apps put them; the
     // toolbar's contents lift `FRAME` to line up with them.
-    let crumbs = breadcrumb(s.project().map_or("No project", |p| p.name.as_str()), &title, k).offset(0.0, -FRAME);
+    let crumbs = breadcrumb(s.project(), &title, k).offset(0.0, -FRAME);
     let (hud_key, settings_key, sidebar_key) = (s.keys.label(Cmd::FrameStats), s.keys.label(Cmd::Settings), s.keys.label_static(Cmd::ToggleSidebar));
     let hud_button = IconButton::new(&icons::WINDOW_ANALYTICS)
         .variant(IconButtonVariant::GhostMuted)
@@ -108,6 +109,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     // Files dropped anywhere in the window go to the composer.
     sidebar::delete_dialog(s, k, &mut layer);
     trust_dialog(s, k, &mut layer);
+    icon_editor::dialog(s, k, &mut layer);
     rune_kit::root(window, layer)
         .on_drop_files(|s: &mut App, files: &[std::path::PathBuf], _: &mut Tx| s.attach(files))
         .on_drop_hover(|s: &mut App, over: bool, _: &mut Tx| { s.drop_over = over; s.composer_error = None; })
@@ -224,10 +226,15 @@ fn sidebar_toggle(s: &App, lights: f32, attention: Option<Attention>, shortcut: 
     if reduced { b } else { b.motion(Spring::new(0.3, 0.0)) }
 }
 
-/// The toolbar's leading title, as in T3 Code: the project (folder icon, muted), a chevron,
-/// then the thread.
-fn breadcrumb(project: &str, title: &str, k: &Kit) -> El {
+/// The toolbar's leading title, as in T3 Code: the project (its icon, its name muted), a
+/// chevron, then the thread.
+fn breadcrumb(p: Option<&crate::app::Project>, title: &str, k: &Kit) -> El {
     let c = &k.c;
+    let project = p.map_or("No project", |p| p.name.as_str());
+    let mark = match p {
+        Some(p) => sidebar::project_avatar(p, 16.0, k).key("crumb-icon"),
+        None => rune::icon(&icons::FOLDER, 14.0).key("crumb-icon").color(c.icon_faint).a11y_hidden(),
+    };
     row()
         .key("breadcrumb")
         .label(format!("{project}, {title}"))
@@ -238,7 +245,7 @@ fn breadcrumb(project: &str, title: &str, k: &Kit) -> El {
         // The folder half opens another folder, as ⌘O does.
         .child(row().key("crumb-folder").gap(6.0).center_y().cursor(rune::Cursor::Pointer).help("Open Folder…")
             .on_press_tx(|s: &mut App, tx: &mut Tx| s.choose_folder(tx))
-            .child(rune::icon(&icons::FOLDER, 14.0).key("crumb-icon").color(c.icon_faint).a11y_hidden())
+            .child(mark)
             .child(text(project.to_owned()).key("crumb-project").font(k.ty.ui).color(c.text_muted).a11y_hidden()))
         .child(rune::icon(&icons::CHEVRON_RIGHT, 12.0).key("crumb-sep").color(c.icon_faint).a11y_hidden())
         .child(text(title.to_owned()).key("crumb-title").font(k.ty.ui_medium).color(c.text_strong).truncate().shrink().a11y_hidden())

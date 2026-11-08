@@ -56,6 +56,12 @@ const WORKING_OPEN_KEY: &str = "sidebar.working-open";
 pub const LAST_PROJECT_KEY: &str = "project.last";
 /// The sidebar's projects, as folder paths in the order added, and the ones shut.
 pub const PROJECTS_KEY: &str = "projects";
+/// Each project's icon choice, by folder (`project_icon::Choice`). A removed project's stays,
+/// so adding it again brings it back.
+pub const PROJECT_ICONS_KEY: &str = "project_icons";
+/// The size project icons are decoded for, in points at 2×: the icon editor's preview, the
+/// largest they're drawn (mips cover the sidebar's 20 points).
+const PROJECT_ICON_PT: f32 = 48.0;
 /// The plan limits last read, so the gauge has numbers at launch.
 const LIMITS_KEY: &str = "usage.limits";
 /// Each Claude model's context window as Claude Code last reported it, by model id, so a
@@ -243,6 +249,8 @@ pub struct App {
     pub claude_trusted: Option<Vec<PathBuf>>,
     /// Whether to ask before a project's first turn; off in tests.
     pub ask_trust: bool,
+    /// The project icon editor, while it's open.
+    pub icon_edit: Option<crate::icon_editor::IconEdit>,
     /// Claude Code's folder, where deleting a thread deletes its session (`history::remove`).
     /// `None` in tests unless one sets a scratch folder.
     pub(crate) claude_home: Option<PathBuf>,
@@ -348,13 +356,28 @@ pub struct Project {
     pub path: PathBuf,
     /// It's in a git repository, so its threads can run in worktrees.
     pub repo: bool,
+    /// What its mark is, as chosen in its icon editor (saved under `PROJECT_ICONS_KEY`).
+    pub choice: crate::project_icon::Choice,
+    /// The image its mark draws: the one chosen, else its own (a favicon or app icon in the
+    /// folder). None for letters.
+    pub icon_file: Option<PathBuf>,
+    /// `icon_file`, decoding or decoded, once a window exists to draw it; without one the
+    /// mark is its letters.
+    pub icon: Option<Image>,
+    /// Looked for its icon since its choice last changed, found or not.
+    pub(crate) icon_looked: bool,
+    /// Its saved choice has been read (once, the first time icons are looked for).
+    choice_loaded: bool,
+    /// Its letters' tint (`project_icon::spread`), kept apart from the other projects'.
+    pub tint: usize,
 }
 
 impl Project {
     pub fn new(path: PathBuf) -> Project {
         let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
         let repo = worktree::is_repo(&path);
-        Project { name, path, repo }
+        let tint = crate::project_icon::tint_index(&name);
+        Project { name, path, repo, choice: Default::default(), icon_file: None, icon: None, icon_looked: false, choice_loaded: false, tint }
     }
 }
 
@@ -620,6 +643,7 @@ impl App {
             trusted,
             claude_trusted: None,
             ask_trust: true,
+            icon_edit: None,
             claude_home: if cfg!(test) { None } else { history::claude_home() },
             events,
             sender,
@@ -647,6 +671,7 @@ impl App {
     pub fn set_waker(&mut self, w: Waker) {
         self.images = Some(ImageCache::new(w.clone()));
         self.waker = Some(w);
+        self.find_project_icons();
         self.discover_models();
         self.load_sessions();
         // "Open in …" stats each editor's app; done here, off the UI thread, before it's drawn.
@@ -1101,6 +1126,48 @@ impl App {
         Some(t.project.clone()).filter(|p| !p.as_os_str().is_empty()).or_else(|| self.current.clone())
     }
 
+    /// For each project not looked at yet: takes its saved icon choice and finds the image its
+    /// mark draws. Then keeps the projects' letter tints apart, and starts decoding the images
+    /// (off this thread; the cache wakes the window when one is ready).
+    pub fn find_project_icons(&mut self) {
+        use crate::project_icon::{self as pi, Choice};
+        let mut saved = None;
+        for p in self.projects.iter_mut().filter(|p| !p.choice_loaded) {
+            let saved = saved.get_or_insert_with(|| pi::load_choices(self.prefs.get(PROJECT_ICONS_KEY)));
+            if let Some(c) = saved.remove(&p.path) { p.choice = c; }
+            p.choice_loaded = true;
+        }
+        for p in self.projects.iter_mut().filter(|p| !p.icon_looked) {
+            p.icon_file = match &p.choice {
+                Choice::Auto => pi::find(&p.path),
+                Choice::Image(f) => Some(f.clone()).filter(|f| f.is_file()),
+                Choice::Letters { .. } => None,
+            };
+        }
+        let tints = pi::spread(self.projects.iter().map(|p| (p.name.as_str(), p.choice.tint())));
+        for (p, tint) in self.projects.iter_mut().zip(tints) { p.tint = tint; }
+        let cache = self.images.as_ref();
+        for p in self.projects.iter_mut().filter(|p| !p.icon_looked) {
+            // Without a cache (a headless run) there's nothing to draw it with yet.
+            let Some(cache) = cache else { break };
+            p.icon_looked = true;
+            p.icon = p.icon_file.as_ref().map(|f| cache.file(f, PROJECT_ICON_PT, 2.0));
+        }
+    }
+
+    /// Saves every project's icon choice.
+    pub(crate) fn save_icon_choices(&mut self) {
+        let mut all = crate::project_icon::load_choices(self.prefs.get(PROJECT_ICONS_KEY));
+        for p in &self.projects { all.insert(p.path.clone(), p.choice.clone()); }
+        let v = crate::project_icon::save_choices(all.iter().map(|(p, c)| (p.as_path(), c)));
+        let _ = self.prefs.set(PROJECT_ICONS_KEY, &v);
+    }
+
+    /// The project thread `t` is in.
+    pub fn project_of(&self, t: &Thread) -> Option<&Project> {
+        self.projects.iter().find(|p| self.in_project(t, &p.path))
+    }
+
     /// Whether thread `t` is in the project at `path`.
     pub fn in_project(&self, t: &Thread, path: &Path) -> bool {
         if t.project.as_os_str().is_empty() { self.current.as_deref() == Some(path) } else { t.project == path }
@@ -1112,6 +1179,7 @@ impl App {
         let path = path.canonicalize().unwrap_or(path);
         if !self.projects.iter().any(|p| p.path == path) {
             self.projects.push(Project::new(path.clone()));
+            self.find_project_icons();
             self.load_sessions_of(vec![path.clone()]);
         }
         self.composer_error = None;
@@ -1959,6 +2027,7 @@ pub mod scenes {
         // Two stand-in projects, so the snapshots show none of yours.
         let (api, desktop) = (PathBuf::from("/demo/api-client"), PathBuf::from("/demo/desktop"));
         s.projects = vec![Project::new(api.clone()), Project::new(desktop.clone())];
+        s.find_project_icons();
         s.current = Some(api.clone());
         (t.project, c.project, w.project, f.project) = (api.clone(), api.clone(), desktop.clone(), desktop);
         for x in &mut settled { x.project = api.clone(); }
@@ -2163,6 +2232,16 @@ pub mod scenes {
     pub fn update_ready(s: &mut App) {
         demo(s);
         s.update.status = crate::updater::Status::Ready("0.1.6".into());
+    }
+
+    /// The icon editor on the demo's first project, with letters and a colour picked.
+    pub fn icon(s: &mut App) {
+        demo(s);
+        let api = s.projects[0].path.clone();
+        s.open_icon_editor(api);
+        s.icon_edit.as_mut().unwrap().letters = TextEdit::new("AP");
+        s.icon_letters_typed();
+        s.pick_icon_tint(10);
     }
 
     /// The demo with the sidebar shut: the toolbar starts past the traffic lights.
