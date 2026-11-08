@@ -990,7 +990,6 @@ mod tests {
         assert!(rt.state.is_running(id));
 
         // Sending into the running turn steers: it stops, and "now" goes straight away.
-        let started = Instant::now();
         typed(&mut rt, "now", enter(true, false));
         pump_until(&mut rt, 30, |s| s.thread().unwrap().queue.is_empty() && !s.is_running(id));
         let slow = rt.state.thread().unwrap().items.iter().find_map(|i| match i.kind { Kind::TurnEnd { stopped, .. } => Some(stopped), _ => None });
