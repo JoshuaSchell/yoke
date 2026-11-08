@@ -22,8 +22,27 @@ use crate::usage;
 
 pub type ThreadId = u64;
 
-/// The prefs store's app id (`~/Library/Application Support/dev.rune-code/prefs.json`).
-pub const APP_ID: &str = "dev.rune-code";
+/// The prefs store's app id (`~/Library/Application Support/dev.yoke/prefs.json`).
+pub const APP_ID: &str = "dev.yoke";
+/// The app's id before it was renamed Yoke (it was Rune Code).
+const OLD_APP_ID: &str = "dev.rune-code";
+
+/// The first launch after the rename copies the old settings and kept threads over, so the
+/// projects, defaults and Codex threads are still there. The old folder is left alone.
+pub fn migrate_from_rune_code() {
+    let (old, new) = (Prefs::open(OLD_APP_ID), Prefs::open(APP_ID));
+    let (Some(old), Some(new)) = (old.path(), new.path()) else { return };
+    if new.exists() || !old.exists() { return; }
+    let (Some(old_dir), Some(new_dir)) = (old.parent(), new.parent()) else { return };
+    if std::fs::create_dir_all(new_dir).is_err() { return; }
+    let _ = std::fs::copy(old, new);
+    if let Ok(files) = std::fs::read_dir(old_dir.join("threads")) {
+        let _ = std::fs::create_dir_all(new_dir.join("threads"));
+        for f in files.flatten() {
+            let _ = std::fs::copy(f.path(), new_dir.join("threads").join(f.file_name()));
+        }
+    }
+}
 
 /// A thread nobody has touched for this long settles on its own (T3 Code's default).
 pub const AUTO_SETTLE: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -72,7 +91,7 @@ pub enum Lane {
 /// Where pasted screenshots wait to be sent. The CLIs read them during the turn (Codex and
 /// OpenCode by path), so they outlive it, and `purge_old_pastes` clears them at a later launch.
 fn pastes_dir() -> PathBuf {
-    std::env::temp_dir().join("rune-code-pastes")
+    std::env::temp_dir().join("yoke-pastes")
 }
 
 /// Deletes pastes over a day old, so the app leaves nothing growing behind it. Windows never

@@ -183,7 +183,7 @@ impl Harness {
     pub(crate) fn stdin_lines(self, t: &Turn) -> Vec<String> {
         match self {
             Harness::Claude => vec![
-                serde_json::json!({"type": "control_request", "request_id": "rune-code-init", "request": {"subtype": "initialize"}}).to_string(),
+                serde_json::json!({"type": "control_request", "request_id": "yoke-init", "request": {"subtype": "initialize"}}).to_string(),
                 serde_json::json!({
                     "type": "user",
                     "message": {"role": "user", "content": content(t)},
@@ -266,7 +266,7 @@ impl AskRequest {
         let response = match d {
             Decision::Allow => serde_json::json!({"behavior": "allow", "updatedInput": self.input}),
             Decision::AlwaysAllow => serde_json::json!({"behavior": "allow", "updatedInput": self.input, "updatedPermissions": self.suggestions}),
-            Decision::Deny => serde_json::json!({"behavior": "deny", "message": "The user denied this in Rune Code."}),
+            Decision::Deny => serde_json::json!({"behavior": "deny", "message": "The user denied this in Yoke."}),
         };
         serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": self.request_id, "response": response}}).to_string()
     }
@@ -350,7 +350,7 @@ impl Running {
     pub fn set_access(&self, a: Access) -> bool {
         let line = serde_json::json!({
             "type": "control_request",
-            "request_id": format!("rune-code-mode-{}", a.claude_mode()),
+            "request_id": format!("yoke-mode-{}", a.claude_mode()),
             "request": {"subtype": "set_permission_mode", "mode": a.claude_mode()},
         }).to_string();
         write_line(&self.stdin, &line)

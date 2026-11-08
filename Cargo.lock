@@ -1158,7 +1158,7 @@ dependencies = [
  "displaydoc",
  "potential_utf",
  "utf8_iter",
- "yoke",
+ "yoke 0.8.4",
  "zerofrom",
  "zerovec",
 ]
@@ -1249,7 +1249,7 @@ dependencies = [
  "serde",
  "stable_deref_trait",
  "writeable",
- "yoke",
+ "yoke 0.8.4",
  "zerofrom",
  "zerotrie",
  "zerovec",
@@ -2662,23 +2662,6 @@ dependencies = [
  "xkbcommon",
  "zbus 6.2.1",
  "zeroize",
-]
-
-[[package]]
-name = "rune-code"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chrono",
- "libc",
- "objc2 0.5.3",
- "objc2-app-kit 0.2.2",
- "objc2-foundation 0.2.2",
- "rune",
- "rune-kit",
- "rune-notify",
- "rune-theme-opencode",
- "serde_json",
 ]
 
 [[package]]
@@ -4268,6 +4251,23 @@ dependencies = [
 
 [[package]]
 name = "yoke"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "libc",
+ "objc2 0.5.3",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "rune",
+ "rune-kit",
+ "rune-notify",
+ "rune-theme-opencode",
+ "serde_json",
+]
+
+[[package]]
+name = "yoke"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "417ef3fcf6c300b7dbd25c85531a746931c02ad536f3cf4786ed1e88223340b3"
@@ -4508,7 +4508,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ea269c3bd32f0a32c321907a2ae912ba6f4649bb0fc764a15627e99a7095a3f"
 dependencies = [
  "displaydoc",
- "yoke",
+ "yoke 0.8.4",
  "zerofrom",
  "zerovec",
 ]
@@ -4520,7 +4520,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f58a2799cfe9a1670c7ea8edbd52ef8edb93cb37a7f83bf31ba9e35d9dae6a40"
 dependencies = [
  "serde",
- "yoke",
+ "yoke 0.8.4",
  "zerofrom",
  "zerovec-derive",
 ]

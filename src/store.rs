@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn a_thread_round_trips() {
-        let dir = std::env::temp_dir().join(format!("rune-code-store-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("yoke-store-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut t = Thread::new(1, "Write the changelog".into(), Harness::Codex, "gpt-5".into());
         t.session = Some("abc/123".into());

@@ -1,4 +1,4 @@
-//! Rune Code: a small T3 Code-style app for prompting coding agents, to see how Rune does.
+//! Yoke: a small T3 Code-style app for prompting coding agents, to see how Rune does.
 //!
 //! `cargo run -- [project folder]` opens the window on that folder (default: the current one).
 //! Headless: `-- --snap out.png --scene demo --size 1200x800` renders a scene without a window.
@@ -85,9 +85,10 @@ const SCENES: &[Scene] = &[
 ];
 
 fn main() {
+    app::migrate_from_rune_code();
     attention::install();
     rune::prewarm_gpu();
-    // Inside a bundle macOS already shows Rune Code.app's icon.
+    // Inside a bundle macOS already shows Yoke.app's icon.
     let bundled = std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"));
     if !bundled { let _ = rune::set_app_icon(ICON); }
     let spec = AppSpec {
@@ -98,12 +99,12 @@ fn main() {
         setup: Some(|s: &mut App, w| { attention::set_waker(&w); s.set_waker(w) }),
         poll: Some(poll),
         on_key: Some(ui::on_key),
-        ..AppSpec::new("Rune Code", (1180.0, 780.0), init, ui::view)
+        ..AppSpec::new("Yoke", (1180.0, 780.0), init, ui::view)
     };
     // Traffic lights centred 24 points down, as in other macOS apps; the toolbar's contents
     // and the sidebar toggle line up with them (`ui::LIGHTS_MID`).
     let chrome = Chrome { full_size_content: true, traffic_lights: Some((16.0, 17.0)), drag_regions: true };
-    // Rune Code › Settings…, on the Settings shortcut as saved at launch (a rebinding reaches the
+    // Yoke › Settings…, on the Settings shortcut as saved at launch (a rebinding reaches the
     // menu at the next launch; the shortcut table answers it straight away). `ui::mac` moves
     // it below About.
     let keys = shortcuts::Keys::load(&Prefs::open(app::APP_ID));
@@ -198,7 +199,7 @@ mod tests {
         let tools: Vec<_> = t.items.iter().filter_map(|i| match &i.kind { Kind::Tool { name, state, .. } => Some((name.clone(), *state)), _ => None }).collect();
         eprintln!("tools {tools:?}, answer {c:?}");
         assert!(tools.iter().any(|(n, s)| n == "Read" && *s == ToolState::Ok), "tools: {tools:?}");
-        assert!(c.contains("rune-code"), "answer: {c:?}");
+        assert!(c.contains("yoke"), "answer: {c:?}");
     }
 
     /// "Ask first": the real CLI asks before running a command, ⌘Y allows it, and the command's
@@ -390,7 +391,7 @@ mod tests {
     /// session's files.
     #[test]
     fn delete_asks_then_takes_the_session_files() {
-        let home = std::env::temp_dir().join(format!("rune-code-delete-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("yoke-delete-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let sid = "5f5aefca-fd04-4499-9f53-1b734ef86e56";
         let mut app = new_app();
@@ -614,7 +615,7 @@ mod tests {
     fn codex_threads_outlive_the_app() {
         use crate::app::{Item, Thread};
         use crate::harness::Event;
-        let root = std::env::temp_dir().join(format!("rune-code-keep-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("yoke-keep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let prefs = || rune::prefs::Prefs::at(root.join("prefs.json"));
@@ -658,7 +659,7 @@ mod tests {
     #[test]
     fn a_new_thread_in_a_worktree() {
         use std::process::Command;
-        let repo = std::env::temp_dir().join(format!("rune-code-wt-app-{}", std::process::id()));
+        let repo = std::env::temp_dir().join(format!("yoke-wt-app-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(&repo).unwrap();
         let git = |dir: &std::path::Path, args: &[&str]| Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
@@ -687,7 +688,7 @@ mod tests {
         rt.update(|s, tx| { s.drain(tx); });
         let t = rt.state.thread().unwrap();
         let w = t.worktree.clone().expect("the worktree was made");
-        assert!(w.branch.starts_with("rune/fix-the-build-"), "{}", w.branch);
+        assert!(w.branch.starts_with("yoke/fix-the-build-"), "{}", w.branch);
         assert_eq!(std::fs::read_to_string(w.path.join("a.txt")).unwrap(), "hello");
         assert!(t.queue.is_empty() && matches!(&t.items[0].kind, Kind::User(p) if p == "Fix the build"), "then the message went");
         let head = git(&w.path, &["branch", "--show-current"]);

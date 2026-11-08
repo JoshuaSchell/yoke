@@ -34,7 +34,7 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
                 // doesn't wait on an answer that won't come.
                 other => p.replies.push(serde_json::json!({
                     "type": "control_response",
-                    "response": {"subtype": "error", "request_id": id, "error": format!("Rune Code doesn't handle {}", other.unwrap_or("this request"))},
+                    "response": {"subtype": "error", "request_id": id, "error": format!("Yoke doesn't handle {}", other.unwrap_or("this request"))},
                 }).to_string()),
             }
         }
@@ -184,7 +184,7 @@ mod tests {
         let r: Value = serde_json::from_str(&p.replies[0]).unwrap();
         assert_eq!((r["response"]["subtype"].as_str(), r["response"]["request_id"].as_str()), (Some("error"), Some("h1")));
         // Our own initialize's answer is ignored.
-        let v: Value = serde_json::from_str(r#"{"type":"control_response","response":{"subtype":"success","request_id":"rune-code-init","response":{}}}"#).unwrap();
+        let v: Value = serde_json::from_str(r#"{"type":"control_response","response":{"subtype":"success","request_id":"yoke-init","response":{}}}"#).unwrap();
         assert!(parse(&v, &mut p).is_empty());
     }
 }

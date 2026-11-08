@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
-const REQUEST_ID: &str = "rune-code-usage";
+const REQUEST_ID: &str = "yoke-usage";
 
 const SESSION: Duration = Duration::from_secs(5 * 3600);
 const WEEK: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -255,7 +255,7 @@ mod tests {
     use super::*;
 
     /// Trimmed from a real `get_usage` reply (Claude Code 2.1.319, a Max account).
-    const REPLY: &str = r#"{"subtype":"success","request_id":"rune-code-usage","response":{
+    const REPLY: &str = r#"{"subtype":"success","request_id":"yoke-usage","response":{
         "subscription_type":"max","rate_limits_available":true,"rate_limits":{
             "five_hour":{"utilization":31,"resets_at":"2026-11-08T03:20:00.102083+00:00"},
             "seven_day":{"utilization":3,"resets_at":"2026-11-10T22:00:00.102099+00:00"},

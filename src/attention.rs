@@ -23,7 +23,7 @@ const SWEEP_EVERY: f64 = 60.0;
 /// Call first thing in `main`: gives the process its identity on Windows, where toasts need
 /// one, and routes clicks to `poll`.
 pub fn install() {
-    let _ = rune_notify::register(&rune_notify::Identity::new(crate::app::APP_ID, "Rune Code"));
+    let _ = rune_notify::register(&rune_notify::Identity::new(crate::app::APP_ID, "Yoke"));
     rune_notify::on_click(|click| {
         if let Some(id) = click.get("thread").and_then(|t| t.parse().ok()) {
             CLICKS.lock().unwrap_or_else(|e| e.into_inner()).push(id);

@@ -1,8 +1,10 @@
-# Rune Code
+# Yoke
 
-A small T3 Code-style desktop app for prompting coding agents, built to try out
-[Rune](https://github.com/anomalyco/rune), a GPU-rendered Rust UI framework, and see how it feels and how fast it is.
-It's a prototype, not a full T3 Code.
+A harness for harnesses: one desktop app for driving coding agents (Claude Code, Codex,
+OpenCode) across all your projects, after T3 Code. It's built on
+[Rune](https://github.com/anomalyco/rune), a GPU-rendered Rust UI framework. It's young, not a
+full T3 Code yet. It was called Rune Code until the rename; its first launch as Yoke copies the
+old settings and saved threads over.
 
 ![dark](shots/demo-dark.png)
 
@@ -28,7 +30,7 @@ The sidebar lists every project, as T3 Code does, each with its threads under it
 
 ```sh
 cargo install cargo-packager --locked   # once
-cargo packager --release                # target/release/Rune Code.app and Rune Code_<version>_<arch>.dmg
+cargo packager --release                # target/release/Yoke.app and Yoke_<version>_<arch>.dmg
 ```
 
 On Windows the same command builds an NSIS installer and on Linux a `.deb` and an `.AppImage` (untested so far). The config is `[package.metadata.packager]` in `Cargo.toml`. The macOS bundle is ad-hoc signed, with no Apple account: copied from the `.dmg` after a browser download, it needs right-click › Open the first time. The icon's source is `assets/icon.svg`; `scripts/icons.sh` renders the `.icns`, `.png` and `.ico` from it.
@@ -42,7 +44,7 @@ On Windows the same command builds an NSIS installer and on Linux a `.deb` and a
   - **Agents**: which CLIs were found, and how many models each reported. Look again searches once more (after installing one, say). **Messages from your other sessions** (on by default) lets your other Claude Code sessions, here or in a terminal, message a Claude Code thread here (`SendMessage`), for example to say which files they're editing. Each turn passes `--settings '{"crossSessionInbound":"accept"}'`, or `"refuse"` with the switch off. Without either, the CLI holds a message from a session in a different permission mode for an approval a thread here can't give, so the message would expire unread. A message can't give a thread more access than it has.
   - **Keyboard shortcuts** (below).
   - **Advanced**: frame stats, the settings file (Show in Finder), and the version.
-- **Every shortcut can be changed** in Settings › Keyboard shortcuts. Click one and press the new keys: Esc cancels, ⌫ clears, and a chord that's already in use is refused. The list covers new thread, sidebar, settings, frame stats, focus prompt, previous/next thread (⌥⌘↑/↓), settle thread (⇧⌘S), delete thread (⇧⌘⌫), stop, steer, and opening the pickers (⇧⌘M for the model picker, which ⇧⌘H and ⇧⌘E also open; ⇧⌘A for access). Changes save to `~/Library/Application Support/dev.rune-code/prefs.json`, along with the appearance. The menu bar's Settings… item picks up a new chord at the next launch.
+- **Every shortcut can be changed** in Settings › Keyboard shortcuts. Click one and press the new keys: Esc cancels, ⌫ clears, and a chord that's already in use is refused. The list covers new thread, sidebar, settings, frame stats, focus prompt, previous/next thread (⌥⌘↑/↓), settle thread (⇧⌘S), delete thread (⇧⌘⌫), stop, steer, and opening the pickers (⇧⌘M for the model picker, which ⇧⌘H and ⇧⌘E also open; ⇧⌘A for access). Changes save to `~/Library/Application Support/dev.yoke/prefs.json`, along with the appearance. The menu bar's Settings… item picks up a new chord at the next launch.
 - The window answers macOS tiling (Window › Fill, Center, Move & Resize, and their Fn-Control shortcuts).
 - The composer has two pickers:
   - **the model picker** (⇧⌘M, after T3 Code's): one chip ("Opus 5.5 High") opening a popover with Favorites and each harness down a rail, a search over the harness's models, and the reasoning effort beside them.
@@ -75,15 +77,15 @@ The gauge in the toolbar (**⇧⌘U**), or the one in the composer while Claude 
 
 ## Uninstall
 
-Rune Code keeps `prefs.json` (shortcuts, appearance, theme, new-thread defaults, the send and follow-up settings, the projects and the last one used, settled threads, the model lists, favorite models, the last plan-limits reading and Claude's prices) and a `threads` folder (Codex and OpenCode threads, one JSON file each) in `dev.rune-code` in the platform's config folder. Pasted screenshots wait in the temp folder's `rune-code-pastes` and are deleted a day later, at the next launch. On macOS, the system also keeps a GPU shader cache for the app.
+Yoke keeps `prefs.json` (shortcuts, appearance, theme, new-thread defaults, the send and follow-up settings, the projects and the last one used, settled threads, the model lists, favorite models, the last plan-limits reading and Claude's prices) and a `threads` folder (Codex and OpenCode threads, one JSON file each) in `dev.yoke` in the platform's config folder. Pasted screenshots wait in the temp folder's `yoke-pastes` and are deleted a day later, at the next launch. On macOS, the system also keeps a GPU shader cache for the app.
 
 | Installed with | Remove the app | Remove its data |
 | --- | --- | --- |
-| `.dmg` (macOS) | Drag Rune Code from Applications to the Trash | `rm -rf ~/Library/Application\ Support/dev.rune-code "$(getconf DARWIN_USER_CACHE_DIR)dev.rune-code"` |
-| Homebrew cask (macOS) | `brew uninstall --zap rune-code` | The cask's `zap` removes the same two folders |
-| Nix | Drop it from your config (or `nix profile remove`) | As for the `.dmg` on macOS; `rm -rf ~/.config/dev.rune-code` on Linux |
-| `.deb` / `.AppImage` (Linux) | `sudo apt remove rune-code`, or delete the `.AppImage` | `rm -rf ~/.config/dev.rune-code` |
-| Installer (Windows) | Settings › Apps › Rune Code › Uninstall | Tick "Delete the application data" in the uninstaller |
+| `.dmg` (macOS) | Drag Yoke from Applications to the Trash | `rm -rf ~/Library/Application\ Support/dev.yoke "$(getconf DARWIN_USER_CACHE_DIR)dev.yoke"` |
+| Homebrew cask (macOS) | `brew uninstall --zap yoke` | The cask's `zap` removes the same two folders |
+| Nix | Drop it from your config (or `nix profile remove`) | As for the `.dmg` on macOS; `rm -rf ~/.config/dev.yoke` on Linux |
+| `.deb` / `.AppImage` (Linux) | `sudo apt remove yoke`, or delete the `.AppImage` | `rm -rf ~/.config/dev.yoke` |
+| Installer (Windows) | Settings › Apps › Yoke › Uninstall | Tick "Delete the application data" in the uninstaller |
 
 Uninstalling leaves the agents' own files alone, since the terminal CLIs share them: Claude Code's session transcripts (`~/.claude/projects/`), and "Always allow" rules saved to a project's `.claude/settings.local.json`.
 
@@ -109,8 +111,8 @@ This works the way the Claude Agent SDK talks to the CLI. The prompt goes in on 
 - **Themes**: OpenCode, Nord and Gruvbox, each in light and dark (Settings › Appearance › Theme; Mode picks light, dark or the system's). Nord and Gruvbox keep the OpenCode kit's fonts, spacing and shadows and recolour it: every grey in OpenCode's palette maps by its lightness onto the theme's own ramp, and the accent, status and code colours come from the theme (`src/ui/theme.rs`).
 - Settings › Agents counts the models each installed CLI reported. "Default" (let the CLI choose) isn't counted, and a CLI that isn't installed shows none.
 - The sidebar also lists each project's saved Claude Code sessions (`~/.claude/projects/<folder>/*.jsonl`), from the terminal or earlier runs, titled as Claude Code titles them; opening one reads its transcript, and replying resumes it.
-- Codex and OpenCode keep no history the app can read back, so Rune Code saves those threads itself (`src/store.rs`) when each turn ends: they come back in their project at the next launch, and replying resumes the CLI's session. Deleting the thread deletes its file.
-- **Worktree threads**, as in T3 Code: in a git repository the composer's Local / New worktree chip picks where a new thread runs. In a worktree, the thread gets a branch of its own from the project's HEAD (`rune/<first words of the prompt>-<id>`) in `~/.rune-code/worktrees/<project>/`, so agents can change the same repository at once without touching each other's files or your checkout. The row shows the branch. Merging it back is up to you, and deleting the thread leaves the worktree and branch in place. Files git ignores (a local `.env`, `.cargo/config.toml`) aren't in a new worktree.
+- Codex and OpenCode keep no history the app can read back, so Yoke saves those threads itself (`src/store.rs`) when each turn ends: they come back in their project at the next launch, and replying resumes the CLI's session. Deleting the thread deletes its file.
+- **Worktree threads**, as in T3 Code: in a git repository the composer's Local / New worktree chip picks where a new thread runs. In a worktree, the thread gets a branch of its own from the project's HEAD (`yoke/<first words of the prompt>-<id>`) in `~/.yoke/worktrees/<project>/`, so agents can change the same repository at once without touching each other's files or your checkout. The row shows the branch. Merging it back is up to you, and deleting the thread leaves the worktree and branch in place. Files git ignores (a local `.env`, `.cargo/config.toml`) aren't in a new worktree.
 - Drop images (PNG, JPEG, GIF, WebP) anywhere on the window, or paste a screenshot into the prompt, to attach them. Claude Code gets them as image blocks; Codex as `--image`; OpenCode gets the paths in the prompt.
 - A transcript that streams Markdown as it arrives: code fences are syntax-coloured and tables, lists and inline code render. Text is selectable.
 - Tool calls appear as rows: icon, tool name, a one-line summary and a running/ok/failed status. Click a row to see its output.
@@ -164,7 +166,7 @@ Rune runs any app headless, using the same renderer:
 
 ```sh
 cargo build
-target/debug/rune-code --snap out.png --scene demo --size 1180x780 --theme light   # scenes: demo long empty picker effort settings usage usage-popover queue approval attach collapsed
+target/debug/yoke --snap out.png --scene demo --size 1180x780 --theme light   # scenes: demo long empty picker effort settings usage usage-popover queue approval attach collapsed
 cargo test                                                    # parsers, shortcuts, queue/steer and approvals (against a stand-in claude)
 cargo test -- --ignored live_claude --nocapture               # drives the real `claude` through the UI (costs a few tokens)
 cargo test -- --ignored live_usage --nocapture                # reads the real plan limits and transcripts (no tokens)
@@ -192,11 +194,11 @@ Profiling the live app, or a bench, with function names (the `perf` profile keep
 
 ```sh
 cargo build --profile perf
-samply record ./target/perf/rune-code                    # macOS and Linux; `cargo install samply`
-xcrun xctrace record --template 'Time Profiler' --launch -- ./target/perf/rune-code   # macOS
-perf record -g ./target/perf/rune-code                   # Linux; `perf stat` for cache misses and IPC
-footprint $(pgrep -n rune-code)                          # macOS memory by kind
-top -pid $(pgrep -n rune-code) -stats cpu,mem,idlew,power   # idle wakeups and energy
+samply record ./target/perf/yoke                    # macOS and Linux; `cargo install samply`
+xcrun xctrace record --template 'Time Profiler' --launch -- ./target/perf/yoke   # macOS
+perf record -g ./target/perf/yoke                   # Linux; `perf stat` for cache misses and IPC
+footprint $(pgrep -n yoke)                          # macOS memory by kind
+top -pid $(pgrep -n yoke) -stats cpu,mem,idlew,power   # idle wakeups and energy
 ```
 
 Live with Claude Code (haiku), the first streamed text lands about 1.5 s after Return; that time is the CLI, not the UI.

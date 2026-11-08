@@ -1,4 +1,4 @@
-//! Settings (⌘, or Rune Code › Settings…), after T3 Code's: a rail of pages down the left
+//! Settings (⌘, or Yoke › Settings…), after T3 Code's: a rail of pages down the left
 //! (Appearance, New threads, Chat, Agents, Keyboard shortcuts, Advanced) and the chosen page
 //! beside it. It takes the main pane while it's open, since nothing else there can be used
 //! meanwhile; Esc, Done, or picking a thread closes it. What the pages change lives in
@@ -295,7 +295,7 @@ fn advanced(s: &App, k: &Kit) -> El {
     }
     rows.push(row().w_full().min_h(52.0).px(18.0).py(12.0).gap(20.0).center_y()
         .child(text("Version").font(label_style(k)).color(c.text_strong).grow(1.0))
-        .child(text(format!("Rune Code {}", env!("CARGO_PKG_VERSION"))).font(help_style(k)).color(c.text_muted)));
+        .child(text(format!("Yoke {}", env!("CARGO_PKG_VERSION"))).font(help_style(k)).color(c.text_muted)));
     card(k, rows)
 }
 

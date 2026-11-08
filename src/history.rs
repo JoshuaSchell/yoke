@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn removing_a_session_takes_its_files_and_nothing_else() {
-        let home = std::env::temp_dir().join(format!("rune-code-remove-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("yoke-remove-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let project = Path::new("/Users/josh/my.app");
         let id = "88998ad8-25b9-43da-99f0-81bfef07d76f";
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(title(&titled).as_deref(), Some("Build fix"));
         assert_eq!(title(r#"{"type":"mode"}"#), None, "no prompt, no thread");
 
-        let path = std::env::temp_dir().join(format!("rune-code-history-{}.jsonl", std::process::id()));
+        let path = std::env::temp_dir().join(format!("yoke-history-{}.jsonl", std::process::id()));
         std::fs::write(&path, &file).unwrap();
         let rows = load(&path);
         let _ = std::fs::remove_file(&path);

@@ -192,7 +192,7 @@ pub fn delete_dialog(s: &App, k: &Kit, layer: &mut Vec<El>) {
     let what = if s.saved_session(id).is_some() {
         format!("\u{201c}{}\u{201d} and its Claude Code transcript are deleted from this computer. This can't be undone.", t.title)
     } else {
-        format!("\u{201c}{}\u{201d} is removed from Rune Code. This can't be undone.", t.title)
+        format!("\u{201c}{}\u{201d} is removed from Yoke. This can't be undone.", t.title)
     };
     let buttons = row().key("delete-buttons").w_full().padding(16.0).gap(8.0).justify_end()
         .child(Button::new("Cancel").variant(ButtonVariant::Ghost).on_press(|s: &mut App| s.confirm_delete = None).build(k).key("delete-cancel"))

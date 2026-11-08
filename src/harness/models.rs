@@ -59,7 +59,7 @@ pub fn discover(h: Harness, bin: &Path, cwd: &Path) -> Option<Vec<ModelOpt>> {
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);
-const REQUEST_ID: &str = "rune-code-models";
+const REQUEST_ID: &str = "yoke-models";
 
 /// `claude -p --input-format stream-json …`, then one `initialize` control request on stdin.
 /// The reply comes before any prompt is needed, so no tokens are spent.
@@ -151,7 +151,7 @@ mod tests {
 
     #[test]
     fn reads_claude_initialize_models() {
-        let v: Value = serde_json::from_str(r#"{"type":"control_response","response":{"subtype":"success","request_id":"rune-code-models","response":{
+        let v: Value = serde_json::from_str(r#"{"type":"control_response","response":{"subtype":"success","request_id":"yoke-models","response":{
             "commands":[],
             "models":[
                 {"value":"default","displayName":"Default (recommended)","description":"Opus 5.5"},

@@ -1,5 +1,5 @@
 [package]
-name = "rune-code"
+name = "yoke"
 version = "0.1.0"
 edition = "2024"
 description = "A small T3 Code-style desktop app for prompting coding agents (Claude Code, Codex, OpenCode), built on Rune."
@@ -28,13 +28,13 @@ objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSDockTile", "NSMenu", "NSMenuItem", "NSResponder"] }
 objc2-foundation = { version = "0.2", features = ["NSString", "NSThread"] }
 
-# Installers: `cargo packager --release` builds Rune Code.app and a .dmg on macOS, an NSIS
+# Installers: `cargo packager --release` builds Yoke.app and a .dmg on macOS, an NSIS
 # installer on Windows, and a .deb and .AppImage on Linux, into target/release/.
 # assets/icon.svg is the source; icon.icns, icon.png, icon-256.png and icon.ico are rendered
 # from it (scripts/icons.sh).
 [package.metadata.packager]
-product-name = "Rune Code"
-identifier = "dev.rune-code"
+product-name = "Yoke"
+identifier = "dev.yoke"
 category = "DeveloperTool"
 icons = ["assets/icon.icns", "assets/icon.png", "assets/icon.ico"]
 before-packaging-command = "cargo build --release"
@@ -46,7 +46,7 @@ signing-identity = "-"
 
 # The Windows uninstaller offers to delete these too (the prefs and pasted screenshots).
 [package.metadata.packager.nsis]
-appdata-paths = ["$APPDATA/$IDENTIFIER", "$TEMP/rune-code-pastes"]
+appdata-paths = ["$APPDATA/$IDENTIFIER", "$TEMP/yoke-pastes"]
 
 # Dependencies build optimised even in debug, so `cargo run` is smooth.
 [profile.dev.package."*"]
