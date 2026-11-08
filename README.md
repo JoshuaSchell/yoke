@@ -75,7 +75,7 @@ The gauge in the toolbar (**⇧⌘U**), or the one in the composer while Claude 
 
 ## Uninstall
 
-Rune Code keeps one small file of its own, `prefs.json` (shortcuts, appearance, theme, new-thread defaults, the send and follow-up settings, the projects and the last one used, settled threads, the model lists, favorite models, the last plan-limits reading and Claude's prices), in `dev.rune-code` in the platform's config folder. Pasted screenshots wait in the temp folder's `rune-code-pastes` and are deleted a day later, at the next launch. On macOS, the system also keeps a GPU shader cache for the app.
+Rune Code keeps `prefs.json` (shortcuts, appearance, theme, new-thread defaults, the send and follow-up settings, the projects and the last one used, settled threads, the model lists, favorite models, the last plan-limits reading and Claude's prices) and a `threads` folder (Codex and OpenCode threads, one JSON file each) in `dev.rune-code` in the platform's config folder. Pasted screenshots wait in the temp folder's `rune-code-pastes` and are deleted a day later, at the next launch. On macOS, the system also keeps a GPU shader cache for the app.
 
 | Installed with | Remove the app | Remove its data |
 | --- | --- | --- |
@@ -109,6 +109,7 @@ This works the way the Claude Agent SDK talks to the CLI. The prompt goes in on 
 - **Themes**: OpenCode, Nord and Gruvbox, each in light and dark (Settings › Appearance › Theme; Mode picks light, dark or the system's). Nord and Gruvbox keep the OpenCode kit's fonts, spacing and shadows and recolour it: every grey in OpenCode's palette maps by its lightness onto the theme's own ramp, and the accent, status and code colours come from the theme (`src/ui/theme.rs`).
 - Settings › Agents counts the models each installed CLI reported. "Default" (let the CLI choose) isn't counted, and a CLI that isn't installed shows none.
 - The sidebar also lists each project's saved Claude Code sessions (`~/.claude/projects/<folder>/*.jsonl`), from the terminal or earlier runs, titled as Claude Code titles them; opening one reads its transcript, and replying resumes it.
+- Codex and OpenCode keep no history the app can read back, so Rune Code saves those threads itself (`src/store.rs`) when each turn ends: they come back in their project at the next launch, and replying resumes the CLI's session. Deleting the thread deletes its file.
 - Drop images (PNG, JPEG, GIF, WebP) anywhere on the window, or paste a screenshot into the prompt, to attach them. Claude Code gets them as image blocks; Codex as `--image`; OpenCode gets the paths in the prompt.
 - A transcript that streams Markdown as it arrives: code fences are syntax-coloured and tables, lists and inline code render. Text is selectable.
 - Tool calls appear as rows: icon, tool name, a one-line summary and a running/ok/failed status. Click a row to see its output.
@@ -141,7 +142,8 @@ src/harness/           spawning CLIs and parsing their JSON lines
 src/harness/models.rs  asking each CLI for its models
 src/harness/limits.rs  Claude's plan limits (`get_usage`, `rate_limit_event`)
 src/usage.rs           spend from Claude Code's transcripts, priced from LiteLLM's table
-src/history.rs         Claude Code's saved sessions for the project
+src/history.rs         Claude Code's saved sessions, and the folders they ran in
+src/store.rs           Codex and OpenCode threads the app saves itself
 src/ui/mod.rs          window: SplitView shell, toolbar, new-thread hero
 src/ui/sidebar.rs      thread list: inbox, Working and Settled shelves
 src/attention.rs       notifications, Dock badge, auto-settle sweep

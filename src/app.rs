@@ -14,6 +14,7 @@ use crate::harness::limits::{self, Limits};
 use crate::harness::models::{self, ModelOpt};
 use crate::harness::{self, Access, AskRequest, Decision, Event, Harness, Running, Turn};
 use crate::history;
+use crate::store;
 use crate::shortcuts::{Cmd, Keys};
 use crate::ui::theme::Theme;
 use crate::usage;
@@ -46,6 +47,13 @@ const USAGE_DAYS_KEY: &str = "usage.days";
 pub const LIMITS_EVERY: Duration = Duration::from_secs(5 * 60);
 /// The Usage page's periods, in days.
 pub const USAGE_PERIODS: [(u32, &str); 4] = [(1, "Today"), (7, "7 days"), (30, "30 days"), (90, "90 days")];
+
+/// One project's saved threads, listed off the UI thread.
+pub struct Listed {
+    pub project: PathBuf,
+    pub claude: Vec<history::Session>,
+    pub kept: Vec<store::Saved>,
+}
 
 /// Where a thread sits in the sidebar's inbox.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,8 +179,10 @@ pub struct App {
     events: Receiver<(ThreadId, Event)>,
     sender: Sender<(ThreadId, Event)>,
     discovered: Receiver<(Harness, Vec<ModelOpt>)>,
-    sessions: Receiver<(PathBuf, Vec<history::Session>)>,
-    sessions_tx: Sender<(PathBuf, Vec<history::Session>)>,
+    sessions: Receiver<Listed>,
+    sessions_tx: Sender<Listed>,
+    /// Where Codex and OpenCode threads are kept (`store`); `None` in tests.
+    store: Option<PathBuf>,
     discover_tx: Sender<(Harness, Vec<ModelOpt>)>,
     waker: Option<Waker>,
     running: HashMap<ThreadId, Running>,
@@ -283,7 +293,8 @@ pub struct Thread {
     pub failed: bool,
     /// The last activity, for the sidebar's "5m".
     pub updated: SystemTime,
-    /// A Claude Code session file not read yet: the transcript loads when the thread opens.
+    /// A saved transcript not read yet (a Claude Code session file, or a `store` record):
+    /// it loads when the thread opens.
     pub saved: Option<PathBuf>,
     /// When the running turn started.
     pub turn_started: Option<Instant>,
@@ -383,7 +394,8 @@ impl App {
             .map(|p| Project { collapsed: collapsed.contains(&p.to_string_lossy().into_owned()), ..Project::new(p) })
             .collect();
         let open = open.filter(|p| p.is_dir()).map(|p| p.canonicalize().unwrap_or(p));
-        if let Some(p) = &open && !projects.iter().any(|x| &x.path == p) {
+        let added = open.as_ref().is_some_and(|p| !projects.iter().any(|x| &x.path == p));
+        if added && let Some(p) = &open {
             projects.push(Project::new(p.clone()));
         }
         let last = prefs.get::<String>(LAST_PROJECT_KEY).map(PathBuf::from);
@@ -455,6 +467,7 @@ impl App {
             beat: 0,
             keys: Keys::load(&prefs),
             picker: crate::picker::Picker::load(&prefs),
+            store: store::dir(&prefs),
             recording: None,
             key_error: None,
             prefs,
@@ -479,6 +492,7 @@ impl App {
             next_id: 1,
         };
         app.apply_defaults();
+        if added { app.save_projects(); }
         app
     }
 
@@ -638,14 +652,39 @@ impl App {
     }
 
     fn load_sessions_of(&self, paths: Vec<PathBuf>) {
-        let (tx, wake) = (self.sessions_tx.clone(), self.waker.clone());
+        let (tx, wake, store) = (self.sessions_tx.clone(), self.waker.clone(), self.store.clone());
         std::thread::spawn(move || {
             for p in paths {
-                let list = history::list(&p);
-                let _ = tx.send((p, list));
+                let claude = history::list(&p);
+                let kept = store.as_deref().map(|d| store::list(d, &p)).unwrap_or_default();
+                let _ = tx.send(Listed { project: p, claude, kept });
                 if let Some(w) = &wake { w(); }
             }
         });
+    }
+
+    /// Adds `project`'s kept Codex and OpenCode threads no thread has yet.
+    pub(crate) fn land_kept(&mut self, project: &Path, list: Vec<store::Saved>) {
+        if !self.projects.iter().any(|p| p.path == project) { return; }
+        for x in list {
+            if self.threads.iter().any(|t| t.harness == x.harness && t.session.as_deref() == Some(x.session.as_str())) { continue; }
+            let id = self.id();
+            let mut t = Thread::new(id, x.title, x.harness, x.model);
+            let idle = x.modified.elapsed().is_ok_and(|d| d >= AUTO_SETTLE);
+            t.settled = self.settled_by_hand.get(&x.session).copied().unwrap_or(idle);
+            t.session = Some(x.session);
+            t.project = project.to_owned();
+            t.saved = Some(x.path);
+            t.updated = x.modified;
+            self.threads.push(t);
+        }
+        self.threads.sort_by(|a, b| b.updated.cmp(&a.updated));
+    }
+
+    /// Writes thread `id`'s record if it's one the app keeps.
+    fn keep(&self, id: ThreadId) {
+        let (Some(dir), Some(t)) = (&self.store, self.threads.iter().find(|t| t.id == id)) else { return };
+        if store::keeps(t) { store::save(dir, t); }
     }
 
     /// Adds `project`'s sessions no thread has yet, newest first among the threads.
@@ -1035,7 +1074,8 @@ impl App {
             t.unread = false;
             t.rev += 1;
             if let Some(path) = t.saved.take() {
-                for kind in history::load(&path) {
+                let kinds = if t.harness == Harness::Claude { history::load(&path) } else { store::load(&path) };
+                for kind in kinds {
                     fresh += 1;
                     t.items.push(Item { id: fresh, rev: 0, kind });
                 }
@@ -1080,6 +1120,10 @@ impl App {
         }
         let running = self.running.remove(&id);
         if let Some(r) = &running { r.stop(); }
+        if let (Some(dir), Some(t)) = (&self.store, self.threads.iter().find(|t| t.id == id))
+            && let (true, Some(s)) = (store::keeps(t), &t.session) {
+                store::remove(dir, t.harness, s);
+            }
         self.threads.retain(|t| t.id != id);
         if self.selected == Some(id) { self.selected = None; }
         let Some(session) = session else { return };
@@ -1270,9 +1314,10 @@ impl App {
             changed = true;
             self.land_models(h, list);
         }
-        while let Ok((project, list)) = self.sessions.try_recv() {
+        while let Ok(l) = self.sessions.try_recv() {
             changed = true;
-            self.land_sessions(&project, list);
+            self.land_sessions(&l.project, l.claude);
+            self.land_kept(&l.project, l.kept);
         }
         while let Ok((id, e)) = self.events.try_recv() {
             changed = true;
@@ -1307,6 +1352,12 @@ impl App {
         }
         let selected = self.selected == Some(id);
         let fresh = self.id();
+        let exited = matches!(e, Event::Exited { .. });
+        self.apply_to(id, e, selected, fresh);
+        if exited { self.keep(id); }
+    }
+
+    fn apply_to(&mut self, id: ThreadId, e: Event, selected: bool, fresh: u64) {
         let Some(t) = self.thread_mut(id) else { return };
         t.rev += 1;
         match e {

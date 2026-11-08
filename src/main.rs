@@ -11,6 +11,7 @@ mod harness;
 mod history;
 mod picker;
 mod settings;
+mod store;
 mod shortcuts;
 mod ui;
 mod usage;
@@ -604,6 +605,50 @@ mod tests {
         assert!(rt.state.threads.iter().any(|t| t.id == 99), "the first project's threads stay");
         assert_eq!(rt.state.prefs.get::<String>(crate::app::LAST_PROJECT_KEY), Some(dir.to_string_lossy().into_owned()));
         assert_eq!(rt.state.prefs.get::<Vec<String>>(crate::app::PROJECTS_KEY).unwrap().len(), 2);
+    }
+
+    /// A Codex thread is saved when its turn ends, and the next launch lists it in its
+    /// project with its transcript; deleting it deletes the record.
+    #[test]
+    fn codex_threads_outlive_the_app() {
+        use crate::app::{Item, Thread};
+        use crate::harness::Event;
+        let root = std::env::temp_dir().join(format!("rune-code-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let prefs = || rune::prefs::Prefs::at(root.join("prefs.json"));
+        let mut app = App::new(Some(std::env::current_dir().unwrap()), prefs());
+        let here = app.current.clone().unwrap();
+        let mut t = Thread::new(7, "Write the changelog".into(), Harness::Codex, "Default".into());
+        t.project = here.clone();
+        t.session = Some("codex-session-1".into());
+        t.busy = true;
+        t.items.push(Item { id: 1, rev: 0, kind: Kind::User("Write it".into()) });
+        t.items.push(Item { id: 2, rev: 0, kind: Kind::Assistant { text: "Done.".into(), streaming: false } });
+        app.threads.push(t);
+        app.apply(7, Event::Exited { code: Some(0), stderr: String::new() });
+        let record = root.join("threads/codex-codex-session-1.json");
+        let start = Instant::now();
+        while !record.exists() && start.elapsed() < Duration::from_secs(5) { std::thread::sleep(Duration::from_millis(10)); }
+        assert!(record.exists(), "the turn's end saved the thread");
+
+        let mut rt = headless(App::new(None, prefs()));
+        rt.update(|s, _| s.load_sessions());
+        let start = Instant::now();
+        while !rt.state.threads.iter().any(|t| t.harness == Harness::Codex) && start.elapsed() < Duration::from_secs(10) {
+            rt.update(|s, tx| { s.drain(tx); });
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let id = rt.state.threads.iter().find(|t| t.harness == Harness::Codex).map(|t| t.id).expect("listed at the next launch");
+        rt.update(|s, _| s.select(id));
+        let t = rt.state.thread().unwrap();
+        assert_eq!((t.title.as_str(), t.session.as_deref(), &t.project), ("Write the changelog", Some("codex-session-1"), &here));
+        assert!(matches!(&t.items[1].kind, Kind::Assistant { text, .. } if text == "Done."));
+        assert!(t.items.iter().any(|i| matches!(i.kind, Kind::TurnEnd { .. })));
+
+        rt.update(|s, _| s.delete(id));
+        assert!(!record.exists(), "deleting the thread deletes its record");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Each project lists its own threads under its name; picking a thread makes its project
