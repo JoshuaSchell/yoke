@@ -1619,6 +1619,12 @@ pub mod scenes {
         }
         let ago = |m: u64| SystemTime::now() - Duration::from_secs(60 * m);
         (w.updated, t.updated, c.updated, f.updated) = (ago(1), ago(4), ago(2), ago(12));
+        // Two stand-in projects, so the snapshots show none of yours.
+        let (api, desktop) = (PathBuf::from("/demo/api-client"), PathBuf::from("/demo/desktop"));
+        s.projects = vec![Project::new(api.clone()), Project::new(desktop.clone())];
+        s.current = Some(api.clone());
+        (t.project, c.project, w.project, f.project) = (api.clone(), api.clone(), desktop.clone(), desktop);
+        for x in &mut settled { x.project = api.clone(); }
         s.threads = vec![w, t, c, f];
         s.threads.extend(settled);
         s.settled_open = true;
@@ -1782,8 +1788,10 @@ pub mod scenes {
     }
 
     pub fn empty(s: &mut App) {
-        s.threads.clear();
+        demo(s);
+        s.threads.retain(|t| t.settled);
         s.selected = None;
+        s.draft.focused = true;
     }
 
     const DEMO_ANSWER: &str = "Done. `fetch` now retries transient failures with exponential backoff:\n\n\

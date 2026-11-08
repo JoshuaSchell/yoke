@@ -167,6 +167,7 @@ Rune runs any app headless, using the same renderer:
 ```sh
 cargo build
 target/debug/yoke --snap out.png --scene demo --size 1180x780 --theme light   # scenes: demo long empty picker effort settings usage usage-popover queue approval attach collapsed
+scripts/shots.sh                                              # re-renders shots/ (a scratch HOME, so none of your threads show)
 cargo test                                                    # parsers, shortcuts, queue/steer and approvals (against a stand-in claude)
 cargo test -- --ignored live_claude --nocapture               # drives the real `claude` through the UI (costs a few tokens)
 cargo test -- --ignored live_usage --nocapture                # reads the real plan limits and transcripts (no tokens)
