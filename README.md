@@ -110,6 +110,7 @@ This works the way the Claude Agent SDK talks to the CLI. The prompt goes in on 
 - Settings › Agents counts the models each installed CLI reported. "Default" (let the CLI choose) isn't counted, and a CLI that isn't installed shows none.
 - The sidebar also lists each project's saved Claude Code sessions (`~/.claude/projects/<folder>/*.jsonl`), from the terminal or earlier runs, titled as Claude Code titles them; opening one reads its transcript, and replying resumes it.
 - Codex and OpenCode keep no history the app can read back, so Rune Code saves those threads itself (`src/store.rs`) when each turn ends: they come back in their project at the next launch, and replying resumes the CLI's session. Deleting the thread deletes its file.
+- **Worktree threads**, as in T3 Code: in a git repository the composer's Local / New worktree chip picks where a new thread runs. In a worktree, the thread gets a branch of its own from the project's HEAD (`rune/<first words of the prompt>-<id>`) in `~/.rune-code/worktrees/<project>/`, so agents can change the same repository at once without touching each other's files or your checkout. The row shows the branch. Merging it back is up to you, and deleting the thread leaves the worktree and branch in place. Files git ignores (a local `.env`, `.cargo/config.toml`) aren't in a new worktree.
 - Drop images (PNG, JPEG, GIF, WebP) anywhere on the window, or paste a screenshot into the prompt, to attach them. Claude Code gets them as image blocks; Codex as `--image`; OpenCode gets the paths in the prompt.
 - A transcript that streams Markdown as it arrives: code fences are syntax-coloured and tables, lists and inline code render. Text is selectable.
 - Tool calls appear as rows: icon, tool name, a one-line summary and a running/ok/failed status. Click a row to see its output.
@@ -143,7 +144,8 @@ src/harness/models.rs  asking each CLI for its models
 src/harness/limits.rs  Claude's plan limits (`get_usage`, `rate_limit_event`)
 src/usage.rs           spend from Claude Code's transcripts, priced from LiteLLM's table
 src/history.rs         Claude Code's saved sessions, and the folders they ran in
-src/store.rs           Codex and OpenCode threads the app saves itself
+src/store.rs           Codex and OpenCode threads (and worktree threads) the app saves itself
+src/worktree.rs        making a git worktree for a thread
 src/ui/mod.rs          window: SplitView shell, toolbar, new-thread hero
 src/ui/sidebar.rs      thread list: inbox, Working and Settled shelves
 src/attention.rs       notifications, Dock badge, auto-settle sweep

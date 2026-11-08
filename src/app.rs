@@ -15,6 +15,7 @@ use crate::harness::models::{self, ModelOpt};
 use crate::harness::{self, Access, AskRequest, Decision, Event, Harness, Running, Turn};
 use crate::history;
 use crate::store;
+use crate::worktree::{self, Worktree};
 use crate::shortcuts::{Cmd, Keys};
 use crate::ui::theme::Theme;
 use crate::usage;
@@ -37,6 +38,8 @@ pub const LAST_PROJECT_KEY: &str = "project.last";
 /// The sidebar's projects, as folder paths in the order added, and the ones shut.
 pub const PROJECTS_KEY: &str = "projects";
 const COLLAPSED_KEY: &str = "projects.collapsed";
+/// New threads start in a worktree of their own (`worktree`).
+const WORKTREE_KEY: &str = "composer.worktree";
 /// The plan limits last read, so the gauge has numbers at launch.
 const LIMITS_KEY: &str = "usage.limits";
 /// LiteLLM's Claude prices (`usage::trim_prices`) and when they were fetched (epoch seconds).
@@ -183,6 +186,10 @@ pub struct App {
     sessions_tx: Sender<Listed>,
     /// Where Codex and OpenCode threads are kept (`store`); `None` in tests.
     store: Option<PathBuf>,
+    /// New threads start in a worktree of their own, where the project is a git repository.
+    pub worktree_mode: bool,
+    worktrees: Receiver<(ThreadId, Result<Worktree, String>)>,
+    worktrees_tx: Sender<(ThreadId, Result<Worktree, String>)>,
     discover_tx: Sender<(Harness, Vec<ModelOpt>)>,
     waker: Option<Waker>,
     running: HashMap<ThreadId, Running>,
@@ -257,12 +264,15 @@ pub struct Project {
     pub path: PathBuf,
     /// Its group in the sidebar is shut.
     pub collapsed: bool,
+    /// It's in a git repository, so its threads can run in worktrees.
+    pub repo: bool,
 }
 
 impl Project {
     pub fn new(path: PathBuf) -> Project {
         let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-        Project { name, path, collapsed: false }
+        let repo = worktree::is_repo(&path);
+        Project { name, path, collapsed: false, repo }
     }
 }
 
@@ -282,8 +292,12 @@ pub struct Thread {
     /// The model the harness reported (`claude-opus-5-5`), once it has.
     pub resolved_model: Option<String>,
     pub session: Option<String>,
-    /// The folder it runs in. Empty (a test's thread) counts as the current project.
+    /// The project it belongs to. Empty (a test's thread) counts as the current project.
     pub project: PathBuf,
+    /// The worktree it runs in instead of the project's folder, if it has one.
+    pub worktree: Option<Worktree>,
+    /// Its worktree is being made; its first message waits in the queue.
+    pub preparing: bool,
     pub items: Vec<Item>,
     pub busy: bool,
     pub unread: bool,
@@ -338,6 +352,8 @@ impl Thread {
             resolved_model: None,
             session: None,
             project: PathBuf::new(),
+            worktree: None,
+            preparing: false,
             items: Vec::new(),
             busy: false,
             unread: false,
@@ -385,6 +401,7 @@ impl App {
         let (sender, events) = channel();
         let (discover_tx, discovered) = channel();
         let (sessions_tx, sessions) = channel();
+        let (worktrees_tx, worktrees) = channel();
         let installed = harness::detect();
         let harness = installed.iter().find(|(_, p)| p.is_some()).map_or(Harness::Claude, |(h, _)| *h);
         let collapsed: Vec<String> = prefs.get(COLLAPSED_KEY).unwrap_or_default();
@@ -468,6 +485,9 @@ impl App {
             keys: Keys::load(&prefs),
             picker: crate::picker::Picker::load(&prefs),
             store: store::dir(&prefs),
+            worktree_mode: prefs.get(WORKTREE_KEY).unwrap_or(false),
+            worktrees,
+            worktrees_tx,
             recording: None,
             key_error: None,
             prefs,
@@ -672,13 +692,45 @@ impl App {
             let mut t = Thread::new(id, x.title, x.harness, x.model);
             let idle = x.modified.elapsed().is_ok_and(|d| d >= AUTO_SETTLE);
             t.settled = self.settled_by_hand.get(&x.session).copied().unwrap_or(idle);
+            // A Claude thread's transcript is Claude Code's session file, kept under the
+            // worktree's folder; others are in the record.
+            t.saved = match (&x.worktree, x.harness) {
+                (Some(w), Harness::Claude) => history::dir(&w.path).map(|d| d.join(format!("{}.jsonl", x.session))),
+                _ => Some(x.path),
+            };
             t.session = Some(x.session);
             t.project = project.to_owned();
-            t.saved = Some(x.path);
+            t.worktree = x.worktree;
             t.updated = x.modified;
             self.threads.push(t);
         }
         self.threads.sort_by(|a, b| b.updated.cmp(&a.updated));
+    }
+
+    /// A worktree was made (its queued message goes now) or couldn't be (it waits, to send
+    /// in the project's folder instead).
+    pub(crate) fn land_worktree(&mut self, id: ThreadId, made: Result<Worktree, String>) {
+        let fresh = self.id();
+        let Some(t) = self.thread_mut(id) else { return };
+        t.preparing = false;
+        t.busy = false;
+        t.turn_started = None;
+        t.rev += 1;
+        match made {
+            Ok(w) => {
+                t.worktree = Some(w);
+                self.ready.push(id);
+            }
+            Err(e) => {
+                t.failed = true;
+                t.items.push(Item { id: fresh, rev: 0, kind: Kind::Error(format!("Couldn't make a worktree: {e}. The message is still queued: send it to run in the project's folder instead.")) });
+            }
+        }
+    }
+
+    pub fn toggle_worktree_mode(&mut self) {
+        self.worktree_mode = !self.worktree_mode;
+        let _ = self.prefs.set(WORKTREE_KEY, &self.worktree_mode);
     }
 
     /// Writes thread `id`'s record if it's one the app keeps.
@@ -824,8 +876,9 @@ impl App {
         self.current.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// The folder thread `t`'s turns run in.
+    /// The folder thread `t`'s turns run in: its worktree, else its project's.
     pub fn run_dir(&self, t: &Thread) -> Option<PathBuf> {
+        if let Some(w) = &t.worktree { return Some(w.path.clone()); }
         Some(t.project.clone()).filter(|p| !p.as_os_str().is_empty()).or_else(|| self.current.clone())
     }
 
@@ -1161,7 +1214,7 @@ impl App {
     pub fn send(&mut self, tx: &mut Tx) {
         let Some(q) = self.take_draft() else { return };
         match self.selected {
-            Some(id) if self.is_running(id) => {
+            Some(id) if self.is_running(id) || self.thread().is_some_and(|t| t.preparing) => {
                 if let Some(t) = self.thread_mut(id) {
                     t.queue.push(q);
                     t.rev += 1;
@@ -1175,7 +1228,23 @@ impl App {
                     return;
                 };
                 let mut t = Thread::new(id, harness::first_line(&q.text, 60), self.harness, q.model.clone());
-                t.project = project;
+                t.project = project.clone();
+                if self.worktree_mode && self.project().is_some_and(|p| p.repo) {
+                    // The message waits in the queue until the worktree is made (`drain`).
+                    let branch = worktree::branch_name(&q.text, id ^ SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as u64));
+                    t.preparing = true;
+                    t.busy = true;
+                    t.turn_started = Some(Instant::now());
+                    t.queue.push(q);
+                    self.threads.insert(0, t);
+                    self.selected = Some(id);
+                    let (tx, wake) = (self.worktrees_tx.clone(), self.waker.clone());
+                    std::thread::spawn(move || {
+                        let _ = tx.send((id, worktree::create(&project, &branch)));
+                        if let Some(w) = wake { w(); }
+                    });
+                    return;
+                }
                 self.threads.insert(0, t);
                 self.selected = Some(id);
                 self.start_turn(id, q, tx);
@@ -1313,6 +1382,10 @@ impl App {
         while let Ok((h, list)) = self.discovered.try_recv() {
             changed = true;
             self.land_models(h, list);
+        }
+        while let Ok((id, made)) = self.worktrees.try_recv() {
+            changed = true;
+            self.land_worktree(id, made);
         }
         while let Ok(l) = self.sessions.try_recv() {
             changed = true;

@@ -1,5 +1,6 @@
 //! Threads the app keeps itself: Codex and OpenCode ones, whose CLIs keep no history this app
-//! reads back (Claude Code's sessions come from its own files, `history`). One JSON file per
+//! reads back (Claude Code's sessions come from its own files, `history`), and threads in
+//! worktrees, which Claude Code files under the worktree's folder rather than the project's. One JSON file per
 //! thread in `threads/` beside `prefs.json`, written when a turn ends, so the thread is in its
 //! project's group at the next launch and replying resumes its session.
 
@@ -10,16 +11,17 @@ use serde_json::{Value, json};
 
 use crate::app::{Kind, Thread, ToolState};
 use crate::harness::{ALL, Harness};
+use crate::worktree::Worktree;
 
 /// Where the records go: `threads/` beside the prefs file. `None` for in-memory prefs (tests).
 pub fn dir(prefs: &rune::prefs::Prefs) -> Option<PathBuf> {
     Some(prefs.path()?.parent()?.join("threads"))
 }
 
-/// Which threads have a record: the ones whose CLI keeps none we read, once they have a
-/// session to resume.
+/// Which threads have a record, once they have a session to resume: the ones whose CLI
+/// keeps none we read, and the ones in worktrees.
 pub fn keeps(t: &Thread) -> bool {
-    t.harness != Harness::Claude && t.session.is_some()
+    (t.harness != Harness::Claude || t.worktree.is_some()) && t.session.is_some()
 }
 
 fn file(dir: &Path, h: Harness, session: &str) -> PathBuf {
@@ -35,12 +37,14 @@ pub struct Saved {
     pub model: String,
     pub modified: SystemTime,
     pub path: PathBuf,
+    pub worktree: Option<Worktree>,
 }
 
 /// The record of `t` as JSON text, for `write` (made on the UI thread, written off it).
 pub fn record(t: &Thread) -> Option<String> {
     let session = t.session.as_deref()?;
-    let items: Vec<Value> = t.items.iter().filter_map(|i| kind_json(&i.kind)).collect();
+    // Claude Code keeps a Claude thread's transcript itself.
+    let items: Vec<Value> = if t.harness == Harness::Claude { Vec::new() } else { t.items.iter().filter_map(|i| kind_json(&i.kind)).collect() };
     let updated = t.updated.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let doc = json!({
         "version": 1,
@@ -50,6 +54,7 @@ pub fn record(t: &Thread) -> Option<String> {
         "title": t.title,
         "model": t.model,
         "updated": updated,
+        "worktree": t.worktree.as_ref().map(|w| json!({ "path": w.path.to_string_lossy(), "branch": w.branch })),
         "items": items,
     });
     Some(doc.to_string())
@@ -88,6 +93,7 @@ pub fn list(dir: &Path, project: &Path) -> Vec<Saved> {
                 title: v["title"].as_str().unwrap_or("Untitled").to_owned(),
                 model: v["model"].as_str().unwrap_or(crate::harness::models::DEFAULT).to_owned(),
                 modified: SystemTime::UNIX_EPOCH + Duration::from_secs(v["updated"].as_u64().unwrap_or(0)),
+                worktree: v["worktree"]["path"].as_str().map(|p| Worktree { path: PathBuf::from(p), branch: v["worktree"]["branch"].as_str().unwrap_or_default().to_owned() }),
                 path,
             })
         })

@@ -58,7 +58,12 @@ fn ago(t: &Thread) -> String {
 /// On the shelves, which hold every project's threads, it starts with the project.
 fn subtitle(s: &App, t: &Thread, lane: Lane, k: &Kit) -> (String, Option<rune::Color>) {
     let model = t.resolved_model.as_deref().unwrap_or(if t.model == crate::harness::models::DEFAULT { "" } else { t.model.as_str() });
-    let who = if model.is_empty() { t.harness.name().to_owned() } else { format!("{} · {model}", t.harness.name()) };
+    // A worktree thread names its branch instead of the model.
+    let who = match (&t.worktree, model.is_empty()) {
+        (Some(w), _) => format!("{} · {}", t.harness.name(), w.branch),
+        (None, true) => t.harness.name().to_owned(),
+        (None, false) => format!("{} · {model}", t.harness.name()),
+    };
     let project = match s.projects.iter().find(|p| s.in_project(t, &p.path)) {
         Some(p) if lane != Lane::Inbox => format!("{} · ", p.name),
         _ => String::new(),
@@ -66,6 +71,9 @@ fn subtitle(s: &App, t: &Thread, lane: Lane, k: &Kit) -> (String, Option<rune::C
     let queued = if t.queue.is_empty() { String::new() } else { format!(" · {} queued", t.queue.len()) };
     if !t.asks.is_empty() {
         return (format!("Wants to use {}", t.asks[0].ask.tool), Some(k.c.warning.icon));
+    }
+    if t.preparing {
+        return (format!("{project}Making a worktree…"), None);
     }
     if t.busy {
         let secs = t.turn_started.map_or(0, |s| s.elapsed().as_secs());

@@ -63,7 +63,7 @@ pub fn remove(home: &Path, project: &Path, id: &str) -> bool {
 
 /// The folders Claude Code has sessions for, most recently used first, read from each
 /// session's `cwd` (the folder names it keeps them under can't be turned back into paths).
-/// Folders that are gone, home itself, and temporary folders are left out.
+/// Folders that are gone, home itself, temporary folders and this app's worktrees are left out.
 pub fn projects() -> Vec<PathBuf> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return Vec::new() };
     let Ok(dirs) = std::fs::read_dir(home.join(".claude/projects")) else { return Vec::new() };
@@ -76,7 +76,8 @@ pub fn projects() -> Vec<PathBuf> {
             .max_by_key(|(t, _)| *t);
         let Some((when, file)) = newest else { continue };
         let Some(cwd) = session_cwd(&file) else { continue };
-        if !cwd.is_dir() || cwd == home || cwd.parent().is_none() || temporary(&cwd) { continue; }
+        let ours = crate::worktree::root().is_some_and(|r| cwd.starts_with(r));
+        if !cwd.is_dir() || cwd == home || cwd.parent().is_none() || temporary(&cwd) || ours { continue; }
         if found.iter().any(|(_, p)| *p == cwd) { continue; }
         found.push((when, cwd));
     }

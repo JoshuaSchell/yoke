@@ -108,8 +108,12 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut bar = row().w_full().gap(2.0).center_y()
         .child(model_pick)
         .child(dot(k))
-        .child(access_pick)
-        .child(rune::el().grow(1.0));
+        .child(access_pick);
+    // Local or a new worktree, for a new thread in a git repository (as in T3 Code).
+    if s.thread().is_none() && s.project().is_some_and(|p| p.repo) {
+        bar = bar.child(dot(k)).child(worktree_chip(s, k));
+    }
+    let mut bar = bar.child(rune::el().grow(1.0));
     // How close the Claude plan is to its limits, opening the windows' meters.
     if let Some(chip) = crate::ui::usage::chip(s, k, layer) {
         bar = bar.child(chip.mr(4.0));
@@ -141,7 +145,12 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         let stop = if stop_key.is_empty() { String::new() } else { format!("  ·  {stop_key} stop") };
         format!("{} {}{other}{stop}", first.1, first.0)
     } else {
-        let path = s.project().map_or_else(String::new, |p| p.path.display().to_string());
+        let wt = s.thread().and_then(|t| t.worktree.as_ref());
+        let path = match wt {
+            Some(w) => format!("{} ({})", w.path.display(), w.branch),
+            None if s.thread().is_none() && s.worktree_mode && s.project().is_some_and(|p| p.repo) => "In a new worktree".to_owned(),
+            None => s.project().map_or_else(String::new, |p| p.path.display().to_string()),
+        };
         format!("{path}  ·  {send_key} send  ·  {newline} newline")
     };
     let hint = text(hint).font(k.ty.text_xsmall).color(c.text_faint).truncate();
@@ -151,6 +160,21 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     row().w_full().justify_center().px(24.0).pb(14.0).pt(4.0)
         .child(stack.child(card).child(hint))
+}
+
+/// Where a new thread runs: the project's folder, or a worktree of its own on a new branch.
+fn worktree_chip(s: &App, k: &Kit) -> El {
+    let c = &k.c;
+    let on = s.worktree_mode;
+    row().key("worktree-chip").h(28.0).px(8.0).gap(6.0).center_y().radius(8.0)
+        .cursor(rune::Cursor::Pointer)
+        .hover(c.hover)
+        .role("switch").checked(on)
+        .label("New worktree")
+        .help(if on { "Runs in a new git worktree on its own branch. Click to run in the project's folder." } else { "Runs in the project's folder. Click to run in a new git worktree on its own branch." })
+        .child(icon(&icons::BRANCH, 14.0).color(if on { c.text_strong } else { c.icon_weaker }))
+        .child(text(if on { "New worktree" } else { "Local" }).font(k.ty.ui_medium).color(c.text_strong))
+        .on_press(|s: &mut App| s.toggle_worktree_mode())
 }
 
 /// Images waiting to go with the next message, each with a remove button.
@@ -185,7 +209,9 @@ fn attachments(s: &App, k: &Kit) -> El {
 fn queue(t: &Thread, running: bool, steer_key: &str, k: &Kit) -> El {
     let c = &k.c;
     let id = t.id;
-    let head = if running {
+    let head = if t.preparing {
+        "Making the worktree · sent when it's ready".to_owned()
+    } else if running {
         format!("{} queued · sent in order when the turn ends", t.queue.len())
     } else {
         format!("{} queued · paused after the stop", t.queue.len())

@@ -12,6 +12,7 @@ mod history;
 mod picker;
 mod settings;
 mod store;
+mod worktree;
 mod shortcuts;
 mod ui;
 mod usage;
@@ -649,6 +650,74 @@ mod tests {
         rt.update(|s, _| s.delete(id));
         assert!(!record.exists(), "deleting the thread deletes its record");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With "New worktree" on, a new thread's message waits while a worktree is made on a
+    /// new branch, then its turn runs there (here Codex, not installed, so it only fails to
+    /// start, spending nothing).
+    #[test]
+    fn a_new_thread_in_a_worktree() {
+        use std::process::Command;
+        let repo = std::env::temp_dir().join(format!("rune-code-wt-app-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "hello").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first"]);
+
+        let mut app = App::new(Some(repo.clone()), rune::prefs::Prefs::memory());
+        if app.binary(Harness::Codex).is_some() { return; }
+        app.choose_harness(Harness::Codex);
+        let mut rt = headless(app);
+        assert!(rt.find("worktree-chip").is_some(), "offered in a git repository");
+        rt.update(|s, _| s.toggle_worktree_mode());
+        rt.key(key(Key::Text("Fix the build".into())));
+        rt.key(key(Key::Enter));
+        rt.frame(0.1);
+        let t = rt.state.thread().unwrap();
+        assert!(t.preparing && t.queue.len() == 1 && t.items.is_empty(), "the message waits for the worktree");
+
+        let start = Instant::now();
+        while rt.state.thread().unwrap().preparing && start.elapsed() < Duration::from_secs(10) {
+            rt.update(|s, tx| { s.drain(tx); });
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        rt.update(|s, tx| { s.drain(tx); });
+        let t = rt.state.thread().unwrap();
+        let w = t.worktree.clone().expect("the worktree was made");
+        assert!(w.branch.starts_with("rune/fix-the-build-"), "{}", w.branch);
+        assert_eq!(std::fs::read_to_string(w.path.join("a.txt")).unwrap(), "hello");
+        assert!(t.queue.is_empty() && matches!(&t.items[0].kind, Kind::User(p) if p == "Fix the build"), "then the message went");
+        let head = git(&w.path, &["branch", "--show-current"]);
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), w.branch);
+
+        git(&repo, &["worktree", "remove", "--force", w.path.to_str().unwrap()]);
+        let _ = std::fs::remove_dir(w.path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The folders your Claude Code sessions ran in become projects listing their threads
+    /// (read only; prefs stay in memory): `cargo test -- --ignored live_projects --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_projects_list_their_threads() {
+        let mut prefs = rune::prefs::Prefs::memory();
+        crate::app::seed_projects(&mut prefs);
+        let mut app = App::new(None, prefs);
+        app.set_waker(std::sync::Arc::new(|| {}));
+        let mut rt = headless(app);
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            rt.update(|s, tx| { s.drain(tx); });
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for p in &rt.state.projects {
+            let n = rt.state.threads.iter().filter(|t| rt.state.in_project(t, &p.path)).count();
+            eprintln!("{}: {n} threads", p.path.display());
+        }
+        assert!(rt.state.threads.len() > 0);
     }
 
     /// Each project lists its own threads under its name; picking a thread makes its project
