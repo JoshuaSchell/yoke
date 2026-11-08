@@ -883,11 +883,11 @@ mod tests {
         assert_eq!(rt.state.thread().unwrap().queue.iter().map(|q| q.text.as_str()).collect::<Vec<_>>(), ["two", "three"]);
         assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("two")), "the queue shows above the prompt");
         let qid = rt.state.thread().unwrap().queue[0].id;
-        let started = Instant::now();
         rt.update(|s, tx| s.send_queued_now(id, qid, tx));
         // "two" starts once the slow turn is killed, then "three" after it.
-        pump_until(&mut rt, 8, |s| s.thread().unwrap().queue.is_empty() && !s.is_running(id));
-        assert!(started.elapsed() < Duration::from_secs(8), "steering didn't wait out the slow turn");
+        pump_until(&mut rt, 30, |s| s.thread().unwrap().queue.is_empty() && !s.is_running(id));
+        let slow = rt.state.thread().unwrap().items.iter().find_map(|i| match i.kind { Kind::TurnEnd { stopped, .. } => Some(stopped), _ => None });
+        assert_eq!(slow, Some(true), "steering killed the slow turn rather than waiting it out");
         assert_eq!(user_messages(&rt.state), ["slow one", "two", "three"]);
 
         // Esc stops a slow turn; what was queued behind it waits.
@@ -895,9 +895,13 @@ mod tests {
         typed(&mut rt, "after", key(Key::Enter));
         rt.key(key(Key::Escape));
         rt.frame(1.0 / 60.0);
-        pump_until(&mut rt, 8, |s| !s.is_running(id));
+        // Generous for a slow CI machine; what matters is that the turn was killed, not that
+        // its 10-second sleep ran out.
+        pump_until(&mut rt, 30, |s| !s.is_running(id));
         rt.update(|s, tx| { s.drain(tx); });
         assert!(!rt.state.is_running(id));
+        let stopped = rt.state.thread().unwrap().items.iter().rev().find_map(|i| match i.kind { Kind::TurnEnd { stopped, .. } => Some(stopped), _ => None });
+        assert_eq!(stopped, Some(true), "Esc killed the turn");
         assert_eq!(rt.state.thread().unwrap().queue.len(), 1, "the queue waits after a stop");
     }
 
@@ -988,8 +992,9 @@ mod tests {
         // Sending into the running turn steers: it stops, and "now" goes straight away.
         let started = Instant::now();
         typed(&mut rt, "now", enter(true, false));
-        pump_until(&mut rt, 8, |s| s.thread().unwrap().queue.is_empty() && !s.is_running(id));
-        assert!(started.elapsed() < Duration::from_secs(8), "steering didn't wait out the slow turn");
+        pump_until(&mut rt, 30, |s| s.thread().unwrap().queue.is_empty() && !s.is_running(id));
+        let slow = rt.state.thread().unwrap().items.iter().find_map(|i| match i.kind { Kind::TurnEnd { stopped, .. } => Some(stopped), _ => None });
+        assert_eq!(slow, Some(true), "steering killed the slow turn rather than waiting it out");
         assert_eq!(user_messages(&rt.state), ["first\nslow", "now"]);
 
         // ⇧⌘↩ does the other: it queues.
