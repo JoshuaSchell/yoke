@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Horns: one bar across the brow, turned up square at each end. -->
+  <path fill="#EFE7D8" d="M180 180 H260 V260 H764 V180 H844 V340 H180 Z"/>
+  <!-- Ears, held out level under the horns. -->
+  <path fill="#C4935F" d="M232 372 H352 V430 H232 Z M672 372 H792 V430 H672 Z"/>
+  <!-- Head, chamfered toward the muzzle. -->
+  <path fill="#C4935F" d="M352 260 H672 V620 L665 664 H359 L352 620 Z"/>
+  <!-- Muzzle. -->
+  <path fill="#EFE7D8" d="M359 664 H665 L632 880 H392 Z"/>
+  <!-- Eyes and nostrils, cut through to the black. -->
+  <path fill="#000000" d="M406 424 H470 V488 H406 Z M554 424 H618 V488 H554 Z M436 760 H474 V826 H436 Z M550 760 H588 V826 H550 Z"/>
+</svg>

@@ -56,7 +56,6 @@ const WORKING_OPEN_KEY: &str = "sidebar.working-open";
 pub const LAST_PROJECT_KEY: &str = "project.last";
 /// The sidebar's projects, as folder paths in the order added, and the ones shut.
 pub const PROJECTS_KEY: &str = "projects";
-const COLLAPSED_KEY: &str = "projects.collapsed";
 /// The plan limits last read, so the gauge has numbers at launch.
 const LIMITS_KEY: &str = "usage.limits";
 /// Each Claude model's context window as Claude Code last reported it, by model id, so a
@@ -129,6 +128,8 @@ pub struct App {
     pub open_menu: Option<&'static str>,
     /// The model picker's search, rail and favorites (`picker`).
     pub picker: crate::picker::Picker,
+    /// The new-thread screen's project picker: its search and the row under the arrows.
+    pub project_pick: crate::picker::ProjectPick,
     /// Updates from GitHub Releases (`updater`).
     pub update: crate::updater::Updater,
     /// Settings (⌘,) fills the main pane instead of the thread.
@@ -287,8 +288,6 @@ impl Appearance {
 pub struct Project {
     pub name: String,
     pub path: PathBuf,
-    /// Its group in the sidebar is shut.
-    pub collapsed: bool,
     /// It's in a git repository, so its threads can run in worktrees.
     pub repo: bool,
 }
@@ -297,7 +296,7 @@ impl Project {
     pub fn new(path: PathBuf) -> Project {
         let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
         let repo = worktree::is_repo(&path);
-        Project { name, path, collapsed: false, repo }
+        Project { name, path, repo }
     }
 }
 
@@ -451,11 +450,10 @@ impl App {
         let (worktrees_tx, worktrees) = channel();
         let installed = harness::detect();
         let harness = installed.iter().find(|(_, p)| p.is_some()).map_or(Harness::Claude, |(h, _)| *h);
-        let collapsed: Vec<String> = prefs.get(COLLAPSED_KEY).unwrap_or_default();
         let mut projects: Vec<Project> = prefs.get::<Vec<String>>(PROJECTS_KEY).unwrap_or_default().into_iter()
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
-            .map(|p| Project { collapsed: collapsed.contains(&p.to_string_lossy().into_owned()), ..Project::new(p) })
+            .map(Project::new)
             .collect();
         let open = open.filter(|p| p.is_dir()).map(|p| p.canonicalize().unwrap_or(p));
         let added = open.as_ref().is_some_and(|p| !projects.iter().any(|x| &x.path == p));
@@ -533,6 +531,7 @@ impl App {
             beat: 0,
             keys: Keys::load(&prefs),
             picker: crate::picker::Picker::load(&prefs),
+            project_pick: crate::picker::ProjectPick::default(),
             update: crate::updater::Updater::default(),
             store: store::dir(&prefs),
             // `apply_defaults` sets it from Settings › New threads.
@@ -951,23 +950,20 @@ impl App {
         if t.project.as_os_str().is_empty() { self.current.as_deref() == Some(path) } else { t.project == path }
     }
 
-    /// Adds `path` to the sidebar (or opens its group if it's there) and starts a new thread
-    /// in it. Its saved sessions come in as threads.
+    /// Adds `path` as a project (if it's new) and starts a new thread in it. Its saved
+    /// sessions come in as threads.
     pub fn add_project(&mut self, path: PathBuf) {
         let path = path.canonicalize().unwrap_or(path);
-        match self.projects.iter_mut().find(|p| p.path == path) {
-            Some(p) => p.collapsed = false,
-            None => {
-                self.projects.push(Project::new(path.clone()));
-                self.load_sessions_of(vec![path.clone()]);
-            }
+        if !self.projects.iter().any(|p| p.path == path) {
+            self.projects.push(Project::new(path.clone()));
+            self.load_sessions_of(vec![path.clone()]);
         }
         self.composer_error = None;
         self.save_projects();
         self.new_thread_in(path);
     }
 
-    /// Takes the project out of the sidebar, with its threads. Its folder and Claude Code's
+    /// Takes the project out of Yoke, with its threads. Its folder and Claude Code's
     /// saved sessions stay; adding it again brings them back. Refused while one of its turns runs.
     pub fn remove_project(&mut self, path: &Path) -> bool {
         let threads: Vec<ThreadId> = self.threads.iter().filter(|t| self.in_project(t, path)).map(|t| t.id).collect();
@@ -985,18 +981,13 @@ impl App {
         true
     }
 
-    pub fn toggle_project(&mut self, path: &Path) {
-        if let Some(p) = self.projects.iter_mut().find(|p| p.path == path) { p.collapsed = !p.collapsed; }
-        self.save_projects();
-    }
-
-    /// A new thread in the project at `path` (its "+" in the sidebar).
+    /// A new thread in the project at `path`.
     pub fn new_thread_in(&mut self, path: PathBuf) {
         self.set_current(path);
         self.new_thread();
     }
 
-    fn set_current(&mut self, path: PathBuf) {
+    pub(crate) fn set_current(&mut self, path: PathBuf) {
         if self.current.as_ref() == Some(&path) { return; }
         let _ = self.prefs.set(LAST_PROJECT_KEY, &path.to_string_lossy().into_owned());
         self.current = Some(path);
@@ -1004,9 +995,7 @@ impl App {
 
     fn save_projects(&mut self) {
         let paths: Vec<String> = self.projects.iter().map(|p| p.path.to_string_lossy().into_owned()).collect();
-        let shut: Vec<String> = self.projects.iter().filter(|p| p.collapsed).map(|p| p.path.to_string_lossy().into_owned()).collect();
         let _ = self.prefs.set(PROJECTS_KEY, &paths);
-        let _ = self.prefs.set(COLLAPSED_KEY, &shut);
     }
 
     /// ⌘N: the new-thread screen, with the composer back on the new-thread defaults.
@@ -1064,17 +1053,10 @@ impl App {
         v
     }
 
-    /// Project `path`'s inbox threads as its group lists them: all while it's open; while
-    /// it's shut, only the selected one, so the thread you're reading keeps its row.
-    pub fn project_inbox(&self, p: &Project) -> Vec<&Thread> {
-        self.lane_threads(Lane::Inbox).into_iter()
-            .filter(|t| self.in_project(t, &p.path) && (!p.collapsed || self.selected == Some(t.id)))
-            .collect()
-    }
-
-    /// The inbox in the sidebar's order: each project's group in turn.
+    /// The inbox in the sidebar's order: every project's threads in one list, as T3 Code's
+    /// Active list, the last to come back to you first.
     pub fn inbox_order(&self) -> Vec<ThreadId> {
-        self.projects.iter().flat_map(|p| self.project_inbox(p)).map(|t| t.id).collect()
+        self.lane_threads(Lane::Inbox).iter().map(|t| t.id).collect()
     }
 
     /// The settled threads the shelf lists: up to `settled_shown` while it's open; while it's
@@ -1851,6 +1833,13 @@ pub mod scenes {
         s.threads.retain(|t| t.settled);
         s.selected = None;
         s.draft.focused = true;
+    }
+
+    /// The new-thread screen with the headline's project picker open.
+    pub fn projects(s: &mut App) {
+        demo(s);
+        s.new_thread();
+        s.open_project_picker();
     }
 
     const DEMO_ANSWER: &str = "Done. `fetch` now retries transient failures with exponential backoff:\n\n\

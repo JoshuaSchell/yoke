@@ -203,7 +203,7 @@ pub fn context_gauge(s: &App, k: &Kit) -> Option<El> {
     Some(row().key("context-gauge").h(28.0).px(6.0).center_y().radius(8.0)
         .label(format!("Context window: {}", context_words(&ctx)))
         .help(help)
-        .child(dial("context", Some(frac), tone(frac, Good::Low, k), c.icon_base, c.surface_raised_base, 18.0)))
+        .child(dial("context", Some(frac), tone(frac, Good::Low, k), c.icon_muted, c.surface_raised_base, 18.0)))
 }
 
 /// The plan's tightest window, for the toolbar's gauge, and every window's line for its tooltip.

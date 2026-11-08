@@ -15,15 +15,22 @@ use std::time::Duration;
 
 use rune::{Cx, El, Icon, KeyEvent, Spring, Tx, col, el, row, text};
 use rune_kit::shell::{PaneMotion, SidebarPeek, SidebarToggle, SplitView, Toolbar};
-use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit};
+use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, TooltipAppearance, TooltipStyle};
 use rune_theme_opencode::icons;
 
 use crate::app::App;
 use crate::shortcuts::Cmd;
 
+/// Seconds the pointer rests on something before its tooltip shows.
+const HELP_DELAY: f64 = 0.25;
+
 pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     let dark = s.appearance.dark(cx.system_dark());
     let k: &Kit = theme::kit(s.theme, dark);
+    // Tooltips in the theme's look and on its own short wait, rather than AppKit's: its second
+    // or so felt slow on the gauges, and its timer starts over whenever a region is registered
+    // again, as the context gauge's is with every reply streaming in.
+    cx.help_look(TooltipStyle::from_kit(k, TooltipAppearance::Compact).max_width(320.0).help_look().delay(HELP_DELAY));
     let mut layer = Vec::new();
 
     let mut main = col().key("main").w_full().h_full().min_h(0.0);
@@ -35,7 +42,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
         match s.thread() {
             Some(_) => main.child(transcript::view(s, k, (s.theme, dark))).child(composer::view(s, k, &mut layer)),
             None if s.projects.is_empty() => main.child(no_projects(s, k)),
-            None => main.child(hero(s, k)).child(composer::view(s, k, &mut layer)),
+            None => main.child(hero(s, k, &mut layer)).child(composer::view(s, k, &mut layer)),
         }
     };
     if s.hud {
@@ -231,15 +238,31 @@ fn update_button(s: &App, k: &Kit) -> Option<El> {
 }
 
 /// The new-thread screen's centre.
-fn hero(s: &App, k: &Kit) -> El {
+/// The new-thread screen: "What should we build in yoke?", the project a picker (as T3 Code's
+/// headline is), since the sidebar lists every project's threads together.
+fn hero(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let c = &k.c;
     let h = s.active_harness();
     let installed: Vec<&str> = s.installed.iter().filter(|(_, p)| p.is_some()).map(|(h, _)| h.name()).collect();
     let found = if installed.is_empty() { "No agent CLIs found on PATH".to_owned() } else { format!("Found {}", installed.join(", ")) };
+    let head = rune::TextStyle { size: 26.0, line_height: 32.0, ..k.ty.body_medium };
+    let headline = row().key("headline").center_y()
+        .child(text("What should we build in").font(head).color(c.text_strong).mr(2.0))
+        .child(picker::project_view(s, k, head, layer))
+        .child(text("?").font(head).color(c.text_strong));
+    let path = s.project().map(|p| tilde(&p.path)).unwrap_or_default();
     col().key("hero").w_full().grow(1.0).min_h(0.0).center().gap(10.0).px(24.0)
         .child(sidebar::avatar(h, k).size(36.0, 36.0).radius(10.0))
-        .child(text("What should we build?").font(rune::TextStyle { size: 26.0, line_height: 32.0, ..k.ty.body_medium }).color(c.text_strong))
-        .child(text(format!("{}  ·  {}", s.project().map_or("", |p| p.name.as_str()), found)).font(k.ty.small).color(c.text_faint))
+        .child(headline)
+        .child(text(format!("{path}  ·  {found}")).font(k.ty.small).color(c.text_faint))
+}
+
+/// `path` with the home folder as "~".
+pub fn tilde(path: &std::path::Path) -> String {
+    match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        Some(home) if path.starts_with(&home) => format!("~/{}", path.strip_prefix(&home).unwrap_or(path).display()),
+        _ => path.display().to_string(),
+    }
 }
 
 /// The main pane with no projects yet (a first launch with no Claude Code history).

@@ -230,3 +230,117 @@ fn efforts(s: &App, h: Harness, k: &Kit) -> El {
         .child(el().w_full().h(1.0).fill(c.border_weak))
         .child(levels)
 }
+
+// ---------------------------------------------------------------------------------------------
+// The project picker
+
+const PROJECT_TRIGGER: &str = "project-picker-trigger";
+const PROJECT_W: f32 = 360.0;
+const PROJECT_LIST_MAX: f32 = 280.0;
+
+/// The new-thread headline's project ("What should we build in yoke ▾?"), in the headline's
+/// `font`, with its popover pushed into `layer` while it's open: a search over the projects,
+/// each with a button that takes it out of Yoke, and Add project.
+pub fn project_view(s: &App, k: &Kit, font: rune::TextStyle, layer: &mut Vec<El>) -> El {
+    let c = &k.c;
+    let open = s.project_picker_open();
+    let name = s.project().map_or_else(|| "a project".to_owned(), |p| p.name.clone());
+    let chip = row().key("project-chip").pl(8.0).pr(2.0).py(2.0).gap(6.0).center_y().radius(10.0).shrink().min_w(0.0)
+        .cursor(Cursor::Pointer)
+        .role("button")
+        .expanded(open)
+        .label(format!("Project: {name}"))
+        .help("Choose the project")
+        .fill(if open { c.surface_hover } else { rune::Color::TRANSPARENT })
+        .hover(c.hover)
+        .child(text(name).font(font).color(c.text_strong).truncate().shrink().min_w(0.0))
+        .child(icon(&icons::CHEVRON_DOWN, 16.0).color(c.icon_weaker))
+        .on_press(|s: &mut App| s.toggle_project_picker());
+    if open {
+        layer.push(scrim("project-picker-scrim", |s: &mut App| s.close_project_picker()));
+        let surface = popover::raised(k, project_panel(s, k).key("project-picker").role("dialog").label("Choose project").focus_return(PROJECT_TRIGGER), 12.0);
+        layer.push(popover::anchored(k, surface, PROJECT_TRIGGER, Placement::BottomStart, 8.0));
+    }
+    row().key(PROJECT_TRIGGER).shrink().min_w(0.0).child(chip)
+}
+
+fn project_panel(s: &App, k: &Kit) -> El {
+    let c = &k.c;
+    let search = TextInput::new(&s.project_pick.search)
+        .plain()
+        .leading_icon(k.glyph.search)
+        .height(44.0)
+        .width(None)
+        .placeholder("Search projects…")
+        .label("Search projects")
+        .on_edit(|s: &mut App| &mut s.project_pick.search)
+        .on_change(|s: &mut App, _: &mut Tx| s.project_picker_searched())
+        .on_key(|s: &mut App, ev: &rune::KeyEvent, tx: &mut Tx| s.project_picker_key(ev, tx))
+        .build(k)
+        .key("project-search");
+    let rows = s.project_rows();
+    let mut items = col().key("project-rows").w_full().gap(2.0).px(8.0).py(8.0);
+    if rows.is_empty() {
+        items = items.child(text("No projects match").font(k.ty.small).color(c.text_faint).px(10.0).py(10.0));
+    }
+    for (i, path) in rows.iter().enumerate() {
+        if let Some(p) = s.projects.iter().find(|p| &p.path == path) {
+            items = items.child(project_row(s, p, s.project_pick.active == i, k));
+        }
+    }
+    let scroller = col().key("project-scroll").w_full().max_h(PROJECT_LIST_MAX).shrink().min_h(0.0)
+        .scroll(ScrollSpec { stick_bottom: false })
+        .scroll_edge_fade(16.0)
+        .scroll_margin(16.0)
+        .child(items);
+    let key = s.keys.label(crate::shortcuts::Cmd::OpenFolder);
+    let mut add = row().key("project-add").w_full().h(ROW_H).pl(10.0).pr(10.0).gap(10.0).center_y().radius(8.0)
+        .role("button").label("Add project")
+        .cursor(Cursor::Pointer).hover(c.hover)
+        .child(icon(&icons::PLUS_SMALL, 15.0).color(c.icon_base))
+        .child(text("Add project…").font(k.ty.ui).color(c.text_strong).grow(1.0));
+    if !key.is_empty() {
+        add = add.child(Keybind::new(&[key]).variant(KeybindVariant::Neutral).build(k));
+    }
+    let add = add.on_press_tx(|s: &mut App, tx: &mut Tx| { s.close_project_picker(); s.choose_folder(tx); });
+    col().w(PROJECT_W).clip_rounded(12.0)
+        .child(col().w_full().px(8.0).child(search))
+        .child(el().w_full().h(1.0).fill(c.border_weak))
+        .child(scroller)
+        .child(el().w_full().h(1.0).fill(c.border_weak))
+        .child(col().w_full().padding(8.0).child(add))
+}
+
+fn project_row(s: &App, p: &crate::app::Project, active: bool, k: &Kit) -> El {
+    let c = &k.c;
+    let chosen = s.current.as_ref() == Some(&p.path);
+    let remove = {
+        let path = p.path.clone();
+        rune_kit::IconButton::new(&icons::CLOSE_SMALL)
+            .control_size(rune_kit::ControlSize::Small)
+            .variant(rune_kit::IconButtonVariant::GhostMuted)
+            .label(format!("Remove {}", p.name))
+            .help("Remove from Yoke (the folder and its sessions stay)")
+            .build(k)
+            .focusable(false)
+            .key("remove")
+            .group_opacity(0.0, 1.0)
+            .on_press_tx(move |s: &mut App, _: &mut Tx| {
+                s.remove_project(&path);
+                if s.projects.is_empty() { s.close_project_picker(); }
+            })
+    };
+    let mut line = row().key(crate::picker::project_row_key(&p.path)).w_full().h(ROW_H + 8.0).pl(10.0).pr(4.0).gap(10.0).center_y().radius(8.0)
+        .role("option").label(p.name.clone()).checked(chosen)
+        .fill(if active { c.hover } else { rune::Color::TRANSPARENT })
+        .cursor(Cursor::Pointer).hover(c.hover)
+        .child(icon(&icons::FOLDER, 15.0).color(c.icon_weaker))
+        .child(col().grow(1.0).shrink().min_w(0.0)
+            .child(text(p.name.clone()).font(k.ty.ui_medium).color(c.text_strong).truncate())
+            .child(text(crate::ui::tilde(&p.path)).font(k.ty.small).color(c.text_faint).truncate()));
+    if chosen {
+        line = line.child(icon(&icons::CHECK_SMALL, 14.0).color(c.icon_base));
+    }
+    let path = p.path.clone();
+    line.child(remove).hover_group().on_press(move |s: &mut App| s.choose_project(path.clone()))
+}

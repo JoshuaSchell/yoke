@@ -1,150 +1,46 @@
 {
-  "fill-specializations": [
-    {
-      "value": {
-        "linear-gradient": [
-          "display-p3:1.00000,1.00000,1.00000,1.00000",
-          "display-p3:0.86000,0.86000,0.88000,1.00000"
-        ],
-        "orientation": {
-          "start": {
-            "x": 0.5,
-            "y": 0
-          },
-          "stop": {
-            "x": 0.5,
-            "y": 1
-          }
-        }
-      }
-    },
-    {
-      "appearance": "dark",
-      "value": {
-        "linear-gradient": [
-          "display-p3:0.24000,0.24000,0.25000,1.00000",
-          "display-p3:0.05000,0.05000,0.06000,1.00000"
-        ],
-        "orientation": {
-          "start": {
-            "x": 0.5,
-            "y": 0
-          },
-          "stop": {
-            "x": 0.5,
-            "y": 1
-          }
-        }
-      }
-    }
-  ],
   "groups": [
     {
-      "name": "Face",
+      "name": "Ox",
       "layers": [
         {
-          "name": "face",
-          "image-name": "face.svg",
+          "name": "ox",
+          "image-name": "ox.svg",
           "glass": false
         }
       ],
       "shadow": {
-        "kind": "neutral",
-        "opacity": 0.3
+        "kind": "none",
+        "opacity": 0
       },
       "translucency": {
         "enabled": false,
         "value": 0
       },
-      "specular": true,
+      "specular": false,
       "position": {
-        "scale": 0.9,
+        "scale": 1,
         "translation-in-points": [
           0,
-          10
-        ]
-      }
-    },
-    {
-      "name": "Muzzle",
-      "layers": [
-        {
-          "name": "muzzle",
-          "image-name": "muzzle.svg",
-          "glass": true
-        }
-      ],
-      "shadow": {
-        "kind": "neutral",
-        "opacity": 0.4
-      },
-      "translucency": {
-        "enabled": true,
-        "value": 0.1
-      },
-      "specular": true,
-      "position": {
-        "scale": 0.9,
-        "translation-in-points": [
-          0,
-          10
-        ]
-      }
-    },
-    {
-      "name": "Head",
-      "layers": [
-        {
-          "name": "head",
-          "image-name": "head.svg",
-          "glass": true
-        }
-      ],
-      "shadow": {
-        "kind": "neutral",
-        "opacity": 0.5
-      },
-      "translucency": {
-        "enabled": true,
-        "value": 0.1
-      },
-      "specular": true,
-      "position": {
-        "scale": 0.9,
-        "translation-in-points": [
-          0,
-          10
-        ]
-      }
-    },
-    {
-      "name": "Horns",
-      "layers": [
-        {
-          "name": "horns",
-          "image-name": "horns.svg",
-          "glass": true
-        }
-      ],
-      "shadow": {
-        "kind": "neutral",
-        "opacity": 0.4
-      },
-      "translucency": {
-        "enabled": true,
-        "value": 0.1
-      },
-      "specular": true,
-      "position": {
-        "scale": 0.9,
-        "translation-in-points": [
-          0,
-          10
+          -9
         ]
       }
     }
   ],
   "supported-platforms": {
     "squares": "shared"
-  }
+  },
+  "fill-specializations": [
+    {
+      "value": {
+        "solid": "display-p3:0.00000,0.00000,0.00000,1.00000"
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "solid": "display-p3:0.00000,0.00000,0.00000,1.00000"
+      }
+    }
+  ]
 }

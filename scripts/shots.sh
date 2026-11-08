@@ -23,6 +23,7 @@ snap demo-dark demo OpenCode Dark
 snap demo-light demo OpenCode Light
 snap empty-dark empty OpenCode Dark
 snap empty-light empty OpenCode Light
+snap projects-dark projects OpenCode Dark
 snap long-dark long OpenCode Dark
 snap long-light long OpenCode Light
 snap picker-dark picker OpenCode Dark

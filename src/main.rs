@@ -76,6 +76,7 @@ const SCENES: &[Scene] = &[
     ("demo", app::scenes::demo),
     ("long", app::scenes::long),
     ("empty", app::scenes::empty),
+    ("projects", app::scenes::projects),
     ("picker", app::scenes::picker),
     ("effort", app::scenes::effort),
     ("settings", app::scenes::settings),
@@ -742,12 +743,14 @@ mod tests {
         assert!(rt.state.threads.len() > 0);
     }
 
-    /// Each project lists its own threads under its name; picking a thread makes its project
-    /// the current one; a shut group keeps only the selected thread; removing a project takes
-    /// its threads out of the sidebar.
+    /// Every project's threads share one inbox, the last to come back first, each row naming
+    /// its project; picking a thread makes its project the current one; the new-thread
+    /// headline's picker chooses, searches and removes projects, and removing one takes its
+    /// threads out of the sidebar.
     #[test]
-    fn projects_group_their_threads() {
+    fn projects_share_one_inbox_and_are_picked_in_the_headline() {
         use crate::app::Thread;
+        use rune::{Key, KeyEvent, Mods};
         let mut rt = headless(new_app());
         let a = rt.state.current.clone().unwrap();
         let b = std::env::temp_dir().canonicalize().unwrap();
@@ -759,21 +762,37 @@ mod tests {
             rt.state.threads.push(t);
         }
         rt.frame(0.1);
-        assert_eq!(rt.state.inbox_order(), [1, 2, 3], "grouped by project, newest first in each");
-        let group = format!("project-{}", b.display());
-        assert!(rt.find(&format!("{group}/thread-2")).is_some(), "thread 2 is under its project");
+        assert_eq!(rt.state.inbox_order(), [2, 1, 3], "one list across projects, newest first");
+        let b_name = b.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(rt.find("thread-2").is_some(), "thread 2 is in the inbox");
+        let named = format!("{b_name} · ");
+        assert!(rt.elements().iter().any(|e| e.path.contains("thread-2") && e.text.as_deref().is_some_and(|x| x.starts_with(&named))), "the row names its project");
 
         rt.update(|s, _| s.select(2));
         assert_eq!(rt.state.current.as_ref(), Some(&b));
-        rt.update(|s, _| s.toggle_project(&b));
-        assert_eq!(rt.state.inbox_order(), [1, 2], "a shut group keeps the selected thread");
         rt.update(|s, _| s.select(1));
         assert_eq!(rt.state.current.as_ref(), Some(&a));
-        assert_eq!(rt.state.inbox_order(), [1]);
+
+        // The new-thread screen: "What should we build in <a>?", and its picker.
+        rt.update(|s, _| s.new_thread());
+        rt.frame(0.2);
+        assert!(rt.find("project-chip").is_some());
+        rt.update(|s, _| s.open_project_picker());
+        rt.frame(0.3);
+        assert_eq!(rt.state.project_rows(), [a.clone(), b.clone()]);
+        assert_eq!(rt.state.project_pick.active, 0, "the current project is under the arrows");
+        rt.update(|s, tx| { s.project_picker_key(&KeyEvent { key: Key::Down, mods: Mods::default() }, tx); });
+        rt.update(|s, tx| { s.project_picker_key(&KeyEvent { key: Key::Enter, mods: Mods::default() }, tx); });
+        assert_eq!(rt.state.current.as_ref(), Some(&b), "↓ ↩ chose the second project");
+        assert!(!rt.state.project_picker_open());
+        assert!(rt.state.selected.is_none(), "still on the new-thread screen");
+        rt.update(|s, _| { s.open_project_picker(); s.project_pick.search = rune::TextEdit::new(b.display().to_string()); s.project_picker_searched(); });
+        assert_eq!(rt.state.project_rows(), std::slice::from_ref(&b), "the search narrows the list");
 
         rt.update(|s, _| { s.remove_project(&b); });
-        rt.frame(0.2);
+        rt.frame(0.4);
         assert!(rt.state.threads.iter().all(|t| t.project != b));
+        assert_eq!(rt.state.current.as_ref(), Some(&a));
         assert_eq!(rt.state.prefs.get::<Vec<String>>(crate::app::PROJECTS_KEY), Some(vec![a.to_string_lossy().into_owned()]));
     }
 
