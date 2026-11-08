@@ -20,6 +20,7 @@ mod store;
 mod updater;
 mod worktree;
 mod shortcuts;
+mod skills;
 mod ui;
 mod usage;
 
@@ -101,6 +102,7 @@ const SCENES: &[Scene] = &[
     ("trust", app::scenes::trust),
     ("icon", app::scenes::icon),
     ("diff", app::scenes::diff),
+    ("skills", app::scenes::skills),
 ];
 
 fn main() {

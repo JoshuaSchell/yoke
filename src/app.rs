@@ -251,6 +251,8 @@ pub struct App {
     pub ask_trust: bool,
     /// The diff panel.
     pub diff: crate::diff::DiffPanel,
+    /// Settings › Skills.
+    pub skills: crate::skills::SkillsPage,
     /// After-turn snapshots taken off the UI thread: (thread, token, what the turn changed).
     pub(crate) checkpoint_tx: std::sync::mpsc::Sender<(ThreadId, String, Option<crate::checkpoint::Stat>)>,
     pub(crate) checkpoint_rx: Receiver<(ThreadId, String, Option<crate::checkpoint::Stat>)>,
@@ -656,6 +658,7 @@ impl App {
             claude_trusted: None,
             ask_trust: true,
             diff: Default::default(),
+            skills: Default::default(),
             checkpoint_tx,
             checkpoint_rx,
             icon_edit: None,
@@ -2301,6 +2304,13 @@ pub mod scenes {
 
     const DEMO_BEFORE: &str = "use std::time::Duration;\n\npub struct Client {\n    base: String,\n    timeout: Duration,\n}\n\nimpl Client {\n    pub fn new(base: &str) -> Client {\n        Client { base: base.to_owned(), timeout: Duration::from_secs(30) }\n    }\n\n    pub async fn fetch(&self, req: Request) -> Result<Response> {\n        self.send(req).await\n    }\n\n    async fn send(&self, req: Request) -> Result<Response> {\n        todo!()\n    }\n}\n";
     const DEMO_AFTER: &str = "use std::time::Duration;\n\nuse tokio::time::sleep;\n\n/// Attempts before giving up on a transient failure.\nconst MAX_ATTEMPTS: u32 = 5;\n\npub struct Client {\n    base: String,\n    timeout: Duration,\n}\n\nimpl Client {\n    pub fn new(base: &str) -> Client {\n        Client { base: base.to_owned(), timeout: Duration::from_secs(30) }\n    }\n\n    pub async fn fetch(&self, req: Request) -> Result<Response> {\n        let mut delay = Duration::from_millis(100);\n        for attempt in 1..=MAX_ATTEMPTS {\n            match self.send(req.clone()).await {\n                Err(e) if e.is_transient() && attempt < MAX_ATTEMPTS => {\n                    sleep(delay).await;\n                    delay *= 2;\n                }\n                other => return other,\n            }\n        }\n        unreachable!()\n    }\n\n    async fn send(&self, req: Request) -> Result<Response> {\n        todo!()\n    }\n}\n";
+
+    /// Settings › Skills (with whatever skills the home folder has; the shots use a scratch one).
+    pub fn skills(s: &mut App) {
+        demo(s);
+        s.open_settings();
+        s.show_settings_page(crate::settings::Page::Skills);
+    }
 
     /// The icon editor on the demo's first project, with letters and a colour picked.
     pub fn icon(s: &mut App) {

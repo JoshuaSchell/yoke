@@ -49,11 +49,12 @@ pub enum Page {
     NewThreads,
     Chat,
     Agents,
+    Skills,
     Shortcuts,
     Advanced,
 }
 
-pub const PAGES: [Page; 6] = [Page::Appearance, Page::NewThreads, Page::Chat, Page::Agents, Page::Shortcuts, Page::Advanced];
+pub const PAGES: [Page; 7] = [Page::Appearance, Page::NewThreads, Page::Chat, Page::Agents, Page::Skills, Page::Shortcuts, Page::Advanced];
 
 impl Page {
     pub fn id(self) -> &'static str {
@@ -62,6 +63,7 @@ impl Page {
             Page::NewThreads => "new-threads",
             Page::Chat => "chat",
             Page::Agents => "agents",
+            Page::Skills => "skills",
             Page::Shortcuts => "shortcuts",
             Page::Advanced => "advanced",
         }
@@ -73,6 +75,7 @@ impl Page {
             Page::NewThreads => "New threads",
             Page::Chat => "Chat",
             Page::Agents => "Agents",
+            Page::Skills => "Skills",
             Page::Shortcuts => "Keyboard shortcuts",
             Page::Advanced => "Advanced",
         }
@@ -84,6 +87,7 @@ impl Page {
             Page::NewThreads => &icons::NEW_SESSION,
             Page::Chat => &icons::SPEECH_BUBBLE,
             Page::Agents => &icons::PROVIDERS,
+            Page::Skills => &icons::POST_SKILL,
             Page::Shortcuts => &icons::KEYBOARD,
             Page::Advanced => &icons::SLIDERS,
         }
@@ -358,6 +362,7 @@ impl App {
 
     pub fn show_settings_page(&mut self, p: Page) {
         self.settings_page = p;
+        if p == Page::Skills { self.scan_skills(); }
         self.open_menu = None;
         self.recording = None;
         self.key_error = None;

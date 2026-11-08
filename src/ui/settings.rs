@@ -1,5 +1,5 @@
 //! Settings (⌘, or Yoke › Settings…), after T3 Code's: a rail of pages down the left
-//! (Appearance, New threads, Chat, Agents, Keyboard shortcuts, Advanced) and the chosen page
+//! (Appearance, New threads, Chat, Agents, Skills, Keyboard shortcuts, Advanced) and the chosen page
 //! beside it. It takes the main pane while it's open, since nothing else there can be used
 //! meanwhile; Esc, Done, or picking a thread closes it. What the pages change lives in
 //! `crate::settings`.
@@ -29,6 +29,7 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         Page::NewThreads => new_threads(s, k, layer),
         Page::Chat => chat(s, k, layer),
         Page::Agents => agents(s, k),
+        Page::Skills => skills_page(s, k),
         Page::Shortcuts => shortcuts_page(s, k),
         Page::Advanced => advanced(s, k),
     };
@@ -307,6 +308,84 @@ fn agents(s: &App, k: &Kit) -> El {
         .child(card(k, clis))
         .child(section_title(k, "Claude Code", None))
         .child(card(k, vec![setting(k, "Messages from your other sessions", peers_help, peers)]))
+}
+
+/// Settings › Skills: every skill the agents can read, which agents see each, and Share to
+/// link one into the folders of those that don't (`crate::skills`).
+fn skills_page(s: &App, k: &Kit) -> El {
+    let c = &k.c;
+    let new = match &s.skills.new_name {
+        None => Button::new("New skill…").variant(ButtonVariant::Ghost).control_size(ControlSize::Small)
+            .on_press(|s: &mut App| s.start_new_skill()).build(k).key("skill-new"),
+        Some(name) => row().key("skill-new-row").gap(6.0).center_y()
+            .child(rune_kit::TextInput::new(name).width(Some(180.0)).placeholder("skill-name").label("New skill's name")
+                .on_edit(|s: &mut App| s.skills.new_name.as_mut().expect("the New skill row is open"))
+                .on_submit(|s: &mut App, _: &mut Tx| s.create_skill())
+                .build(k).key("skill-new-name"))
+            .child(Button::new("Create").variant(ButtonVariant::Contrast).control_size(ControlSize::Small).on_press(|s: &mut App| s.create_skill()).build(k).key("skill-create"))
+            .child(Button::new("Cancel").variant(ButtonVariant::Ghost).control_size(ControlSize::Small).on_press(|s: &mut App| s.cancel_new_skill()).build(k).key("skill-cancel")),
+    };
+    let mut page = col().w_full().gap(12.0)
+        .child(row().w_full().center_y().gap(8.0)
+            .child(section_title(k, "Your skills", Some("Codex and OpenCode read ~/.agents/skills; Claude Code reads ~/.claude/skills; OpenCode reads both. Share links a skill's folder into the folders of the agents that don't see it yet, without moving or copying it. New skills go in ~/.agents/skills, linked for Claude Code.")).grow(1.0).min_w(0.0))
+            .child(col().pt(16.0).child(new)));
+    if let Some(e) = &s.skills.error {
+        page = page.child(text(e.clone()).key("skills-error").font(help_style(k)).color(c.danger.icon).wrap().px(4.0));
+    }
+    let rows = |list: &[crate::skills::Skill]| -> Vec<El> { list.iter().map(|sk| skill_row(s, sk, k)).collect() };
+    page = page.child(if s.skills.user.is_empty() { card(k, vec![empty_row("No skills yet.", k)]) } else { card(k, rows(&s.skills.user)) });
+    if let Some(p) = s.project() {
+        page = page.child(section_title(k, &format!("In {}", p.name), Some("The project's own skills (.agents/skills, .claude/skills, .opencode/skills). Sharing one adds a relative link inside the project, which you can commit.")));
+        page = page.child(if s.skills.project.is_empty() { card(k, vec![empty_row("This project has no skills.", k)]) } else { card(k, rows(&s.skills.project)) });
+    }
+    page
+}
+
+fn empty_row(note: &str, k: &Kit) -> El {
+    row().w_full().min_h(52.0).px(18.0).center_y().child(text(note.to_owned()).font(help_style(k)).color(k.c.text_faint))
+}
+
+/// A skill: its name and description, which agents see it (their marks, faint where they
+/// don't), and Share, Stop sharing, or why it can't be.
+fn skill_row(s: &App, sk: &crate::skills::Skill, k: &Kit) -> El {
+    let c = &k.c;
+    let scope = sk.scope;
+    let key = format!("skill-{}-{}", if scope == crate::skills::Scope::User { "u" } else { "p" }, sk.name);
+    let marks = harness::ALL.into_iter().map(|h| {
+        let seen = sk.seen_by(h);
+        crate::ui::sidebar::avatar(h, k).size(18.0, 18.0).opacity(if seen { 1.0 } else { 0.22 })
+            .help(format!("{} {}", h.name(), if seen { "sees it" } else { "doesn't see it" }))
+            .key(format!("sees-{}", h.id()))
+    });
+    let mut info = col().grow(1.0).min_w(0.0).gap(2.0)
+        .child(text(sk.name.clone()).font(label_style(k)).color(c.text_strong).truncate())
+        .child(text(sk.description.clone()).font(help_style(k)).color(c.text_muted).truncate());
+    if sk.diverged() {
+        let places: Vec<&str> = sk.copies.iter().map(|x| x.place.label()).collect();
+        info = info.child(text(format!("Separate copies in {}: each agent may read a different one.", places.join(", "))).font(help_style(k)).color(c.warning.icon).wrap());
+    }
+    let name = sk.name.clone();
+    let action = if sk.claude_only() {
+        text("From claude.ai").font(help_style(k)).color(c.text_faint)
+    } else if sk.shareable() {
+        Button::new("Share").variant(ButtonVariant::Outline).control_size(ControlSize::Small)
+            .on_press(move |s: &mut App| s.share_skill(&name, scope)).build(k).key("share")
+    } else if !s.links_of(sk).is_empty() {
+        Button::new("Stop sharing").variant(ButtonVariant::Ghost).control_size(ControlSize::Small)
+            .on_press(move |s: &mut App| s.unshare_skill(&name, scope)).build(k).key("unshare")
+    } else {
+        text("Every agent").font(help_style(k)).color(c.text_faint)
+    };
+    let home = sk.home();
+    let reveal = IconButton::new(&icons::FOLDER).control_size(ControlSize::Small).variant(IconButtonVariant::GhostMuted)
+        .label(format!("Show {} in Finder", sk.name)).help("Show in Finder")
+        .on_press(move |_: &mut App| if let Some(h) = &home { crate::skills::reveal(&h.join("SKILL.md")); })
+        .build(k).key("reveal");
+    row().key(key).w_full().min_h(60.0).px(18.0).py(10.0).gap(14.0).center_y()
+        .child(info)
+        .child(row().key("marks").gap(4.0).center_y().children(marks))
+        .child(row().key("action").w(120.0).justify_end().child(action))
+        .child(reveal)
 }
 
 fn advanced(s: &App, k: &Kit) -> El {
