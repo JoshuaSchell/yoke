@@ -9,6 +9,7 @@ mod attention;
 mod bench;
 mod harness;
 mod history;
+mod picker;
 mod shortcuts;
 mod ui;
 mod usage;
@@ -413,6 +414,65 @@ mod tests {
         rt.key(key(Key::Escape));
         rt.frame(1.0 / 60.0);
         assert!(!rt.state.settings);
+    }
+
+    /// The model chip opens the picker on the current harness: a star pins a model to
+    /// Favorites (without choosing it), the search filters, ⌘2 picks the second row, the
+    /// arrows and Return pick too, and the effort column sets the effort.
+    #[test]
+    fn model_picker() {
+        let mut app = new_app();
+        app.choose_harness(Harness::Claude);
+        app.models.insert(Harness::Claude, crate::harness::models::fallback(Harness::Claude));
+        let mut rt = headless(app);
+        let click = |rt: &mut Runtime<App>, key: &str, t: f64| {
+            let (x, y) = rt.find(key).unwrap_or_else(|| panic!("{key} on screen"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            rt.frame(t);
+        };
+        click(&mut rt, "model-chip", 0.1);
+        assert!(rt.state.picker_open());
+        for i in 0..20 { rt.frame(0.1 + i as f64 / 60.0); }
+        assert!(rt.find("pick-claude-opus").is_some() && rt.find("effort-high").is_some());
+
+        click(&mut rt, "pick-claude-sonnet/star", 0.5);
+        assert!(rt.state.is_favorite(Harness::Claude, "sonnet"));
+        assert_eq!(rt.state.model, crate::harness::models::DEFAULT, "a star doesn't choose");
+        assert!(rt.state.picker_open());
+        click(&mut rt, "rail-favorites", 0.6);
+        assert_eq!(rt.state.picker_rows().0.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(), ["sonnet"]);
+        click(&mut rt, "rail-claude", 0.7);
+
+        click(&mut rt, "effort-max", 0.8);
+        assert_eq!(rt.state.effort, "max");
+        rt.key(key(Key::Text("hai".into())));
+        rt.frame(0.9);
+        assert_eq!(rt.state.picker_rows().0.iter().map(|r| r.value.as_str()).collect::<Vec<_>>(), ["haiku"]);
+        rt.key(key(Key::Enter));
+        rt.frame(1.0);
+        assert_eq!(rt.state.model, "haiku");
+        assert!(!rt.state.picker_open() && rt.state.draft.focused);
+
+        rt.key(shift_cmd('m'));
+        rt.frame(1.1);
+        assert!(rt.state.picker_open());
+        rt.key(cmd('2'));
+        rt.frame(1.2);
+        assert_eq!(rt.state.model, rt.state.models(Harness::Claude)[1].value);
+        rt.key(shift_cmd('m'));
+        rt.frame(1.3);
+        rt.key(key(Key::Down));
+        rt.key(key(Key::Enter));
+        rt.frame(1.4);
+        assert_eq!(rt.state.model, rt.state.models(Harness::Claude)[2].value);
+        rt.key(shift_cmd('m'));
+        rt.frame(1.5);
+        rt.key(key(Key::Escape));
+        rt.frame(1.6);
+        assert!(!rt.state.picker_open());
+        assert_eq!(rt.state.model, rt.state.models(Harness::Claude)[2].value);
+        assert_eq!(rt.state.picker_summary().1, Some("Max"), "the chip shows the effort");
     }
 
     /// The composer's gauge opens the plan's meters; "Open usage" opens the page, which

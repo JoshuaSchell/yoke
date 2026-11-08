@@ -296,15 +296,8 @@ pub fn run(s: &mut App, c: Cmd, tx: &mut Tx) -> bool {
         }
         Cmd::Allow => return s.answer_first(Decision::Allow),
         Cmd::AlwaysAllow => return s.answer_first(Decision::AlwaysAllow),
-        Cmd::HarnessMenu => {
-            if s.thread().is_some() { return false; }
-            s.toggle_menu("harness");
-        }
-        Cmd::ModelMenu => s.toggle_menu("model"),
-        Cmd::EffortMenu => {
-            if s.active_harness().efforts().is_empty() { return false; }
-            s.toggle_menu("effort");
-        }
+        // The harness, model and effort all live in the model picker.
+        Cmd::HarnessMenu | Cmd::ModelMenu | Cmd::EffortMenu => s.toggle_picker(),
         Cmd::AccessMenu => s.toggle_menu("access"),
     }
     true

@@ -36,12 +36,14 @@ On Windows the same command builds an NSIS installer and on Linux a `.deb` and a
 - **Return** sends and **Shift-Return** adds a newline. **Esc** stops a running turn, killing the CLI's whole process group so a tool command it started can't keep the turn alive.
 - **While a turn runs**, Return **queues** the message: queued messages sit above the prompt and go in order when the turn ends. **⌘Return** (or the ↗ button on a queued message) **steers**: it stops the turn and sends the message straight away on the same session. After Esc the queue waits until you send from it.
 - **⌘N** starts a new thread, **⌘O** opens another folder, **⇧⌘U** shows usage and plan limits, **⇧⌘B** shows or hides the sidebar, **⇧⌘P** shows frame stats, and **⌘,** opens Settings (theme, appearance, frame stats, keyboard shortcuts, which CLIs were found). Settings takes over the main pane; Esc, Done or picking a thread closes it.
-- **Every shortcut can be changed** in Settings › Keyboard shortcuts. Click one and press the new keys: Esc cancels, ⌫ clears, and a chord that's already in use is refused. The list covers new thread, sidebar, settings, frame stats, focus prompt, previous/next thread (⌥⌘↑/↓), settle thread (⇧⌘S), delete thread (⇧⌘⌫), stop, steer, and opening each picker (⇧⌘H/M/E/A). Changes save to `~/Library/Application Support/dev.rune-code/prefs.json`, along with the appearance. The menu bar's Settings… item picks up a new chord at the next launch.
+- **Every shortcut can be changed** in Settings › Keyboard shortcuts. Click one and press the new keys: Esc cancels, ⌫ clears, and a chord that's already in use is refused. The list covers new thread, sidebar, settings, frame stats, focus prompt, previous/next thread (⌥⌘↑/↓), settle thread (⇧⌘S), delete thread (⇧⌘⌫), stop, steer, and opening the pickers (⇧⌘M for the model picker, which ⇧⌘H and ⇧⌘E also open; ⇧⌘A for access). Changes save to `~/Library/Application Support/dev.rune-code/prefs.json`, along with the appearance. The menu bar's Settings… item picks up a new chord at the next launch.
 - The window answers macOS tiling (Window › Fill, Center, Move & Resize, and their Fn-Control shortcuts).
-- The composer has four pickers:
-  - **harness** (fixed once a thread starts, since sessions don't move between CLIs);
-  - **model**: asked of the CLI at launch (see below);
-  - **effort**: Claude Code `--effort` (low … max) and Codex `model_reasoning_effort`. It's hidden for harnesses that have no effort flag;
+- The composer has two pickers:
+  - **the model picker** (⇧⌘M, after T3 Code's): one chip ("Opus 5.5 High") opening a popover with Favorites and each harness down a rail, a search over the harness's models, and the reasoning effort beside them.
+    - The **harness** is fixed once a thread starts, since sessions don't move between CLIs; a harness that isn't installed is dimmed.
+    - **Models** are asked of the CLI at launch (see below). The first five show until you search or press Show more. ⌘1–⌘9 pick a row by number, ↑↓ and Return pick too, and Esc closes.
+    - The **star** on a row pins the model to Favorites, which are saved in prefs.
+    - **Effort** is Claude Code `--effort` (low … max) and Codex `model_reasoning_effort`. Its column is hidden for harnesses with no effort flag. Default sends no flag, so the CLI picks.
   - **access**: Read only, Ask first, Edit files or Full access. With Claude Code, anything beyond the level you pick asks you in the app (see Approvals) instead of being refused:
     - **Ask first** lets reads through and asks before edits and commands;
     - **Edit files** lets edits through and asks before commands;
@@ -67,7 +69,7 @@ The gauge in the toolbar (**⇧⌘U**), or the one in the composer while Claude 
 
 ## Uninstall
 
-Rune Code keeps one small file of its own, `prefs.json` (shortcuts, appearance, theme, the last folder, settled threads, the model lists, the last plan-limits reading and Claude's prices), in `dev.rune-code` in the platform's config folder. Pasted screenshots wait in the temp folder's `rune-code-pastes` and are deleted a day later, at the next launch. On macOS, the system also keeps a GPU shader cache for the app.
+Rune Code keeps one small file of its own, `prefs.json` (shortcuts, appearance, theme, the last folder, settled threads, the model lists, favorite models, the last plan-limits reading and Claude's prices), in `dev.rune-code` in the platform's config folder. Pasted screenshots wait in the temp folder's `rune-code-pastes` and are deleted a day later, at the next launch. On macOS, the system also keeps a GPU shader cache for the app.
 
 | Installed with | Remove the app | Remove its data |
 | --- | --- | --- |
@@ -140,6 +142,8 @@ src/attention.rs       notifications, Dock badge, auto-settle sweep
 src/ui/theme.rs        OpenCode, Nord and Gruvbox kits
 src/ui/transcript.rs   virtualised, memoised transcript
 src/ui/composer.rs     prompt field and pickers
+src/picker.rs          the model picker's state: rail, search, favorites, keys
+src/ui/picker.rs       the model picker's chip and popover
 src/ui/usage.rs        the Usage page, the composer's gauge and its popover
 src/ui/hud.rs          frame stats (⇧⌘P)
 ```

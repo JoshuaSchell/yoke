@@ -88,9 +88,6 @@ impl Harness {
             Harness::OpenCode => "OpenCode",
         }
     }
-    pub fn from_name(n: &str) -> Option<Harness> {
-        ALL.into_iter().find(|h| h.name() == n)
-    }
     pub fn binary(self) -> &'static str {
         match self {
             Harness::Claude => "claude",

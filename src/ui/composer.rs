@@ -1,12 +1,12 @@
-//! The prompt box: queued follow-ups, an auto-growing field over a row of pickers (harness,
-//! model, effort, access), and the send / queue / steer / stop buttons.
+//! The prompt box: queued follow-ups, an auto-growing field over a row of pickers (the model
+//! picker's chip, and access), and the send / queue / steer / stop buttons.
 
 use rune::{El, TextStyle, Tx, col, icon, row, text, text_input};
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Select};
 use rune_theme_opencode::icons;
 
 use crate::app::{App, Thread};
-use crate::harness::{self, ACCESS, Access, Harness};
+use crate::harness::{self, ACCESS, Access};
 use crate::shortcuts::{self, Cmd};
 use crate::ui::transcript::MAX_W;
 
@@ -43,49 +43,8 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_input_key(|s: &mut App, ev: &rune::KeyEvent, tx: &mut Tx| shortcuts::dispatch(s, ev, tx));
     let field = rune::auto_grow(field, 2, 12);
 
-    // Harness: fixed once a thread has started, since sessions don't move between CLIs.
-    let mut options: Vec<(&str, &str)> = Vec::new();
-    for installed in [true, false] {
-        let group = if installed { "Installed" } else { "Not installed" };
-        options.extend(harness::ALL.iter().filter(|h| s.binary(**h).is_some() == installed).map(|h| (group, h.name())));
-    }
-    let harness_pick = Select::grouped("harness", &options)
-        .current(Some(h.name()))
-        .disabled(s.thread().is_some())
-        .label("Harness")
-        .open(s.open_menu == Some("harness"))
-        .on_toggle(|s: &mut App| s.toggle_menu("harness"))
-        .on_close(|s: &mut App| s.open_menu = None)
-        .on_choose(|s: &mut App, v: &str, _: &mut Tx| {
-            if let Some(h) = Harness::from_name(v) { s.choose_harness(h); }
-            s.open_menu = None;
-        })
-        .build(k, layer);
-    // Models: what the CLI reported it has (see `harness::models`).
-    let models: Vec<&str> = s.models(h).iter().map(|m| m.label.as_str()).collect();
-    let model_pick = Select::new("model", &models)
-        .current(Some(s.model_label(h, &s.model)))
-        .label("Model")
-        .open(s.open_menu == Some("model"))
-        .on_toggle(|s: &mut App| s.toggle_menu("model"))
-        .on_close(|s: &mut App| s.open_menu = None)
-        .on_choose(|s: &mut App, v: &str, _: &mut Tx| s.choose_model(v))
-        .build(k, layer);
-    // Effort: only for harnesses with an effort flag.
-    let efforts = h.efforts();
-    let effort_pick = (!efforts.is_empty()).then(|| {
-        Select::new("effort", efforts)
-            .current(Some(s.effort.as_str()))
-            .label("Effort")
-            .open(s.open_menu == Some("effort"))
-            .on_toggle(|s: &mut App| s.toggle_menu("effort"))
-            .on_close(|s: &mut App| s.open_menu = None)
-            .on_choose(|s: &mut App, v: &str, _: &mut Tx| {
-                s.effort = v.to_owned();
-                s.open_menu = None;
-            })
-            .build(k, layer)
-    });
+    // Harness, model and effort: one chip and its popover (`ui::picker`).
+    let model_pick = crate::ui::picker::view(s, k, layer);
     // "Ask first" only for harnesses that can ask; the others would treat it as read only.
     let access: Vec<&str> = ACCESS.iter().filter(|a| **a != Access::Ask || h.asks()).map(|a| a.label()).collect();
     let access_pick = Select::new("access", &access)
@@ -143,14 +102,7 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     }
 
     let mut bar = row().w_full().gap(2.0).center_y()
-        .child(crate::ui::sidebar::avatar(h, k).mr(4.0))
-        .child(harness_pick)
-        .child(dot(k))
-        .child(model_pick);
-    if let Some(pick) = effort_pick {
-        bar = bar.child(dot(k)).child(pick);
-    }
-    let mut bar = bar
+        .child(model_pick)
         .child(dot(k))
         .child(access_pick)
         .child(rune::el().grow(1.0));

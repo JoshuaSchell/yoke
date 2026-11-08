@@ -89,6 +89,8 @@ pub struct App {
     pub effort: String,
     pub access: Access,
     pub open_menu: Option<&'static str>,
+    /// The model picker's search, rail and favorites (`picker`).
+    pub picker: crate::picker::Picker,
     /// Settings (⌘,) fills the main pane instead of the thread.
     pub settings: bool,
     /// The Usage page (⇧⌘U) fills it the same way.
@@ -397,6 +399,7 @@ impl App {
             hud: false,
             beat: 0,
             keys: Keys::load(&prefs),
+            picker: crate::picker::Picker::load(&prefs),
             recording: None,
             key_error: None,
             prefs,
@@ -642,12 +645,6 @@ impl App {
     /// The label the model picker shows for `value` (the value itself if the list lacks it).
     pub fn model_label<'a>(&'a self, h: Harness, value: &'a str) -> &'a str {
         self.models(h).iter().find(|m| m.value == value).map_or(value, |m| m.label.as_str())
-    }
-
-    pub fn choose_model(&mut self, label: &str) {
-        let h = self.active_harness();
-        self.model = self.models(h).iter().find(|m| m.label == label).map_or_else(|| label.to_owned(), |m| m.value.clone());
-        self.open_menu = None;
     }
 
     pub fn set_appearance(&mut self, a: Appearance) {
@@ -1334,13 +1331,15 @@ pub mod scenes {
 
     pub fn picker(s: &mut App) {
         empty(s);
-        s.open_menu = Some("harness");
+        s.model = "opus".into();
+        s.effort = "high".into();
+        s.open_picker();
     }
 
     pub fn effort(s: &mut App) {
         empty(s);
         s.effort = "high".into();
-        s.open_menu = Some("effort");
+        s.open_picker();
     }
 
     pub fn settings(s: &mut App) {

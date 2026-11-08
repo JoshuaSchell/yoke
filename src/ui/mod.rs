@@ -2,6 +2,7 @@
 
 pub mod composer;
 pub mod hud;
+pub mod picker;
 #[cfg(target_os = "macos")]
 pub mod mac;
 pub mod settings;
