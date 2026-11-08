@@ -249,6 +249,11 @@ pub struct App {
     pub claude_trusted: Option<Vec<PathBuf>>,
     /// Whether to ask before a project's first turn; off in tests.
     pub ask_trust: bool,
+    /// The diff panel.
+    pub diff: crate::diff::DiffPanel,
+    /// After-turn snapshots taken off the UI thread: (thread, token, what the turn changed).
+    pub(crate) checkpoint_tx: std::sync::mpsc::Sender<(ThreadId, String, Option<crate::checkpoint::Stat>)>,
+    pub(crate) checkpoint_rx: Receiver<(ThreadId, String, Option<crate::checkpoint::Stat>)>,
     /// The project icon editor, while it's open.
     pub icon_edit: Option<crate::icon_editor::IconEdit>,
     /// Claude Code's folder, where deleting a thread deletes its session (`history::remove`).
@@ -260,7 +265,7 @@ pub struct App {
     sessions: Receiver<Listed>,
     sessions_tx: Sender<Listed>,
     /// Where Codex and OpenCode threads are kept (`store`); `None` in tests.
-    store: Option<PathBuf>,
+    pub(crate) store: Option<PathBuf>,
     /// The new thread being composed starts in a worktree of their own, where the project is a
     /// git repository. Starts from `defaults.worktree`; the composer's chip changes it.
     pub worktree_mode: bool,
@@ -447,6 +452,10 @@ pub struct Thread {
     pub context: Option<u64>,
     /// Its model's context window, as its last turn reported it.
     pub context_window: Option<u64>,
+    /// Its turns' snapshots, for the diff panel and the turns' chips.
+    pub checkpoints: Vec<crate::diff::Checkpoint>,
+    /// The saved checkpoint index has been read.
+    pub checkpoints_loaded: bool,
 }
 
 /// A question from the CLI, shown on the row (`item`) of the tool it's about.
@@ -476,6 +485,8 @@ impl Thread {
             model,
             resolved_model: None,
             session: None,
+            checkpoints: Vec::new(),
+            checkpoints_loaded: false,
             project: PathBuf::new(),
             worktree: None,
             preparing: false,
@@ -530,6 +541,7 @@ impl App {
         let (sessions_tx, sessions) = channel();
         let (worktrees_tx, worktrees) = channel();
         let (merged_tx, merged) = channel();
+        let (checkpoint_tx, checkpoint_rx) = channel();
         let installed = harness::detect();
         let harness = installed.iter().find(|(_, p)| p.is_some()).map_or(Harness::Claude, |(h, _)| *h);
         let mut projects: Vec<Project> = prefs.get::<Vec<String>>(PROJECTS_KEY).unwrap_or_default().into_iter()
@@ -643,6 +655,9 @@ impl App {
             trusted,
             claude_trusted: None,
             ask_trust: true,
+            diff: Default::default(),
+            checkpoint_tx,
+            checkpoint_rx,
             icon_edit: None,
             claude_home: if cfg!(test) { None } else { history::claude_home() },
             events,
@@ -1003,7 +1018,7 @@ impl App {
         self.selected.and_then(|id| self.threads.iter().find(|t| t.id == id))
     }
 
-    fn thread_mut(&mut self, id: ThreadId) -> Option<&mut Thread> {
+    pub(crate) fn thread_mut(&mut self, id: ThreadId) -> Option<&mut Thread> {
         self.threads.iter_mut().find(|t| t.id == id)
     }
 
@@ -1230,6 +1245,7 @@ impl App {
         self.apply_defaults();
         self.draft.focused = true;
         self.open_menu = None;
+        self.diff_follows_selection();
     }
 
     pub fn open_settings(&mut self) {
@@ -1487,6 +1503,8 @@ impl App {
         if let Some(p) = self.thread().map(|t| t.project.clone()).filter(|p| !p.as_os_str().is_empty()) {
             self.set_current(p);
         }
+        self.load_checkpoints(id);
+        self.diff_follows_selection();
         self.draft.focused = true;
     }
 
@@ -1525,6 +1543,7 @@ impl App {
             && let (true, Some(s)) = (store::keeps(t), &t.session) {
                 store::remove(dir, t.harness, s);
             }
+        if let Some(t) = self.threads.iter().find(|t| t.id == id) { self.forget_checkpoints(t); }
         self.threads.retain(|t| t.id != id);
         if self.selected == Some(id) { self.selected = None; }
         let Some(session) = session else { return };
@@ -1706,7 +1725,13 @@ impl App {
             return;
         };
         let waker = self.waker.clone().unwrap_or_else(|| std::sync::Arc::new(|| {}));
-        self.running.insert(id, harness::spawn(&bin, turn, id, self.sender.clone(), waker));
+        // The folder's snapshot before the turn (for its diff) is taken just before the CLI starts.
+        let cwd = turn.cwd.clone();
+        let running = match self.begin_checkpoint(id, &cwd) {
+            Some(snapshot) => harness::spawn_after(snapshot, &bin, turn, id, self.sender.clone(), waker),
+            None => harness::spawn(&bin, turn, id, self.sender.clone(), waker),
+        };
+        self.running.insert(id, running);
         if let Some(t) = self.thread_mut(id) {
             t.busy = true;
             t.turn_started = Some(Instant::now());
@@ -1785,6 +1810,11 @@ impl App {
             changed = true;
             self.apply(id, e);
         }
+        while let Ok((id, tok, stat)) = self.checkpoint_rx.try_recv() {
+            changed = true;
+            self.land_checkpoint(id, &tok, stat);
+        }
+        changed |= self.drain_diff();
         for id in std::mem::take(&mut self.ready) {
             if let Some(t) = self.thread_mut(id).filter(|t| !t.queue.is_empty()) {
                 let q = t.queue.remove(0);
@@ -1823,7 +1853,10 @@ impl App {
         let fresh = self.id();
         let exited = matches!(e, Event::Exited { .. });
         self.apply_to(id, e, selected, fresh);
-        if exited { self.keep(id); }
+        if exited {
+            self.keep(id);
+            self.end_checkpoint(id);
+        }
     }
 
     fn apply_to(&mut self, id: ThreadId, e: Event, selected: bool, fresh: u64) {
@@ -2233,6 +2266,41 @@ pub mod scenes {
         demo(s);
         s.update.status = crate::updater::Status::Ready("0.1.6".into());
     }
+
+    /// The demo with the diff panel open on its first thread's turn: a scratch repository
+    /// snapshotted before and after a change like the one the transcript describes.
+    pub fn diff(s: &mut App) {
+        demo(s);
+        let repo = std::env::temp_dir().join("yoke-demo-diff");
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::create_dir_all(repo.join("src"));
+        let run = |args: &[&str]| { let _ = std::process::Command::new("git").arg("-C").arg(&repo).args(args)
+            .env("GIT_AUTHOR_NAME", "demo").env("GIT_AUTHOR_EMAIL", "demo@example.com").env("GIT_COMMITTER_NAME", "demo").env("GIT_COMMITTER_EMAIL", "demo@example.com").output(); };
+        run(&["init", "-q", "-b", "main"]);
+        let _ = std::fs::write(repo.join("src/client.rs"), DEMO_BEFORE);
+        let _ = std::fs::write(repo.join("README.md"), "# api-client\n\nA small HTTP client.\n");
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "first"]);
+        let tok = "demo".to_owned();
+        let (start, end) = crate::checkpoint::refs(&tok);
+        let _ = crate::checkpoint::snapshot(&repo, &start);
+        let _ = std::fs::write(repo.join("src/client.rs"), DEMO_AFTER);
+        let _ = std::fs::write(repo.join("src/retry.rs"), "#[test]\nfn gives_up_after_five() {\n    assert_eq!(attempts(), 5);\n}\n");
+        let _ = crate::checkpoint::snapshot(&repo, &end);
+        let stat = crate::checkpoint::stat(&repo, &start, &end).ok();
+        let t = s.thread_mut(100).unwrap();
+        t.checkpoints.push(crate::diff::Checkpoint { token: tok, prompt: 0, dir: repo, ended: true, stat, end_item: None });
+        crate::diff::link_turn_ends(t);
+        s.sidebar.set_open(false);
+        s.open_diff(None);
+        for _ in 0..500 {
+            if s.drain_diff() { break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    const DEMO_BEFORE: &str = "use std::time::Duration;\n\npub struct Client {\n    base: String,\n    timeout: Duration,\n}\n\nimpl Client {\n    pub fn new(base: &str) -> Client {\n        Client { base: base.to_owned(), timeout: Duration::from_secs(30) }\n    }\n\n    pub async fn fetch(&self, req: Request) -> Result<Response> {\n        self.send(req).await\n    }\n\n    async fn send(&self, req: Request) -> Result<Response> {\n        todo!()\n    }\n}\n";
+    const DEMO_AFTER: &str = "use std::time::Duration;\n\nuse tokio::time::sleep;\n\n/// Attempts before giving up on a transient failure.\nconst MAX_ATTEMPTS: u32 = 5;\n\npub struct Client {\n    base: String,\n    timeout: Duration,\n}\n\nimpl Client {\n    pub fn new(base: &str) -> Client {\n        Client { base: base.to_owned(), timeout: Duration::from_secs(30) }\n    }\n\n    pub async fn fetch(&self, req: Request) -> Result<Response> {\n        let mut delay = Duration::from_millis(100);\n        for attempt in 1..=MAX_ATTEMPTS {\n            match self.send(req.clone()).await {\n                Err(e) if e.is_transient() && attempt < MAX_ATTEMPTS => {\n                    sleep(delay).await;\n                    delay *= 2;\n                }\n                other => return other,\n            }\n        }\n        unreachable!()\n    }\n\n    async fn send(&self, req: Request) -> Result<Response> {\n        todo!()\n    }\n}\n";
 
     /// The icon editor on the demo's first project, with letters and a colour picked.
     pub fn icon(s: &mut App) {

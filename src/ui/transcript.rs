@@ -80,7 +80,7 @@ fn item_view(s: &App, t: &Thread, item: &Item, k: &Kit, look: (Theme, bool)) -> 
             }
         }
         Kind::Error(m) => error(m, k),
-        Kind::TurnEnd { secs, cost_usd, stopped } => turn_end(*secs, *cost_usd, *stopped, t, k),
+        Kind::TurnEnd { secs, cost_usd, stopped } => turn_end(*secs, *cost_usd, *stopped, item.id, t, k),
     };
     if streaming {
         // A streaming message changes every delta: building it is the work.
@@ -449,7 +449,7 @@ fn error(m: &str, k: &Kit) -> El {
         .child(text(m.to_owned()).font(k.ty.small).color(c.text_strong).wrap().shrink().grow(1.0).selectable(true))
 }
 
-fn turn_end(secs: f64, cost: Option<f64>, stopped: bool, t: &Thread, k: &Kit) -> El {
+fn turn_end(secs: f64, cost: Option<f64>, stopped: bool, item: u64, t: &Thread, k: &Kit) -> El {
     let c = &k.c;
     let mut parts = vec![if stopped { format!("Stopped after {}", duration(secs)) } else { format!("Worked for {}", duration(secs)) }];
     if let Some(m) = &t.resolved_model { parts.push(m.clone()); }
@@ -458,7 +458,24 @@ fn turn_end(secs: f64, cost: Option<f64>, stopped: bool, t: &Thread, k: &Kit) ->
     row().w_full().gap(10.0).center_y().py(4.0)
         .child(rule())
         .child(text(parts.join("  ·  ")).font(k.ty.text_xsmall).color(c.text_faint))
+        .children(changes_chip(item, t, k))
         .child(rule())
+}
+
+/// "3 files +40 −12" after a turn that changed files: opens the diff panel on that turn.
+fn changes_chip(item: u64, t: &Thread, k: &Kit) -> Option<El> {
+    let c = &k.c;
+    let cp = t.checkpoints.iter().find(|cp| cp.end_item == Some(item))?;
+    let st = cp.stat.filter(|s| s.files > 0)?;
+    let (id, tok) = (t.id, cp.token.clone());
+    let files = if st.files == 1 { "1 file".to_owned() } else { format!("{} files", st.files) };
+    Some(row().key("changes").gap(5.0).center_y().px(8.0).h(22.0).radius(11.0).border(1.0, c.border_weak)
+        .cursor(rune::Cursor::Pointer).hover(c.hover)
+        .role("button").label(format!("Changes: {}", crate::diff::stat_words(st))).help("Show this turn's changes")
+        .child(text(files).font(k.ty.text_xsmall).color(c.text_muted))
+        .child(text(format!("+{}", st.added)).font(k.ty.text_xsmall_medium).color(c.success.icon))
+        .child(text(format!("\u{2212}{}", st.removed)).font(k.ty.text_xsmall_medium).color(c.danger.icon))
+        .on_press(move |s: &mut App| s.open_turn_diff(id, tok.clone())))
 }
 
 fn el_rule(k: &Kit) -> El {

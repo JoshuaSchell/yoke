@@ -60,7 +60,8 @@ pub fn markdown(theme: Theme, k: &Kit) -> MarkdownStyle {
     MarkdownStyle::from_kit(k).syntax_theme(syntax(theme, k))
 }
 
-/// The theme's code colours, for Markdown's code blocks and the code in tool rows.
+/// The theme's code colours (the kit's for OpenCode): Markdown's code blocks, the code in tool
+/// rows, and the diff panel.
 pub fn syntax(theme: Theme, k: &Kit) -> SyntaxTheme {
     let mut syn = SyntaxTheme::from_kit(k);
     let Some(spec) = theme.spec(k.dark) else { return syn };

@@ -8,6 +8,8 @@ mod attention;
 #[cfg(test)]
 mod bench;
 mod editors;
+mod checkpoint;
+mod diff;
 mod harness;
 mod history;
 mod icon_editor;
@@ -98,6 +100,7 @@ const SCENES: &[Scene] = &[
     ("tools", app::scenes::tools),
     ("trust", app::scenes::trust),
     ("icon", app::scenes::icon),
+    ("diff", app::scenes::diff),
 ];
 
 fn main() {

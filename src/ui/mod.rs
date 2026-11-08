@@ -1,6 +1,7 @@
 //! The window: sidebar of threads, and a main pane with the transcript over the composer.
 
 pub mod composer;
+pub mod diff;
 pub mod hud;
 pub mod icon_editor;
 pub mod picker;
@@ -88,10 +89,13 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     if let Some(button) = update_button(s, k) {
         trailing = trailing.child(button);
     }
-    let toolbar = Toolbar::new().leading(crumbs).trailing(trailing.child(usage::toolbar_button(s, k, &mut layer)).child(hud_button).child(settings_button));
+    let toolbar = Toolbar::new().leading(crumbs).trailing(trailing.child(diff::toolbar_button(s, k)).child(usage::toolbar_button(s, k, &mut layer)).child(hud_button).child(settings_button));
     let attention = Attention::of(s, k);
+    // The diff panel is built only while it's open.
+    let inspector = if s.diff.pane.is_open() { diff::view(s, k, &mut layer) } else { el() };
     let window = SplitView::new(main)
         .sidebar(&s.sidebar, |s: &mut App| &mut s.sidebar, sidebar::view(s, k))
+        .inspector(&s.diff.pane, |s: &mut App| &mut s.diff.pane, inspector)
         .toolbar(toolbar)
         .titlebar_inset(cx.titlebar_inset())
         .frame_inset(FRAME)

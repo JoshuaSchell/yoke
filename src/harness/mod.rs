@@ -358,6 +358,8 @@ fn content(t: &Turn) -> serde_json::Value {
 /// A running turn; dropping it doesn't stop it, `stop` does.
 pub struct Running {
     child: Arc<Mutex<Option<Child>>>,
+    /// Stopped before its CLI started (while `spawn_after`'s work ran): it never starts.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
     /// Open while the turn runs, for answering the CLI's questions; closed after its result
     /// so it exits.
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -367,11 +369,9 @@ impl Running {
     /// Kills the CLI and everything it started (tool commands, MCP servers): they share its
     /// process group, and one left running would hold its output open so the turn never ends.
     pub fn stop(&self) {
+        self.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(c) = self.child.lock().unwrap().as_mut() {
-            #[cfg(unix)]
-            // SAFETY: kill(2) with a negative pid signals that process group; no memory involved.
-            unsafe { libc::kill(-(c.id() as i32), libc::SIGKILL); }
-            let _ = c.kill();
+            kill_group(c);
         }
     }
 
@@ -423,6 +423,37 @@ pub fn find(name: &str) -> Option<PathBuf> {
 
 /// Starts `turn`, sending `(tag, event)` to `tx` and waking the UI after each batch.
 pub fn spawn<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Sender<(T, Event)>, wake: Waker) -> Running {
+    let running = Running { child: Arc::default(), stopped: Arc::default(), stdin: Arc::default() };
+    launch(bin, turn, tag, tx, wake, &running);
+    running
+}
+
+/// `spawn`, with `before` run first on a thread of its own (a snapshot of the folder, say), so
+/// starting the turn doesn't wait on it. Stopped meanwhile, the CLI never starts.
+pub fn spawn_after<T: Clone + Send + 'static>(before: impl FnOnce() + Send + 'static, bin: &Path, turn: Turn, tag: T, tx: Sender<(T, Event)>, wake: Waker) -> Running {
+    let running = Running { child: Arc::default(), stopped: Arc::default(), stdin: Arc::default() };
+    let handle = Running { child: running.child.clone(), stopped: running.stopped.clone(), stdin: running.stdin.clone() };
+    let bin = bin.to_owned();
+    std::thread::spawn(move || {
+        before();
+        if handle.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = tx.send((tag, Event::Exited { code: None, stderr: String::new() }));
+            wake();
+            return;
+        }
+        launch(&bin, turn, tag, tx, wake, &handle);
+    });
+    running
+}
+
+fn kill_group(c: &mut Child) {
+    #[cfg(unix)]
+    // SAFETY: kill(2) with a negative pid signals that process group; no memory involved.
+    unsafe { libc::kill(-(c.id() as i32), libc::SIGKILL); }
+    let _ = c.kill();
+}
+
+fn launch<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Sender<(T, Event)>, wake: Waker, running: &Running) {
     let harness = turn.harness;
     let mut cmd = harness.command(bin, &turn);
     let input = harness.stdin_lines(&turn);
@@ -431,8 +462,8 @@ pub fn spawn<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Send
     // Its own process group, so `Running::stop` can end its children too.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    let child = Arc::new(Mutex::new(None));
-    let stdin = Arc::new(Mutex::new(None));
+    let (child, stdin) = (running.child.clone(), running.stdin.clone());
+    let stopped = running.stopped.clone();
     let send = move |e: Event| {
         let _ = tx.send((tag.clone(), e));
         wake();
@@ -446,7 +477,12 @@ pub fn spawn<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Send
             let stdout = c.stdout.take().unwrap();
             let mut stderr = c.stderr.take().unwrap();
             *stdin.lock().unwrap() = c.stdin.take();
-            *child.lock().unwrap() = Some(c);
+            {
+                let mut slot = child.lock().unwrap();
+                // Stopped while it started: it ends at once, as if stopped after.
+                if stopped.load(std::sync::atomic::Ordering::SeqCst) { kill_group(&mut c); }
+                *slot = Some(c);
+            }
             if !input.is_empty() {
                 // Its own thread, so a long prompt can't block on a full pipe.
                 let stdin = stdin.clone();
@@ -483,7 +519,6 @@ pub fn spawn<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Send
             });
         }
     }
-    Running { child, stdin }
 }
 
 /// A short, one-line description of a tool call's input, for its row. A path is kept whole,

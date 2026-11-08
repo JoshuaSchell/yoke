@@ -23,6 +23,7 @@ pub enum Cmd {
     Settings,
     Usage,
     FrameStats,
+    ToggleDiff,
     FocusPrompt,
     PrevThread,
     NextThread,
@@ -38,7 +39,7 @@ pub enum Cmd {
     AccessMenu,
 }
 
-pub const ALL: [Cmd; 20] = [
+pub const ALL: [Cmd; 21] = [
     Cmd::NewThread,
     Cmd::OpenFolder,
     Cmd::OpenInEditor,
@@ -46,6 +47,7 @@ pub const ALL: [Cmd; 20] = [
     Cmd::Settings,
     Cmd::Usage,
     Cmd::FrameStats,
+    Cmd::ToggleDiff,
     Cmd::FocusPrompt,
     Cmd::PrevThread,
     Cmd::NextThread,
@@ -71,6 +73,7 @@ impl Cmd {
             Cmd::Settings => "settings",
             Cmd::Usage => "usage",
             Cmd::FrameStats => "frame-stats",
+            Cmd::ToggleDiff => "toggle-diff",
             Cmd::FocusPrompt => "focus-prompt",
             Cmd::PrevThread => "prev-thread",
             Cmd::NextThread => "next-thread",
@@ -96,6 +99,7 @@ impl Cmd {
             Cmd::Settings => "Open Settings",
             Cmd::Usage => "Show usage and plan limits",
             Cmd::FrameStats => "Show or hide frame stats",
+            Cmd::ToggleDiff => "Show or hide the diff",
             Cmd::FocusPrompt => "Focus the prompt",
             Cmd::PrevThread => "Previous thread",
             Cmd::NextThread => "Next thread",
@@ -121,6 +125,7 @@ impl Cmd {
             Cmd::Settings => "mod+comma",
             Cmd::Usage => "mod+shift+u",
             Cmd::FrameStats => "mod+shift+p",
+            Cmd::ToggleDiff => "mod+shift+d",
             Cmd::FocusPrompt => "mod+l",
             Cmd::PrevThread => "mod+alt+up",
             Cmd::NextThread => "mod+alt+down",
@@ -285,6 +290,7 @@ pub fn run(s: &mut App, c: Cmd, tx: &mut Tx) -> bool {
         Cmd::ToggleSidebar => { s.sidebar.toggle(); }
         Cmd::Settings => { s.open_settings(); }
         Cmd::Usage => { if s.usage_open { s.close_usage() } else { s.open_usage() } }
+        Cmd::ToggleDiff => s.toggle_diff(),
         Cmd::FrameStats => {
             s.hud = !s.hud;
             if s.hud { tx.wake_after(Duration::from_millis(500)); }
