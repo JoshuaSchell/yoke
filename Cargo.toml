@@ -1,6 +1,6 @@
 [package]
 name = "yoke"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "A small T3 Code-style desktop app for prompting coding agents (Claude Code, Codex, OpenCode), built on Rune."
 publish = false
