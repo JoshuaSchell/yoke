@@ -37,6 +37,12 @@ pub fn set_waker(w: &Waker) {
     let _ = WAKER.set(w.clone());
 }
 
+/// Wakes the loop, from outside it (a refused quit, `ui::mac`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn wake() {
+    if let Some(w) = WAKER.get() { w(); }
+}
+
 /// From `poll`: opens clicked threads, posts what happened while away, and settles idle
 /// threads. True if anything on screen changed.
 pub fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {

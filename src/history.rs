@@ -11,7 +11,7 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-use crate::app::{Kind, ToolState};
+use crate::app::{Agent, Item, Kind, ToolState};
 use crate::harness::{first_line, output_text, tool_detail};
 
 pub struct Session {
@@ -137,7 +137,13 @@ fn title(file: &str) -> Option<String> {
 
 /// The person's words in a `user` line: not a tool result, a meta line or a slash-command echo.
 fn prompt(v: &Value) -> Option<String> {
-    if v["type"] != "user" || v["isMeta"].as_bool() == Some(true) || v["isSidechain"].as_bool() == Some(true) { return None; }
+    prompt_in(v, false)
+}
+
+/// `prompt`, in a subagent's own transcript too (`sidechain`), whose lines are all marked so.
+fn prompt_in(v: &Value, sidechain: bool) -> Option<String> {
+    if v["type"] != "user" || v["isMeta"].as_bool() == Some(true) || (!sidechain && v["isSidechain"].as_bool() == Some(true)) { return None; }
+    if notification(v).is_some() { return None; }
     let text = match &v["message"]["content"] {
         Value::String(s) => s.clone(),
         Value::Array(a) => a.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
@@ -157,27 +163,50 @@ pub struct Loaded {
 }
 
 /// The transcript of session file `path`, as rows, and how full its context was at the end.
+/// Subagents' cards get their own rows from their transcripts beside it
+/// (`<id>/subagents/agent-<agent>.jsonl`).
 pub fn load(path: &Path) -> Loaded {
     let Ok(file) = std::fs::read_to_string(path) else { return Loaded::default() };
+    let subagents = path.with_extension("").join("subagents");
+    let (rows, context) = rows(&file, false, &subagents, 0);
+    Loaded { rows, context }
+}
+
+/// How deep subagents' transcripts are read (one a subagent started is one more).
+const MAX_DEPTH: usize = 4;
+
+/// A transcript's rows. `sidechain`: it's a subagent's own, whose lines are all marked so and
+/// whose first message is what it was asked.
+fn rows(file: &str, sidechain: bool, subagents: &Path, depth: usize) -> (Vec<Kind>, Option<(String, u64)>) {
     let mut out: Vec<Kind> = Vec::new();
     let mut context = None;
+    // Agent calls and the subagent each one ran, from its result.
+    let mut ran: Vec<(String, String)> = Vec::new();
+    let mut asked = false;
     for line in file.lines() {
         if !(line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"")) { continue; }
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-        if v["isSidechain"].as_bool() == Some(true) { continue; }
+        if !sidechain && v["isSidechain"].as_bool() == Some(true) { continue; }
         match v["type"].as_str() {
             Some("user") => {
-                if let Some(p) = prompt(&v) {
+                // A turn the CLI started itself, to report on background work: the divider
+                // the app showed, not a message from the person.
+                if let Some(n) = notification(&v) {
+                    if let Some(call) = &n.call { finish_agent(&mut out, call, &n); }
+                    out.push(Kind::Wake(n.summary));
+                    continue;
+                }
+                if let Some(p) = prompt_in(&v, sidechain) {
+                    // A subagent's first message is what it was asked (the card's title says it).
+                    if sidechain && !asked { asked = true; continue; }
                     out.push(Kind::User(p));
                     continue;
                 }
                 for b in v["message"]["content"].as_array().into_iter().flatten().filter(|b| b["type"] == "tool_result") {
                     let call = b["tool_use_id"].as_str().unwrap_or_default();
-                    let row = out.iter_mut().rev().find(|k| matches!(k, Kind::Tool { call: c, .. } if c == call));
-                    if let Some(Kind::Tool { state, output, .. }) = row {
-                        *state = if b["is_error"].as_bool() == Some(true) { ToolState::Failed } else { ToolState::Ok };
-                        *output = output_text(&b["content"]);
-                    }
+                    let state = if b["is_error"].as_bool() == Some(true) { ToolState::Failed } else { ToolState::Ok };
+                    if let Some(agent) = v["toolUseResult"]["agentId"].as_str() { ran.push((call.to_owned(), agent.to_owned())); }
+                    set_result(&mut out, call, state, output_text(&b["content"]));
                 }
             }
             Some("assistant") => {
@@ -191,15 +220,27 @@ pub fn load(path: &Path) -> Loaded {
                             let t = b["text"].as_str().unwrap_or_default();
                             if !t.trim().is_empty() { out.push(Kind::Assistant { text: t.to_owned(), streaming: false }); }
                         }
-                        Some("tool_use") => out.push(Kind::Tool {
-                            call: b["id"].as_str().unwrap_or_default().to_owned(),
-                            name: b["name"].as_str().unwrap_or("tool").to_owned(),
-                            detail: tool_detail(&b["input"]),
-                            // A call with no result in the file was cut off.
-                            state: ToolState::Failed,
-                            output: String::new(),
-                            body: crate::harness::tool_body(b["name"].as_str().unwrap_or_default(), &b["input"]),
-                        }),
+                        Some("tool_use") => {
+                            let call = b["id"].as_str().unwrap_or_default().to_owned();
+                            let name = b["name"].as_str().unwrap_or("tool").to_owned();
+                            if crate::app::agent_tool(&name) {
+                                // A call with no result in the file was cut off.
+                                let agent = Agent { id: 0, call, description: tool_detail(&b["input"]), state: ToolState::Failed, output: String::new(), items: Vec::new() };
+                                match out.last_mut() {
+                                    Some(Kind::Agents(g)) => g.push(agent),
+                                    _ => out.push(Kind::Agents(vec![agent])),
+                                }
+                            } else {
+                                out.push(Kind::Tool {
+                                    detail: tool_detail(&b["input"]),
+                                    state: ToolState::Failed,
+                                    output: String::new(),
+                                    body: crate::harness::tool_body(&name, &b["input"]),
+                                    call,
+                                    name,
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -207,7 +248,86 @@ pub fn load(path: &Path) -> Loaded {
             _ => {}
         }
     }
-    Loaded { rows: out, context }
+    if depth < MAX_DEPTH {
+        for (call, agent) in ran {
+            let Some(a) = agents_mut(&mut out).find(|a| a.call == call) else { continue };
+            let Ok(text) = std::fs::read_to_string(subagents.join(format!("agent-{agent}.jsonl"))) else { continue };
+            let (inner, _) = rows(&text, true, subagents, depth + 1);
+            a.items = inner.into_iter().map(|kind| Item { id: 0, rev: 0, kind }).collect();
+        }
+    }
+    (out, context)
+}
+
+/// Every subagent card in `rows` (not those inside cards).
+fn agents_mut(rows: &mut [Kind]) -> impl Iterator<Item = &mut Agent> {
+    rows.iter_mut().filter_map(|k| match k { Kind::Agents(g) => Some(g), _ => None }).flatten()
+}
+
+/// A tool call's result: on its row or its subagent's card.
+fn set_result(rows: &mut [Kind], call: &str, st: ToolState, out: String) {
+    if let Some(Kind::Tool { state, output, .. }) = rows.iter_mut().rev().find(|k| matches!(k, Kind::Tool { call: c, .. } if c == call)) {
+        *state = st;
+        *output = out;
+        return;
+    }
+    if let Some(a) = agents_mut(rows).find(|a| a.call == call) {
+        a.state = st;
+        a.output = out;
+    }
+}
+
+/// A background agent's end, from the notification the CLI woke on: its call returned at
+/// once ("launched"), so this is where it finished, or not.
+fn finish_agent(rows: &mut [Kind], call: &str, n: &Notification) {
+    let Some(a) = agents_mut(rows).find(|a| a.call == call) else { return };
+    a.state = if n.status == "completed" { ToolState::Ok } else { ToolState::Failed };
+    if let Some(r) = &n.result { a.output = r.clone(); }
+}
+
+/// A `<task-notification>` the CLI sends itself when background work ends.
+struct Notification {
+    call: Option<String>,
+    status: String,
+    summary: String,
+    result: Option<String>,
+}
+
+fn notification(v: &Value) -> Option<Notification> {
+    let text = match &v["message"]["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        _ => return None,
+    };
+    let from_task = v["origin"]["kind"] == "task-notification" || text.trim_start().starts_with("<task-notification>");
+    if !from_task { return None; }
+    let tag = |name: &str| -> Option<String> {
+        let open = format!("<{name}>");
+        let start = text.find(&open)? + open.len();
+        let end = text[start..].find(&format!("</{name}>"))? + start;
+        Some(text[start..end].trim().to_owned())
+    };
+    Some(Notification {
+        call: tag("tool-use-id"),
+        status: tag("status").unwrap_or_default(),
+        summary: tag("summary").unwrap_or_else(|| "Background work finished".to_owned()),
+        result: tag("result"),
+    })
+}
+
+/// Gives every row inside subagents' cards an id of its own, counting on from `next`.
+pub fn number(kind: &mut Kind, next: &mut u64) {
+    if let Kind::Agents(g) = kind {
+        for a in g {
+            *next += 1;
+            a.id = *next;
+            for i in &mut a.items {
+                *next += 1;
+                i.id = *next;
+                number(&mut i.kind, next);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -267,5 +387,43 @@ mod tests {
         assert!(matches!(&rows[0], Kind::User(p) if p == "Fix the build"));
         assert!(matches!(&rows[2], Kind::Tool { state: ToolState::Ok, output, .. } if output == "ok"));
         assert_eq!(rows.len(), 4);
+    }
+
+    /// A saved session with a subagent: its card gets its own transcript's rows, and the
+    /// notification the CLI woke on after background work is a divider, not a message.
+    #[test]
+    fn subagents_and_wakes_come_back() {
+        let dir = std::env::temp_dir().join(format!("yoke-history-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("s1/subagents")).unwrap();
+        let main = [
+            r#"{"type":"user","message":{"role":"user","content":"Count the files"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a1","name":"Agent","input":{"description":"Count files","prompt":"ls | wc -l"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a2","name":"Agent","input":{"description":"Slow echo","prompt":"sleep","run_in_background":true}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a1","content":"The report follows:\n  485\nagentId: x1 (use SendMessage)\n<usage>tool_uses: 1</usage>"}]},"toolUseResult":{"agentId":"x1","status":"completed"}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a2","content":"Async agent launched successfully."}]},"toolUseResult":{"agentId":"x2","isAsync":true}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"STARTED"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>x2</task-id>\n<tool-use-id>a2</tool-use-id>\n<status>completed</status>\n<summary>Agent \"Slow echo\" completed</summary>\n<result>SLOW_DONE</result>\n</task-notification>"},"origin":{"kind":"task-notification"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"FINISHED"}]}}"#,
+        ].join("\n");
+        let sub = [
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"ls | wc -l"}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"ls | wc -l"}}]}}"#,
+            r#"{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","tool_use_id":"b1","content":"485"}]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"485"}]}}"#,
+        ].join("\n");
+        std::fs::write(dir.join("s1.jsonl"), &main).unwrap();
+        std::fs::write(dir.join("s1/subagents/agent-x1.jsonl"), &sub).unwrap();
+        let rows = load(&dir.join("s1.jsonl")).rows;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(title(&main).as_deref(), Some("Count the files"));
+        let Kind::Agents(g) = &rows[1] else { panic!("one group of cards") };
+        assert_eq!(g.len(), 2);
+        assert_eq!(crate::app::agent_report(&g[0].output), "485");
+        assert_eq!(g[0].items.len(), 2, "its Bash row and its reply, not what it was asked");
+        assert!(matches!(&g[0].items[0].kind, Kind::Tool { state: ToolState::Ok, output, .. } if output == "485"));
+        assert_eq!((g[1].state, g[1].output.as_str()), (ToolState::Ok, "SLOW_DONE"), "the background agent's end, from its notification");
+        assert!(matches!(&rows[3], Kind::Wake(w) if w == "Agent \"Slow echo\" completed"));
+        assert_eq!(rows.iter().filter(|k| matches!(k, Kind::User(_))).count(), 1);
     }
 }

@@ -6,10 +6,17 @@
 //! results) and `result` (cost, errors). With the stdio prompt tool the CLI also sends
 //! `control_request`s: `can_use_tool` asks whether a tool may run and waits for our
 //! `control_response` on stdin; `control_cancel_request` withdraws one.
+//!
+//! Subagents: a line with a `parent_tool_use_id` is a subagent's (the `Agent` tool call that
+//! started it), and becomes an [`Event::Sub`] for that call's card. `system/task_*` lines track
+//! each task the CLI runs (a subagent, a shell command) from start to finish, and
+//! `background_tasks_changed` lists the ones running in the background, which the process stays
+//! alive for after its `result`: once they finish it starts a turn of its own (a second
+//! `system/init`) to report on them.
 
 use serde_json::Value;
 
-use super::{AskRequest, Event, ParseState, output_text, tool_body, tool_detail};
+use super::{AskRequest, BackgroundTask, Event, ParseState, TaskStart, TaskUsage, output_text, tool_body, tool_detail};
 
 pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
     let s = |k: &str| v.get(k).and_then(Value::as_str);
@@ -41,18 +48,73 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
         Some("control_cancel_request") => {
             if let Some(id) = s("request_id") { out.push(Event::AskCancelled { request_id: id.into() }); }
         }
+        // Each turn the process runs starts with one: an answer to a message, or a turn the
+        // CLI starts itself once background work it was waiting on has finished.
         Some("system") if s("subtype") == Some("init") => {
+            p.turn_open = true;
+            out.push(Event::TurnStart);
             if let Some(id) = s("session_id") { out.push(Event::Session(id.into())); }
             if let Some(m) = s("model") {
                 p.model = Some(m.to_owned());
                 out.push(Event::Model(m.into()));
             }
         }
+        Some("system") => out.extend(task_event(v, p)),
+        // A message sent with a uuid: queued behind the running turn, taken in, answered.
+        Some("command_lifecycle") => {
+            if let (Some(uuid), Some(state)) = (s("command_uuid"), s("state")) {
+                out.push(Event::Lifecycle { uuid: uuid.into(), state: state.into() });
+            }
+        }
+        Some("stream_event" | "assistant" | "user") => {
+            // A subagent's lines name the tool call that started it; they go to its card, never
+            // into the main conversation.
+            match v["parent_tool_use_id"].as_str().filter(|id| !id.is_empty()) {
+                None => out.extend(message(v, p, None)),
+                Some(parent) => {
+                    for e in message(v, p, Some(parent)) {
+                        if matches!(e, Event::TextDelta(_) | Event::Text(_) | Event::ToolStart { .. } | Event::ToolEnd { .. }) {
+                            out.push(Event::Sub { parent: parent.to_owned(), event: Box::new(e) });
+                        }
+                    }
+                }
+            }
+        }
+        // The plan's windows as the turn spends them (`limits::Limits::apply_event`).
+        Some("rate_limit_event") => {
+            if v["rate_limit_info"].is_object() { out.push(Event::RateLimit(v["rate_limit_info"].clone())); }
+        }
+        Some("result") => {
+            p.turn_open = false;
+            let failed = v["is_error"].as_bool().unwrap_or(false) || s("subtype").is_some_and(|t| t != "success");
+            let error = failed.then(|| s("result").map(str::to_owned).unwrap_or_else(|| s("subtype").unwrap_or("error").into()));
+            // An interrupt ends the turn with `error_during_execution`; that's the stop, not a
+            // failure to show.
+            let interrupted = failed && s("subtype") == Some("error_during_execution") && s("terminal_reason").is_some_and(|r| r.starts_with("aborted"));
+            let error = if interrupted { None } else { error };
+            if let Some(id) = s("session_id") { out.push(Event::Session(id.into())); }
+            if let Some(w) = context_window(&v["modelUsage"], p.model.as_deref()) { out.push(Event::ContextWindow(w)); }
+            out.push(Event::Done { cost_usd: v["total_cost_usd"].as_f64(), error });
+        }
+        _ => {}
+    }
+    out
+}
+
+/// A conversation line (`stream_event`, `assistant` or `user`), the main agent's (`parent`
+/// none) or a subagent's.
+fn message(v: &Value, p: &mut ParseState, parent: Option<&str>) -> Vec<Event> {
+    let mut out = Vec::new();
+    let streamed = match parent {
+        None => &mut p.streamed_text,
+        Some(id) => p.sub_streamed.entry(id.to_owned()).or_default(),
+    };
+    match v["type"].as_str() {
         Some("stream_event") => {
             let e = &v["event"];
             // A model call's usage: when it starts, and its output once it ends. A subagent's
-            // calls (`parent_tool_use_id`) have a context of their own.
-            if v["parent_tool_use_id"].is_null() {
+            // calls have a context of their own.
+            if parent.is_none() {
                 let usage = match e["type"].as_str() {
                     Some("message_start") => Some(&e["message"]["usage"]),
                     Some("message_delta") => Some(&e["usage"]),
@@ -61,11 +123,11 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
                 if let Some(n) = usage.and_then(context_tokens) { out.push(Event::ContextUsed(n)); }
             }
             match e["type"].as_str() {
-                Some("message_start") => p.streamed_text = false,
+                Some("message_start") => *streamed = false,
                 Some("content_block_delta") => match e["delta"]["type"].as_str() {
                     Some("text_delta") => {
                         if let Some(t) = e["delta"]["text"].as_str() {
-                            p.streamed_text = true;
+                            *streamed = true;
                             out.push(Event::TextDelta(t.into()));
                         }
                     }
@@ -80,7 +142,7 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
             for b in v["message"]["content"].as_array().into_iter().flatten() {
                 match b["type"].as_str() {
                     // Text already arrived as deltas; only use the final copy if it didn't.
-                    Some("text") if !p.streamed_text => {
+                    Some("text") if !*streamed => {
                         if let Some(t) = b["text"].as_str() { out.push(Event::Text(t.into())); }
                     }
                     Some("tool_use") => out.push(Event::ToolStart {
@@ -104,20 +166,66 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
                 }
             }
         }
-        // The plan's windows as the turn spends them (`limits::Limits::apply_event`).
-        Some("rate_limit_event") => {
-            if v["rate_limit_info"].is_object() { out.push(Event::RateLimit(v["rate_limit_info"].clone())); }
-        }
-        Some("result") => {
-            let failed = v["is_error"].as_bool().unwrap_or(false) || s("subtype").is_some_and(|t| t != "success");
-            let error = failed.then(|| s("result").map(str::to_owned).unwrap_or_else(|| s("subtype").unwrap_or("error").into()));
-            if let Some(id) = s("session_id") { out.push(Event::Session(id.into())); }
-            if let Some(w) = context_window(&v["modelUsage"], p.model.as_deref()) { out.push(Event::ContextWindow(w)); }
-            out.push(Event::Done { cost_usd: v["total_cost_usd"].as_f64(), error });
-        }
         _ => {}
     }
     out
+}
+
+/// The CLI's task events (`system/task_*`, `background_tasks_changed`): subagents and shell
+/// commands it runs, in the foreground of a turn or the background. Other `system` lines are
+/// left out.
+fn task_event(v: &Value, p: &mut ParseState) -> Option<Event> {
+    let s = |k: &str| v[k].as_str().map(str::to_owned);
+    let usage = |u: &Value| u.is_object().then(|| TaskUsage {
+        tokens: u["total_tokens"].as_u64().unwrap_or(0),
+        tool_uses: u["tool_uses"].as_u64().unwrap_or(0),
+        duration_ms: u["duration_ms"].as_u64().unwrap_or(0),
+    });
+    let id = s("task_id");
+    Some(match v["subtype"].as_str()? {
+        "task_started" => Event::TaskStarted(TaskStart {
+            id: id?,
+            call: s("tool_use_id"),
+            kind: s("task_type").unwrap_or_default(),
+            description: s("description").unwrap_or_default(),
+            subagent_type: s("subagent_type"),
+            background: v["is_backgrounded"].as_bool().unwrap_or(false),
+            parent_task: s("parent_task_id"),
+            prompt: s("prompt"),
+            ambient: v["ambient"].as_bool().unwrap_or(false) || v["skip_transcript"].as_bool().unwrap_or(false),
+        }),
+        "task_progress" => Event::TaskProgress {
+            id: id?,
+            // The model's one-line summary when the CLI makes one, else what it's doing.
+            description: s("summary").filter(|x| !x.trim().is_empty()).or(s("description")).unwrap_or_default(),
+            last_tool: s("last_tool_name"),
+            usage: usage(&v["usage"]),
+        },
+        "task_updated" => Event::TaskUpdated {
+            id: id?,
+            status: v["patch"]["status"].as_str().map(str::to_owned),
+            background: v["patch"]["is_backgrounded"].as_bool(),
+            error: v["patch"]["error"].as_str().map(str::to_owned),
+        },
+        "task_notification" => Event::TaskDone {
+            id: id?,
+            status: s("status").unwrap_or_default(),
+            summary: s("summary").unwrap_or_default(),
+            usage: usage(&v["usage"]),
+        },
+        "background_tasks_changed" => {
+            let tasks: Vec<BackgroundTask> = v["tasks"].as_array().into_iter().flatten().filter_map(|t| Some(BackgroundTask {
+                id: t["task_id"].as_str()?.to_owned(),
+                kind: t["task_type"].as_str().unwrap_or_default().to_owned(),
+                description: t["description"].as_str().unwrap_or_default().to_owned(),
+                parent_task: t["parent_task_id"].as_str().map(str::to_owned),
+                ambient: t["ambient"].as_bool().unwrap_or(false),
+            })).collect();
+            p.background = tasks.iter().filter(|t| !t.ambient).count();
+            Event::Background(tasks)
+        }
+        _ => return None,
+    })
 }
 
 /// The tokens a model call's `usage` puts in the context: input, cache reads and writes, and
@@ -142,6 +250,7 @@ fn context_window(usage: &Value, model: Option<&str>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::TaskStart;
 
     fn run(lines: &[&str]) -> Vec<Event> {
         let mut p = ParseState::default();
@@ -158,6 +267,7 @@ mod tests {
             r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s1","total_cost_usd":0.002}"#,
         ]);
         assert_eq!(ev, vec![
+            Event::TurnStart,
             Event::Session("s1".into()),
             Event::Model("claude-haiku-5-5".into()),
             Event::TextDelta("Hi".into()),
@@ -291,6 +401,109 @@ mod tests {
         let codex = args(Harness::Codex);
         assert_eq!(&codex[codex.len() - 2..], ["--", "--dangerously-bypass-approvals-and-sandbox"]);
         assert_eq!(args(Harness::OpenCode).last().unwrap(), " --dangerously-bypass-approvals-and-sandbox");
+    }
+
+    /// Every line of a fixture through the parser, with the state after each.
+    fn replay(file: &str) -> (Vec<Event>, ParseState) {
+        let mut p = ParseState::default();
+        let ev = file.lines().filter(|l| !l.trim().is_empty()).flat_map(|l| parse(&serde_json::from_str(l).unwrap(), &mut p)).collect();
+        (ev, p)
+    }
+
+    fn main_text(ev: &[Event]) -> String {
+        ev.iter().filter_map(|e| match e { Event::TextDelta(t) | Event::Text(t) => Some(t.as_str()), _ => None }).collect()
+    }
+
+    /// Claude Code 2.1.319, trimmed: a foreground subagent ("Count files") and one in the
+    /// background ("Slow echo") that runs a command of its own, then the turn the CLI starts
+    /// itself once the background one is done. (stdin was closed up front, so the first turn's
+    /// result comes late, after that turn.)
+    #[test]
+    fn subagents_get_their_own_events_and_tasks() {
+        let (ev, p) = replay(include_str!("fixtures/claude-subagents.jsonl"));
+        let (count, slow) = ("toolu_01V7YxLSKwisZ2Uv5Q2DpWgh", "toolu_01QdVSg8wxoHq5JUjYS94fwU");
+        // The main conversation: two Agent calls and its own words, none of the subagents'.
+        let starts: Vec<(&str, &str)> = ev.iter().filter_map(|e| match e { Event::ToolStart { id, name, .. } => Some((id.as_str(), name.as_str())), _ => None }).collect();
+        assert_eq!(starts, [(count, "Agent"), (slow, "Agent")]);
+        let text = main_text(&ev);
+        assert!(text.contains("STARTED") && text.contains("FINISHED"), "{text}");
+        assert!(!text.contains("SLOW_DONE"), "a subagent's reply isn't the agent's: {text}");
+        // Each subagent's own tool call, result and words, for its card.
+        let subs: Vec<(&str, &Event)> = ev.iter().filter_map(|e| match e { Event::Sub { parent, event } => Some((parent.as_str(), event.as_ref())), _ => None }).collect();
+        assert!(subs.iter().any(|(p, e)| *p == count && matches!(e, Event::ToolStart { name, detail, .. } if name == "Bash" && detail.contains("wc -l"))));
+        assert!(subs.iter().any(|(p, e)| *p == count && matches!(e, Event::ToolEnd { ok: true, .. })));
+        assert!(subs.iter().any(|(p, e)| *p == slow && matches!(e, Event::Text(t) if t == "SLOW_DONE")));
+        assert!(subs.iter().all(|(p, _)| *p == count || *p == slow));
+        // Their tasks, from start to end.
+        let started: Vec<&TaskStart> = ev.iter().filter_map(|e| match e { Event::TaskStarted(t) => Some(t), _ => None }).collect();
+        assert_eq!(started.len(), 3);
+        assert_eq!((started[0].description.as_str(), started[0].kind.as_str(), started[0].background, started[0].call.as_deref()), ("Count files", "local_agent", false, Some(count)));
+        assert_eq!((started[1].description.as_str(), started[1].background, started[1].subagent_type.as_deref()), ("Slow echo", true, Some("general-purpose")));
+        assert!(started[1].prompt.as_deref().is_some_and(|p| p.contains("SLOW_DONE")));
+        assert_eq!((started[2].kind.as_str(), started[2].parent_task.as_deref()), ("local_bash", Some("a97e6751fb977a8cb")), "the slow agent's own command");
+        assert!(ev.iter().any(|e| matches!(e, Event::TaskProgress { id, description, usage: Some(u), .. } if id == "acb23a59beb62cd31" && description == "Running Count entries in /tmp" && u.tool_uses == 1)));
+        assert!(ev.iter().any(|e| matches!(e, Event::TaskUpdated { id, status: Some(s), .. } if id == "acb23a59beb62cd31" && s == "completed")));
+        assert!(ev.iter().any(|e| matches!(e, Event::TaskDone { id, status, summary, usage: Some(u) } if id == "acb23a59beb62cd31" && status == "completed" && summary == "485" && u.duration_ms == 2038)));
+        assert!(ev.iter().any(|e| matches!(e, Event::TaskDone { id, summary, .. } if id == "a97e6751fb977a8cb" && summary == "SLOW_DONE")));
+        // What runs in the background: the slow agent, then nothing.
+        let rosters: Vec<Vec<&str>> = ev.iter().filter_map(|e| match e { Event::Background(b) => Some(b.iter().map(|t| t.description.as_str()).collect()), _ => None }).collect();
+        assert_eq!(rosters, [vec!["Slow echo"], vec![]]);
+        assert_eq!(p.background, 0);
+        // Two turns in the one process.
+        assert_eq!(ev.iter().filter(|e| matches!(e, Event::TurnStart)).count(), 2);
+        assert_eq!(ev.iter().filter(|e| matches!(e, Event::Done { error: None, .. })).count(), 2);
+        assert!(!p.turn_open);
+    }
+
+    /// A background command (2.1.319, trimmed): its call returns at once, the turn ends, and
+    /// once the command is done the CLI reports on it in a turn of its own.
+    #[test]
+    fn a_background_command_outlives_its_turn() {
+        let file = include_str!("fixtures/claude-background-bash.jsonl");
+        let mut p = ParseState::default();
+        let mut seen = Vec::new();
+        for l in file.lines() {
+            for e in parse(&serde_json::from_str(l).unwrap(), &mut p) {
+                seen.push((e, p.turn_open, p.background));
+            }
+        }
+        let first_done = seen.iter().position(|(e, ..)| matches!(e, Event::Done { .. })).unwrap();
+        assert_eq!((seen[first_done].1, seen[first_done].2), (false, 1), "the turn is over, the command isn't");
+        let ev: Vec<Event> = seen.into_iter().map(|(e, ..)| e).collect();
+        assert!(ev.iter().any(|e| matches!(e, Event::TaskStarted(t) if t.kind == "local_bash" && t.background && t.call.as_deref() == Some("toolu_01PuTXdVBrD22K1t3UqBVBn6"))));
+        assert!(ev.iter().any(|e| matches!(e, Event::TaskDone { status, summary, .. } if status == "completed" && summary.starts_with("Background command"))));
+        let after: Vec<&Event> = ev[first_done + 1..].iter().filter(|e| matches!(e, Event::TurnStart | Event::Done { .. } | Event::Text(_) | Event::TextDelta(_))).collect();
+        assert!(matches!(after.as_slice(), [Event::TurnStart, Event::Text(t), Event::Done { .. }] if t == "FINISHED"), "{after:?}");
+        assert_eq!(p.background, 0);
+    }
+
+    /// Stop (an interrupt) with `perTaskStopAffordance`: the turn ends, aborted, which isn't an
+    /// error to show; the background agent lives on until `stop_task` stops it (2.1.319).
+    #[test]
+    fn an_interrupted_turn_isnt_a_failure_and_a_stopped_task_says_so() {
+        let (ev, _) = replay(include_str!("fixtures/claude-stop-task.jsonl"));
+        let dones: Vec<&Option<String>> = ev.iter().filter_map(|e| match e { Event::Done { error, .. } => Some(error), _ => None }).collect();
+        assert_eq!(dones, [&None, &None], "the interrupted turn, then the one the CLI started after the stop");
+        let sleeper = "a761c9704b5720442";
+        assert!(ev.iter().any(|e| matches!(e, Event::TaskUpdated { id, status: Some(s), .. } if id == sleeper && s == "killed")));
+        assert!(ev.iter().any(|e| matches!(e, Event::TaskDone { id, status, .. } if id == sleeper && status == "stopped")));
+        // The agent was still in the background after the interrupt.
+        let interrupted = ev.iter().position(|e| matches!(e, Event::Done { .. })).unwrap();
+        let killed = ev.iter().position(|e| matches!(e, Event::TaskUpdated { id, .. } if id == sleeper)).unwrap();
+        assert!(interrupted < killed);
+    }
+
+    #[test]
+    fn lifecycle_and_unknown_system_lines() {
+        let ev = run(&[
+            r#"{"type":"command_lifecycle","command_uuid":"u1","state":"queued"}"#,
+            r#"{"type":"system","subtype":"status","status":"requesting"}"#,
+            r#"{"type":"system","subtype":"hook_started","hook_id":"h"}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"t","task_type":"local_bash","description":"x","ambient":true}"#,
+        ]);
+        assert_eq!(ev[0], Event::Lifecycle { uuid: "u1".into(), state: "queued".into() });
+        assert_eq!(ev.len(), 2, "status and hook lines are ignored: {ev:?}");
+        assert!(matches!(&ev[1], Event::TaskStarted(t) if t.ambient));
     }
 
     /// A reset time past what the clock holds is dropped, not a crash.

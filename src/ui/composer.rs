@@ -164,8 +164,12 @@ pub fn view(s: &App, k: &Kit, floating: bool, layer: &mut Vec<El>) -> El {
     };
     let hint = text(hint).font(k.ty.text_xsmall).color(c.text_faint).truncate();
     let mut stack = col().w_full().max_w(MAX_W).gap(8.0).items_center();
+    // What the thread's CLI still runs in the background after the turn's result.
+    if let Some(bg) = s.thread().and_then(|t| crate::ui::agents::background(s, t, k)) {
+        stack = stack.child(bg);
+    }
     if let Some(t) = s.thread().filter(|t| !t.queue.is_empty()) {
-        stack = stack.child(queue(t, running, &steer_key, k));
+        stack = stack.child(queue(t, running, t.has_background(), &steer_key, k));
     }
     let dock = row().key("composer-dock").w_full().justify_center().px(24.0).pb(14.0).pt(4.0);
     let dock = if floating {
@@ -232,12 +236,15 @@ fn attachments(s: &App, k: &Kit) -> El {
 }
 
 /// Queued follow-ups, oldest first, tucked above the prompt. Each can go now (steering a
-/// running turn) or be removed.
-fn queue(t: &Thread, running: bool, steer_key: &str, k: &Kit) -> El {
+/// running turn) or be removed. `background`: the turn is over but its CLI still runs work in
+/// the background, which the queue waits for.
+fn queue(t: &Thread, running: bool, background: bool, steer_key: &str, k: &Kit) -> El {
     let c = &k.c;
     let id = t.id;
     let head = if t.preparing {
         "Making the worktree · sent when it's ready".to_owned()
+    } else if background && !running {
+        format!("{} queued · waits for the background work to finish, or stop it", t.queue.len())
     } else if running {
         format!("{} queued · sent in order when the turn ends", t.queue.len())
     } else {

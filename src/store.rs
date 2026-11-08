@@ -130,6 +130,8 @@ fn kind_json(k: &Kind) -> Option<Value> {
             v
         }
         Kind::Error(t) => json!({ "type": "error", "text": t }),
+        // Claude Code's alone, whose threads its own transcripts keep.
+        Kind::Agents(_) | Kind::Wake(_) => return None,
         Kind::TurnEnd { secs, cost_usd, stopped } => json!({ "type": "turn-end", "secs": secs, "cost_usd": cost_usd, "stopped": stopped }),
     })
 }

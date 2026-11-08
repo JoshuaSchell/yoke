@@ -51,11 +51,16 @@ fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     #[cfg(target_os = "macos")]
     ui::mac::fix_menus();
     let mut changed = s.drain(tx);
+    // Quitting while a CLI is at work asks first (`App::may_quit`).
+    #[cfg(target_os = "macos")]
+    if ui::mac::quit_guard(!s.quit_ok && !s.at_work().is_empty()) && !s.may_quit() {
+        changed = true;
+    }
     changed |= attention::poll(s, clock, tx);
     // The "Working… 12s" counter and the frame-stats HUD redraw on their own beat, not every
     // frame: `poll` says true only when something on screen changed.
     let beat = if s.hud { (clock * 2.0) as u64 } else { clock as u64 };
-    if (s.hud || s.threads.iter().any(|t| t.busy)) && beat != s.beat {
+    if (s.hud || s.threads.iter().any(|t| t.busy || t.has_background())) && beat != s.beat {
         s.beat = beat;
         changed = true;
     }
@@ -103,6 +108,11 @@ const SCENES: &[Scene] = &[
     ("icon", app::scenes::icon),
     ("diff", app::scenes::diff),
     ("skills", app::scenes::skills),
+    ("agents", app::scenes::agents),
+    ("background", app::scenes::background),
+    ("wake", app::scenes::wake),
+    ("stop-background", app::scenes::stop_background),
+    ("quit", app::scenes::quit),
 ];
 
 fn main() {
@@ -137,7 +147,10 @@ fn main() {
     if let Ok(k) = keys.spec(shortcuts::Cmd::OpenFolder).parse() {
         open = open.key_equivalent(k);
     }
-    rune::App::new(spec).chrome(chrome).standard_menus().menu_item(settings).menu_item(open).on_frame_encoded(ui::hud::record).on_focus(attention::on_focus).run();
+    rune::App::new(spec).chrome(chrome).standard_menus().menu_item(settings).menu_item(open).on_frame_encoded(ui::hud::record).on_focus(attention::on_focus)
+        // Whatever still runs ends with the app (after asking, while there was any).
+        .on_quit(|s: &mut App, _: &mut Tx| s.stop_everything())
+        .run();
 }
 
 #[cfg(test)]
@@ -1333,6 +1346,86 @@ mod tests {
         rt.update(|s, _| s.answer(id, item, crate::harness::Decision::Deny));
         pump_until(&mut rt, 30, |s| !s.is_running(id));
         assert_eq!(tool_outputs(&rt.state)[1].1, "denied");
+    }
+
+    /// A real stream with two subagents (Claude Code 2.1.319): their own rows go on their
+    /// cards, never into the conversation, and each card's status follows its task.
+    #[test]
+    fn subagents_get_cards_of_their_own() {
+        use crate::app::{AgentStatus, scenes};
+        let mut app = new_app();
+        let id = scenes::play(&mut app, "two agents", scenes::SUBAGENTS, usize::MAX);
+        let t = app.thread_mut(id).unwrap();
+        let groups: Vec<&Vec<crate::app::Agent>> = t.items.iter().filter_map(|i| match &i.kind { Kind::Agents(g) => Some(g), _ => None }).collect();
+        assert_eq!(groups.len(), 1, "two launches in a row make one group");
+        let g = groups[0];
+        assert_eq!(g.iter().map(|a| a.description.as_str()).collect::<Vec<_>>(), ["Count files", "Slow echo"]);
+        assert!(g.iter().all(|a| a.status(t.task_for(&a.call)) == AgentStatus::Completed));
+        assert_eq!(g[0].report(t.task_for(&g[0].call)), "485");
+        assert!(g[0].items.iter().any(|i| matches!(&i.kind, Kind::Tool { name, state: ToolState::Ok, .. } if name == "Bash")), "its own Bash row");
+        assert!(g[1].items.iter().any(|i| matches!(&i.kind, Kind::Assistant { text, .. } if text == "SLOW_DONE")), "its own words");
+        let said: String = t.items.iter().filter_map(|i| match &i.kind { Kind::Assistant { text, .. } => Some(text.as_str()), _ => None }).collect();
+        assert!(!said.contains("SLOW_DONE") && said.contains("STARTED"), "{said}");
+        assert!(t.items.iter().all(|i| !matches!(&i.kind, Kind::Tool { .. })), "no subagent row in the conversation");
+        assert!(!t.has_background() && !t.busy);
+    }
+
+    /// A background command (2.1.319): the turn ends with its result while the command runs,
+    /// saying so, and the turn the CLI starts itself once it's done comes after a divider
+    /// naming it, with a cost of its own.
+    #[test]
+    fn background_work_outlives_the_turn_and_wakes_it() {
+        use crate::app::{TaskStatus, scenes};
+        let mut app = new_app();
+        let lines: Vec<&str> = scenes::BACKGROUND_BASH.lines().collect();
+        let first_result = lines.iter().position(|l| l.contains("\"type\":\"result\"")).unwrap();
+        let id = scenes::play(&mut app, "bg", scenes::BACKGROUND_BASH, first_result + 1);
+        let t = app.thread_mut(id).unwrap();
+        assert!(!t.busy, "the turn is over");
+        assert_eq!(t.background.len(), 1, "the command isn't");
+        assert!(matches!(t.items.last().unwrap().kind, Kind::TurnEnd { .. }));
+        let bash = t.task_for("toolu_01PuTXdVBrD22K1t3UqBVBn6").unwrap();
+        assert!(bash.background && bash.status == TaskStatus::Running);
+        let mut p = crate::harness::ParseState::default();
+        for line in &lines[..=first_result] { crate::harness::claude::parse(&serde_json::from_str(line).unwrap(), &mut p); }
+        for line in &lines[first_result + 1..] {
+            for e in crate::harness::claude::parse(&serde_json::from_str(line).unwrap(), &mut p) { app.apply(id, e); }
+        }
+        let t = app.thread_mut(id).unwrap();
+        let kinds: Vec<String> = t.items.iter().map(|i| match &i.kind {
+            Kind::User(_) => "user".into(),
+            Kind::Tool { .. } => "tool".into(),
+            Kind::Assistant { text, .. } => text.clone(),
+            Kind::Wake(w) => format!("wake: {w}"),
+            Kind::TurnEnd { cost_usd, .. } => format!("end {:.4}", cost_usd.unwrap_or(0.0)),
+            _ => "other".into(),
+        }).collect();
+        assert_eq!(kinds, ["user", "tool", "STARTED", "end 0.0028", "wake: \u{201c}Sleep 25 seconds then echo BG_DONE\u{201d} finished", "FINISHED", "end 0.0003"]);
+        assert!(!t.has_background() && !t.busy);
+        assert_eq!(t.task_for("toolu_01PuTXdVBrD22K1t3UqBVBn6").unwrap().status, TaskStatus::Completed);
+    }
+
+    /// While a thread's CLI runs work in the background, what would end it asks first and
+    /// names it; Cancel leaves it all running.
+    #[test]
+    fn stopping_background_work_asks_first() {
+        use crate::app::{StopWhat, scenes};
+        let mut app = new_app();
+        scenes::background(&mut app);
+        let id = app.selected.unwrap();
+        let mut rt = headless(app);
+        assert!(rt.elements().iter().any(|e| e.text.as_deref().is_some_and(|t| t.starts_with("Running in background · 1 agent"))));
+        assert!(rt.elements().iter().any(|e| e.text.as_deref().is_some_and(|t| t.contains("waits for the background work"))), "the queue says why it waits");
+        assert!(rt.elements().iter().any(|e| e.text.as_deref().is_some_and(|t| t.contains("1 agent still running in the background"))), "and the turn's end");
+        rt.update(|s, _| s.ask_stop_background(id));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.elements().iter().any(|e| e.text.as_deref().is_some_and(|t| t.contains("\u{201c}Slow echo\u{201d}"))), "the dialog names it");
+        rt.update(|s, _| s.confirm_stop = None);
+        // Quitting asks while something is at work, and goes once confirmed.
+        assert!(!rt.state.may_quit());
+        assert_eq!(rt.state.confirm_stop, Some((0, StopWhat::Quit)));
+        rt.update(|s, tx| s.confirm_stop(tx));
+        assert!(rt.state.may_quit());
     }
 
     #[test]

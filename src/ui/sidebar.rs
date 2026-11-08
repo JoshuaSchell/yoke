@@ -221,6 +221,13 @@ pub fn delete_dialog(s: &App, k: &Kit, layer: &mut Vec<El>) {
     } else {
         format!("\u{201c}{}\u{201d} is removed from Yoke. This can't be undone.", t.title)
     };
+    // Deleting ends the CLI, and what it still runs in the background with it.
+    let what = if s.background_of(id) {
+        let named: Vec<String> = t.background.iter().take(4).map(|b| crate::ui::agents::task_name(&b.description)).collect();
+        format!("{what} Its background work stops too: {} ({}).", t.background_counts(), named.join(", "))
+    } else {
+        what
+    };
     let buttons = row().key("delete-buttons").w_full().padding(16.0).gap(8.0).justify_end()
         .child(Button::new("Cancel").variant(ButtonVariant::Ghost).on_press(|s: &mut App| s.confirm_delete = None).build(k).key("delete-cancel"))
         .child(Button::new("Delete").variant(ButtonVariant::Danger).on_press(move |s: &mut App| s.delete(id)).build(k).default_button().key("delete-confirm"));

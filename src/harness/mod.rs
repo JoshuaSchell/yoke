@@ -184,7 +184,7 @@ impl Harness {
     pub(crate) fn stdin_lines(self, t: &Turn) -> Vec<String> {
         match self {
             Harness::Claude => vec![
-                serde_json::json!({"type": "control_request", "request_id": "yoke-init", "request": {"subtype": "initialize"}}).to_string(),
+                initialize(),
                 serde_json::json!({
                     "type": "user",
                     "message": {"role": "user", "content": content(t)},
@@ -239,8 +239,64 @@ pub enum Event {
     ContextUsed(u64),
     /// The size of the model's context window, in tokens (Claude Code's `result`).
     ContextWindow(u64),
-    /// The process exited; always the last event of a turn.
+    /// A turn starts in the process (Claude Code's `system/init`): the answer to a message, or
+    /// one the CLI starts itself to report on background work that finished.
+    TurnStart,
+    /// One of a subagent's own events (its text, tool calls and results), for the card of the
+    /// tool call `parent` that started it.
+    Sub { parent: String, event: Box<Event> },
+    /// A task started: a subagent, or a shell command (foreground or background).
+    TaskStarted(TaskStart),
+    /// What a running task is doing now, and what it has used.
+    TaskProgress { id: String, description: String, last_tool: Option<String>, usage: Option<TaskUsage> },
+    /// A task's state changed: its status (`running`, `completed`, `failed`, `killed`…), or it
+    /// moved to the background.
+    TaskUpdated { id: String, status: Option<String>, background: Option<bool>, error: Option<String> },
+    /// A task ended (`completed`, `failed` or `stopped`), with the CLI's summary of it.
+    TaskDone { id: String, status: String, summary: String, usage: Option<TaskUsage> },
+    /// Every task now running in the background (replaces the last list).
+    Background(Vec<BackgroundTask>),
+    /// A message sent with a uuid moved on: `queued`, `started`, `completed` or `cancelled`.
+    Lifecycle { uuid: String, state: String },
+    /// The process exited; always the last event of a run.
     Exited { code: Option<i32>, stderr: String },
+}
+
+/// A task as it starts (Claude Code's `system/task_started`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskStart {
+    pub id: String,
+    /// The tool call that started it (an `Agent` or a `Bash` call), when there is one.
+    pub call: Option<String>,
+    /// `local_agent` (a subagent), `local_bash` (a shell command), or another of the CLI's.
+    pub kind: String,
+    pub description: String,
+    pub subagent_type: Option<String>,
+    /// Started in the background, rather than with its tool call waiting on it.
+    pub background: bool,
+    /// The subagent that started it, if a subagent did.
+    pub parent_task: Option<String>,
+    pub prompt: Option<String>,
+    /// Housekeeping the CLI does on its own, not work to show.
+    pub ambient: bool,
+}
+
+/// What a task has used so far.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TaskUsage {
+    pub tokens: u64,
+    pub tool_uses: u64,
+    pub duration_ms: u64,
+}
+
+/// One entry of `background_tasks_changed`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackgroundTask {
+    pub id: String,
+    pub kind: String,
+    pub description: String,
+    pub parent_task: Option<String>,
+    pub ambient: bool,
 }
 
 /// A tool waiting for the person's approval.
@@ -304,8 +360,15 @@ impl AskRequest {
 pub struct ParseState {
     /// Claude: whether the current message streamed text deltas (so its final copy is skipped).
     streamed_text: bool,
+    /// Claude: the same, per subagent (by the tool call that started it).
+    sub_streamed: std::collections::HashMap<String, bool>,
     /// Claude: the session's model (`system/init`), to pick its window from `result`.
     model: Option<String>,
+    /// Claude: a turn is under way (from `system/init` to its `result`).
+    turn_open: bool,
+    /// Claude: how many tasks run in the background (`background_tasks_changed`), which the
+    /// process stays alive for.
+    background: usize,
     /// Lines the parser wants written back to the CLI's stdin (refusing requests we don't
     /// handle, so the CLI doesn't wait on them).
     pub(crate) replies: Vec<String>,
@@ -327,6 +390,19 @@ pub struct Turn {
     /// message from a session in another permission mode for approval, which a thread here
     /// can't give, so it would expire unread.
     pub peer_messages: bool,
+}
+
+/// The Agent SDK's `initialize` control request, with what Yoke renders declared:
+/// `perTaskStopAffordance` says each background task has a stop control (`stop_task`), so an
+/// interrupt (Stop) only ends the turn and spares background agents, which without it are
+/// killed too; `forwardNestedSubagentToolCalls` sends the tool calls of subagents that other
+/// subagents start, so each card can show its own.
+pub(crate) fn initialize() -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": "yoke-init",
+        "request": {"subtype": "initialize", "perTaskStopAffordance": true, "forwardNestedSubagentToolCalls": true},
+    }).to_string()
 }
 
 /// `path` as an API image block (base64), or `None` if it can't be read or isn't an image type
@@ -382,6 +458,17 @@ impl Running {
             "type": "control_request",
             "request_id": format!("yoke-mode-{}", a.claude_mode()),
             "request": {"subtype": "set_permission_mode", "mode": a.claude_mode()},
+        }).to_string();
+        write_line(&self.stdin, &line)
+    }
+
+    /// Stops one task (a subagent or a shell command) and nothing else: Claude Code's
+    /// `stop_task`. False if the CLI is no longer listening.
+    pub fn stop_task(&self, task: &str) -> bool {
+        let line = serde_json::json!({
+            "type": "control_request",
+            "request_id": format!("yoke-stop-{task}"),
+            "request": {"subtype": "stop_task", "task_id": task},
         }).to_string();
         write_line(&self.stdin, &line)
     }
@@ -501,16 +588,21 @@ fn launch<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Sender<
                     s
                 });
                 let mut p = ParseState::default();
+                let mut done = false;
                 for line in BufReader::new(stdout).lines() {
                     let Ok(line) = line else { break };
                     for e in harness.parse(&line, &mut p) {
-                        // The turn's result: close stdin so a stream-json CLI exits.
-                        if matches!(e, Event::Done { .. }) { *stdin.lock().unwrap() = None; }
+                        done |= matches!(e, Event::Done { .. });
                         send(e);
                     }
                     for r in p.replies.drain(..) {
                         write_line(&stdin, &r);
                     }
+                    // The turn has its result and nothing runs in the background: close stdin
+                    // so a stream-json CLI exits. While background work runs it stays open, so
+                    // a task can still be stopped on its own (`stop_task`); the CLI reports on
+                    // the work in a turn of its own once it's done, and exits after that.
+                    if done && !p.turn_open && p.background == 0 { *stdin.lock().unwrap() = None; }
                 }
                 *stdin.lock().unwrap() = None;
                 let stderr = err.join().unwrap_or_default();

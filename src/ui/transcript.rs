@@ -13,7 +13,7 @@ use rune_kit::syntax::SyntaxTheme;
 use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Markdown, Spinner};
 use rune_theme_opencode::icons;
 
-use crate::app::{App, Item, Kind, Pending, Thread, ToolState};
+use crate::app::{App, Item, Kind, Pending, Task, TaskStatus, Thread, ToolState};
 use crate::harness::{Decision, ToolBody};
 use crate::shortcuts::Cmd;
 
@@ -66,28 +66,53 @@ fn item_view(s: &App, t: &Thread, item: &Item, k: &Kit, look: (Theme, bool)) -> 
     let open = s.expanded.contains(&item.id);
     // What a file row's button opens it in; its name is in the button's tooltip.
     let editor = crate::editors::for_files(s.editor.as_deref());
+    // A row whose look depends on more than itself: what's open inside a subagent card, whether
+    // the last turn's work goes on in the background, a background command's task.
+    let (extra, live) = match &item.kind {
+        Kind::Agents(g) => (crate::ui::agents::open_key(s, item.id, g), crate::ui::agents::live(t, g)),
+        Kind::TurnEnd { .. } => ((last_turn_end(t, item.id) && t.has_background()) as u64, false),
+        Kind::Tool { call, .. } => match t.task_for(call) {
+            Some(task) => (task.status as u64, task.running()),
+            None => (0, false),
+        },
+        _ => (0, false),
+    };
     let build = || match &item.kind {
         Kind::User(m) => user(m, k),
         Kind::Assistant { text, streaming } => {
             Markdown::new(text.as_str()).style(theme::markdown(look.0, k)).selectable(true).streaming(*streaming).build(k)
         }
-        Kind::Tool { name, detail, state, output, body, .. } => {
-            let syn = theme::syntax(look.0, k);
-            let card = tool(item.id, name, detail, *state, output, body, open, t.ask_on(item.id).is_some(), editor, &syn, k);
-            match t.ask_on(item.id) {
-                Some(p) => card.child(approval(s, t.id, p, k)),
-                None => card,
-            }
-        }
+        Kind::Tool { .. } => tool_row(s, t, item, k, look),
+        Kind::Agents(g) => crate::ui::agents::group(s, t, item.id, g, k, look),
+        Kind::Wake(why) => wake(why, k),
         Kind::Error(m) => error(m, k),
         Kind::TurnEnd { secs, cost_usd, stopped } => turn_end(*secs, *cost_usd, *stopped, item.id, t, k),
     };
-    if streaming {
-        // A streaming message changes every delta: building it is the work.
-        build().streaming(true)
+    if streaming || live {
+        // A streaming message changes every delta, and a running subagent's time every
+        // second: building it is the work.
+        build().streaming(streaming)
     } else {
-        memo(format!("item-{}", item.id), (item.rev, open, look, editor.id), build)
+        memo(format!("item-{}", item.id), (item.rev, open, look, editor.id, extra), build)
     }
+}
+
+/// A tool row, with its approval under it while one waits. Used for the subagents' rows too.
+pub(crate) fn tool_row(s: &App, t: &Thread, item: &Item, k: &Kit, look: (Theme, bool)) -> El {
+    let Kind::Tool { name, detail, state, output, body, call } = &item.kind else { return rune::el() };
+    let open = s.expanded.contains(&item.id);
+    let editor = crate::editors::for_files(s.editor.as_deref());
+    let syn = theme::syntax(look.0, k);
+    let card = tool(item.id, name, detail, *state, output, body, open, t.ask_on(item.id).is_some(), t.task_for(call), editor, &syn, k);
+    match t.ask_on(item.id) {
+        Some(p) => card.child(approval(s, t.id, p, k)),
+        None => card,
+    }
+}
+
+/// Whether `item` is the thread's last turn end.
+fn last_turn_end(t: &Thread, item: u64) -> bool {
+    t.items.iter().rev().find(|i| matches!(i.kind, Kind::TurnEnd { .. })).is_some_and(|i| i.id == item)
 }
 
 fn user(m: &str, k: &Kit) -> El {
@@ -111,14 +136,22 @@ fn tool_icon(name: &str) -> &'static Icon {
     }
 }
 
+/// `task`: the call's task, for a command running in the background (its call returned at
+/// once): its row says so until it ends.
 #[allow(clippy::too_many_arguments)]
-fn tool(id: u64, name: &str, detail: &str, state: ToolState, output: &str, body: &ToolBody, open: bool, waiting: bool, editor: crate::editors::Editor, syn: &SyntaxTheme, k: &Kit) -> El {
+fn tool(id: u64, name: &str, detail: &str, state: ToolState, output: &str, body: &ToolBody, open: bool, waiting: bool, task: Option<&Task>, editor: crate::editors::Editor, syn: &SyntaxTheme, k: &Kit) -> El {
     let c = &k.c;
-    let status = match state {
-        ToolState::Running if waiting => text("Needs approval").font(k.ty.text_xsmall_medium).color(c.text_base),
-        ToolState::Running => Spinner::new().size(12.0).build(k),
-        ToolState::Ok => icon(&icons::CHECK_SMALL, 14.0).color(c.icon_weaker),
-        ToolState::Failed => icon(&icons::CIRCLE_X, 13.0).color(c.danger.fg),
+    let background = task.filter(|x| x.background && state != ToolState::Running);
+    let status = match (state, background.map(|x| x.status)) {
+        (ToolState::Running, _) if waiting => text("Needs approval").font(k.ty.text_xsmall_medium).color(c.text_base),
+        (_, Some(TaskStatus::Running)) => row().gap(6.0).center_y()
+            .child(text("In the background").font(k.ty.text_xsmall).color(c.text_muted))
+            .child(Spinner::new().size(12.0).build(k)),
+        (_, Some(TaskStatus::Stopped)) => text("Stopped").font(k.ty.text_xsmall).color(c.text_muted),
+        (_, Some(TaskStatus::Failed)) => icon(&icons::CIRCLE_X, 13.0).color(c.danger.fg),
+        (ToolState::Running, _) => Spinner::new().size(12.0).build(k),
+        (ToolState::Ok, _) => icon(&icons::CHECK_SMALL, 14.0).color(c.icon_weaker),
+        (ToolState::Failed, _) => icon(&icons::CIRCLE_X, 13.0).color(c.danger.fg),
     };
     let has_output = !output.trim().is_empty() || !matches!(body, ToolBody::None);
     // An edit's diffs, made once for both the row's counts and its opened body.
@@ -442,7 +475,7 @@ fn reveal_hidden(s: &str) -> String {
     }).collect()
 }
 
-fn error(m: &str, k: &Kit) -> El {
+pub(crate) fn error(m: &str, k: &Kit) -> El {
     let c = &k.c;
     row().w_full().px(12.0).py(10.0).gap(8.0).radius(9.0).fill(c.danger.bg).border(1.0, c.danger.border)
         .child(icon(&icons::WARNING, 14.0).color(c.danger.fg))
@@ -454,6 +487,8 @@ fn turn_end(secs: f64, cost: Option<f64>, stopped: bool, item: u64, t: &Thread, 
     let mut parts = vec![if stopped { format!("Stopped after {}", duration(secs)) } else { format!("Worked for {}", duration(secs)) }];
     if let Some(m) = &t.resolved_model { parts.push(m.clone()); }
     if let Some(usd) = cost { parts.push(format!("${usd:.4}")); }
+    // The process lives on for work the turn left running.
+    if last_turn_end(t, item) && t.has_background() { parts.push(format!("{} still running in the background", t.background_counts())); }
     let rule = || el_rule(k);
     row().w_full().gap(10.0).center_y().py(4.0)
         .child(rule())
@@ -476,6 +511,17 @@ fn changes_chip(item: u64, t: &Thread, k: &Kit) -> Option<El> {
         .child(text(format!("+{}", st.added)).font(k.ty.text_xsmall_medium).color(c.success.icon))
         .child(text(format!("\u{2212}{}", st.removed)).font(k.ty.text_xsmall_medium).color(c.danger.icon))
         .on_press(move |s: &mut App| s.open_turn_diff(id, tok.clone())))
+}
+
+/// Before a turn the CLI started itself, once work it left in the background finished.
+fn wake(why: &str, k: &Kit) -> El {
+    let c = &k.c;
+    row().w_full().gap(10.0).center_y().py(4.0)
+        .child(el_rule(k))
+        .child(row().gap(6.0).center_y()
+            .child(icon(&icons::OUTLINE_ROTATE_CLOCKWISE, 12.0).color(c.icon_weaker))
+            .child(text(why.to_owned()).font(k.ty.text_xsmall).color(c.text_muted)))
+        .child(el_rule(k))
 }
 
 fn el_rule(k: &Kit) -> El {

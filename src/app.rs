@@ -205,8 +205,10 @@ pub struct App {
     /// Each harness's model picker: what its CLI reported (or the last report, saved), else
     /// the built-in list.
     pub models: HashMap<Harness, Vec<ModelOpt>>,
-    /// Tool rows showing their output.
+    /// Tool rows showing their output, and subagent cards opened.
     pub expanded: HashSet<u64>,
+    /// Rows of subagents folded under their "N subagents" header.
+    pub folded: HashSet<u64>,
     pub hud: bool,
     /// The last half-second (HUD) or second (working counter) `poll` redrew for.
     pub beat: u64,
@@ -240,6 +242,11 @@ pub struct App {
     settled_by_hand: HashMap<String, bool>,
     /// The thread the delete dialog asks about (the row's ✕, or ⇧⌘⌫).
     pub confirm_delete: Option<ThreadId>,
+    /// A stop waiting on "Stop background work?": what would end work the thread's process
+    /// still runs in the background (`StopWhat`), and the thread (0 for quitting).
+    pub confirm_stop: Option<(ThreadId, StopWhat)>,
+    /// Quitting was confirmed (or nothing needed asking): the next quit goes ahead.
+    pub quit_ok: bool,
     /// The project waiting on "Trust this project?" before its first turn, the draft kept.
     pub confirm_trust: Option<PathBuf>,
     /// Project folders trusted here (saved in prefs). See `App::is_trusted`.
@@ -290,6 +297,22 @@ pub enum Alert {
     Failed,
     /// A tool waits for approval (its name).
     Approval(String),
+}
+
+/// What a stop the person asked for would end, while their thread's CLI still runs work in
+/// the background (subagents, commands) that ends with it. Each asks first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopWhat {
+    /// Stop (Esc, or the stop button).
+    Turn,
+    /// Steer the draft in now (⌘↩).
+    Steer,
+    /// Send queued message `qid` now.
+    SendNow(u64),
+    /// The background line's "Stop all".
+    Background,
+    /// Quitting Yoke.
+    Quit,
 }
 
 /// A message waiting for the running turn to end, with the composer's choices when it was
@@ -458,6 +481,20 @@ pub struct Thread {
     pub checkpoints: Vec<crate::diff::Checkpoint>,
     /// The saved checkpoint index has been read.
     pub checkpoints_loaded: bool,
+    /// Every task its CLI process started (subagents, shell commands), oldest first.
+    pub tasks: Vec<Task>,
+    /// What the process runs in the background now (`background_tasks_changed`): it stays
+    /// alive for these after the turn's result, and starts a turn of its own once they finish.
+    pub background: Vec<harness::BackgroundTask>,
+    /// What finished in the background since the last turn ended, for the divider before the
+    /// turn the CLI starts to report on it.
+    pub woke: Vec<String>,
+    /// The CLI's running cost total at the last result: a process that runs several turns
+    /// reports its whole cost each time.
+    pub cost_seen: Option<f64>,
+    /// The turn under way is one the CLI started itself (after background work), not the
+    /// answer to a message: its diff is the message's turn's.
+    pub woken: bool,
 }
 
 /// A question from the CLI, shown on the row (`item`) of the tool it's about.
@@ -470,13 +507,6 @@ impl Thread {
     /// The approval waiting on transcript row `item`.
     pub fn ask_on(&self, item: u64) -> Option<&Pending> {
         self.asks.iter().find(|p| p.item == item)
-    }
-
-    /// The tool row for call `call` in the current turn (since the last message sent).
-    fn tool_row(&mut self, call: &str) -> Option<&mut Item> {
-        self.items.iter_mut().rev()
-            .take_while(|i| !matches!(i.kind, Kind::User(_)))
-            .find(|i| matches!(&i.kind, Kind::Tool { call: c, .. } if c == call))
     }
 
     pub fn new(id: ThreadId, title: String, harness: Harness, model: String) -> Thread {
@@ -507,8 +537,176 @@ impl Thread {
             asks: Vec::new(),
             context: None,
             context_window: None,
+            tasks: Vec::new(),
+            background: Vec::new(),
+            woke: Vec::new(),
+            cost_seen: None,
+            woken: false,
         }
     }
+
+    /// The task started by tool call `call`, if any.
+    pub fn task_for(&self, call: &str) -> Option<&Task> {
+        self.tasks.iter().rev().find(|t| t.call.as_deref() == Some(call))
+    }
+
+    pub fn task(&self, id: &str) -> Option<&Task> {
+        self.tasks.iter().rev().find(|t| t.id == id)
+    }
+
+    /// Whether its process still runs work in the background, which ending the process stops.
+    pub fn has_background(&self) -> bool {
+        !self.background.is_empty()
+    }
+
+    /// What's running in the background, in words: "1 agent, 2 commands".
+    pub fn background_counts(&self) -> String {
+        let agents = self.background.iter().filter(|b| b.kind == "local_agent").count();
+        let others = self.background.len() - agents;
+        let mut parts = Vec::new();
+        if agents > 0 { parts.push(if agents == 1 { "1 agent".to_owned() } else { format!("{agents} agents") }); }
+        if others > 0 { parts.push(if others == 1 { "1 command".to_owned() } else { format!("{others} commands") }); }
+        parts.join(", ")
+    }
+
+    /// Bumps the transcript row that shows item `item` (itself, or the subagent card it's in),
+    /// so its memo is rebuilt.
+    pub fn bump(&mut self, item: u64) {
+        if let Some(row) = self.items.iter_mut().find(|i| i.id == item || contains_item(&i.kind, item)) { row.rev += 1; }
+    }
+
+    /// Bumps the row that shows tool call `call`: its tool row or subagent card.
+    fn bump_call(&mut self, call: &str) {
+        if let Some(row) = self.items.iter_mut().rev().find(|i| shows_call(&i.kind, call)) { row.rev += 1; }
+    }
+
+    /// The subagent started by tool call `call`, wherever its card is (inside another
+    /// subagent's, for one a subagent started), its row bumped.
+    fn agent_mut(&mut self, call: &str) -> Option<&mut Agent> {
+        let row = self.items.iter_mut().rev().find(|i| matches!(&i.kind, Kind::Agents(g) if find_agent(g, call).is_some()))?;
+        row.rev += 1;
+        let Kind::Agents(g) = &mut row.kind else { return None };
+        find_agent_mut(g, call)
+    }
+}
+
+/// Whether row kind `k` shows tool call `call`: as its tool row, a subagent's card, or one of
+/// the rows inside a card.
+fn shows_call(k: &Kind, call: &str) -> bool {
+    match k {
+        Kind::Tool { call: c, .. } => c == call,
+        Kind::Agents(g) => g.iter().any(|a| a.call == call || a.items.iter().any(|i| shows_call(&i.kind, call))),
+        _ => false,
+    }
+}
+
+fn contains_item(k: &Kind, item: u64) -> bool {
+    match k {
+        Kind::Agents(g) => g.iter().any(|a| a.id == item || a.items.iter().any(|i| i.id == item || contains_item(&i.kind, item))),
+        _ => false,
+    }
+}
+
+fn find_agent<'a>(g: &'a [Agent], call: &str) -> Option<&'a Agent> {
+    g.iter().find(|a| a.call == call).or_else(|| g.iter().flat_map(|a| &a.items).find_map(|i| match &i.kind {
+        Kind::Agents(inner) => find_agent(inner, call),
+        _ => None,
+    }))
+}
+
+fn find_agent_mut<'a>(g: &'a mut [Agent], call: &str) -> Option<&'a mut Agent> {
+    if let Some(at) = g.iter().position(|a| a.call == call) { return Some(&mut g[at]); }
+    for a in g.iter_mut() {
+        for i in a.items.iter_mut() {
+            if let Kind::Agents(inner) = &mut i.kind && let Some(found) = find_agent_mut(inner, call) { return Some(found); }
+        }
+    }
+    None
+}
+
+/// The tool row for call `call` in `items`, or inside a subagent's card there.
+fn find_tool_mut<'a>(items: &'a mut [Item], call: &str) -> Option<&'a mut Item> {
+    if let Some(at) = items.iter().rposition(|i| matches!(&i.kind, Kind::Tool { call: c, .. } if c == call)) { return Some(&mut items[at]); }
+    for i in items.iter_mut().rev() {
+        if let Kind::Agents(g) = &mut i.kind {
+            for a in g.iter_mut() {
+                if let Some(found) = find_tool_mut(&mut a.items, call) { return Some(found); }
+            }
+        }
+    }
+    None
+}
+
+/// Where the current turn's rows start: after the last message sent.
+fn turn_start(items: &[Item]) -> usize {
+    items.iter().rposition(|i| matches!(i.kind, Kind::User(_))).map_or(0, |i| i + 1)
+}
+
+/// Applies one of a subagent's own events to its card's rows: text streams into its last
+/// message, tool calls become rows (a subagent it starts, a card of its own), results land on
+/// them. `fresh` is a new item id, and `fresh + 1` another for a card.
+fn add_to(items: &mut Vec<Item>, e: Event, fresh: u64) {
+    match e {
+        Event::TextDelta(d) => match items.last_mut() {
+            Some(Item { kind: Kind::Assistant { text, streaming: true }, rev, .. }) => {
+                text.push_str(&d);
+                *rev += 1;
+            }
+            _ => items.push(Item { id: fresh, rev: 0, kind: Kind::Assistant { text: d, streaming: true } }),
+        },
+        Event::Text(t) => {
+            end_stream_in(items);
+            if !t.trim().is_empty() { items.push(Item { id: fresh, rev: 0, kind: Kind::Assistant { text: t, streaming: false } }); }
+        }
+        Event::ToolStart { id: call, name, detail, body } => {
+            end_stream_in(items);
+            if find_tool_mut(items, &call).is_some() { return; }
+            if agent_tool(&name) {
+                let agent = Agent { id: fresh + 1, call, description: detail, state: ToolState::Running, output: String::new(), items: Vec::new() };
+                match items.last_mut() {
+                    Some(Item { kind: Kind::Agents(g), rev, .. }) => {
+                        g.push(agent);
+                        *rev += 1;
+                    }
+                    _ => items.push(Item { id: fresh, rev: 0, kind: Kind::Agents(vec![agent]) }),
+                }
+            } else {
+                items.push(Item { id: fresh, rev: 0, kind: Kind::Tool { call, name, detail, state: ToolState::Running, output: String::new(), body } });
+            }
+        }
+        Event::ToolEnd { id: call, ok, output } => end_call(items, &call, ok, output),
+        _ => {}
+    }
+}
+
+/// A tool call's result: on its row, or on its subagent's card.
+fn end_call(items: &mut [Item], call: &str, ok: bool, out: String) {
+    let state = if ok { ToolState::Ok } else { ToolState::Failed };
+    if let Some(row) = find_tool_mut(items, call) {
+        if let Kind::Tool { state: s, output, .. } = &mut row.kind {
+            *s = state;
+            *output = out;
+        }
+        row.rev += 1;
+        return;
+    }
+    for i in items.iter_mut().rev() {
+        if let Kind::Agents(g) = &mut i.kind && let Some(a) = find_agent_mut(g, call) {
+            a.state = state;
+            a.output = out;
+            end_stream_in(&mut a.items);
+            i.rev += 1;
+            return;
+        }
+    }
+}
+
+fn end_stream_in(items: &mut [Item]) {
+    if let Some(Item { kind: Kind::Assistant { streaming, .. }, rev, .. }) = items.last_mut()
+        && *streaming {
+            *streaming = false;
+            *rev += 1;
+        }
 }
 
 pub struct Item {
@@ -529,8 +727,168 @@ pub enum Kind {
     User(String),
     Assistant { text: String, streaming: bool },
     Tool { call: String, name: String, detail: String, state: ToolState, output: String, body: harness::ToolBody },
+    /// Subagents the agent started one after another (`Agent` tool calls): one card each,
+    /// under "N subagents" when there's more than one.
+    Agents(Vec<Agent>),
+    /// Before a turn the CLI started itself: what woke it ("Slow echo finished").
+    Wake(String),
     Error(String),
     TurnEnd { secs: f64, cost_usd: Option<f64>, stopped: bool },
+}
+
+/// A subagent the agent started (an `Agent`, formerly `Task`, tool call), with its own text and
+/// tool calls, which never go into the main conversation.
+pub struct Agent {
+    /// Its card's own id, for opening it (`App::expanded`).
+    pub id: u64,
+    pub call: String,
+    /// What the agent was asked to do, in a few words (the call's `description`).
+    pub description: String,
+    /// The call's own state and result. A background agent's call returns at once ("launched"),
+    /// so its task (`Thread::task_for`) says whether it's still working.
+    pub state: ToolState,
+    pub output: String,
+    /// Its text and tool rows, as the conversation's own are.
+    pub items: Vec<Item>,
+}
+
+/// Whether a tool call starts a subagent.
+pub fn agent_tool(name: &str) -> bool {
+    matches!(name, "Agent" | "Task")
+}
+
+/// A task the CLI runs for the conversation: a subagent or a shell command, in the foreground
+/// of a turn or in the background (Claude Code's `system/task_*` lines).
+#[derive(Clone, Debug)]
+pub struct Task {
+    pub id: String,
+    /// The tool call that started it.
+    pub call: Option<String>,
+    pub kind: TaskKind,
+    pub description: String,
+    pub subagent_type: Option<String>,
+    pub prompt: Option<String>,
+    /// The subagent that started it, if one did.
+    pub parent: Option<String>,
+    pub background: bool,
+    pub status: TaskStatus,
+    /// What it's doing now (the latest `task_progress`).
+    pub progress: Option<String>,
+    pub usage: Option<harness::TaskUsage>,
+    /// How it ended, in the CLI's words (a subagent's report, a command's exit).
+    pub summary: Option<String>,
+    pub started: Instant,
+    pub ended: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskKind {
+    Agent,
+    Command,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl TaskStatus {
+    /// The CLI's `task_updated` and `task_notification` statuses.
+    fn from_cli(s: &str) -> Option<TaskStatus> {
+        Some(match s {
+            "pending" | "running" | "paused" => TaskStatus::Running,
+            "completed" => TaskStatus::Completed,
+            "failed" => TaskStatus::Failed,
+            "killed" | "stopped" | "cancelled" => TaskStatus::Stopped,
+            _ => return None,
+        })
+    }
+}
+
+impl Task {
+    pub fn running(&self) -> bool {
+        self.status == TaskStatus::Running
+    }
+
+    /// How long it has run, or ran.
+    pub fn elapsed(&self) -> Duration {
+        self.ended.unwrap_or_else(Instant::now).saturating_duration_since(self.started)
+    }
+}
+
+/// What a subagent's card says it's doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentStatus {
+    Running,
+    /// Running in the background: the turn that started it doesn't wait for it.
+    Background,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl AgentStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentStatus::Running => "Running",
+            AgentStatus::Background => "In the background",
+            AgentStatus::Completed => "Completed",
+            AgentStatus::Failed => "Failed",
+            AgentStatus::Stopped => "Stopped",
+        }
+    }
+
+    pub fn settled(self) -> bool {
+        !matches!(self, AgentStatus::Running | AgentStatus::Background)
+    }
+}
+
+impl Agent {
+    /// Its status: its task's while there is one, else its call's.
+    pub fn status(&self, task: Option<&Task>) -> AgentStatus {
+        match task.map(|t| (t.status, t.background)) {
+            Some((TaskStatus::Running, true)) => AgentStatus::Background,
+            Some((TaskStatus::Running, false)) => AgentStatus::Running,
+            Some((TaskStatus::Completed, _)) => AgentStatus::Completed,
+            Some((TaskStatus::Failed, _)) => AgentStatus::Failed,
+            Some((TaskStatus::Stopped, _)) => AgentStatus::Stopped,
+            None => match self.state {
+                ToolState::Running => AgentStatus::Running,
+                ToolState::Ok => AgentStatus::Completed,
+                ToolState::Failed => AgentStatus::Failed,
+            },
+        }
+    }
+
+    /// Its report: the task's summary, else the call's result without the notes Claude Code
+    /// wraps it in for the model.
+    pub fn report(&self, task: Option<&Task>) -> String {
+        if let Some(s) = task.and_then(|t| t.summary.as_deref()).filter(|s| !s.trim().is_empty()) {
+            return s.trim().to_owned();
+        }
+        agent_report(&self.output)
+    }
+}
+
+/// An `Agent` call's result as the person would read it: the subagent's report, without the
+/// hand-back frame before it and the agent id and usage after it. A background agent's
+/// "launched" note isn't a report: empty.
+pub fn agent_report(output: &str) -> String {
+    if output.starts_with("Async agent launched") { return String::new(); }
+    let body = match output.find("The report follows:") {
+        Some(at) => &output[at + "The report follows:".len()..],
+        None => output,
+    };
+    let body = body.split("\nagentId: ").next().unwrap_or(body);
+    let body = body.split("<usage>").next().unwrap_or(body);
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim_start().starts_with("<tools-used-before-summary>")).collect();
+    // The hand-back indents every line of the report.
+    let indent = lines.iter().filter(|l| !l.trim().is_empty()).map(|l| l.len() - l.trim_start().len()).min().unwrap_or(0);
+    lines.iter().map(|l| l.get(indent..).unwrap_or(l.trim_start())).collect::<Vec<_>>().join("\n").trim().to_owned()
 }
 
 impl App {
@@ -626,6 +984,7 @@ impl App {
             installed,
             models,
             expanded: HashSet::new(),
+            folded: HashSet::new(),
             hud: false,
             beat: 0,
             keys: Keys::load(&prefs),
@@ -653,6 +1012,8 @@ impl App {
             merge_settled: HashSet::new(),
             settled_by_hand,
             confirm_delete: None,
+            confirm_stop: None,
+            quit_ok: false,
             confirm_trust: None,
             trusted,
             claude_trusted: None,
@@ -1495,9 +1856,11 @@ impl App {
                 } else {
                     store::load(&path)
                 };
-                for kind in kinds {
+                for mut kind in kinds {
                     fresh += 1;
-                    t.items.push(Item { id: fresh, rev: 0, kind });
+                    let id = fresh;
+                    history::number(&mut kind, &mut fresh);
+                    t.items.push(Item { id, rev: 0, kind });
                 }
             }
             self.model = t.model.clone();
@@ -1658,19 +2021,34 @@ impl App {
     /// an ordinary send.
     pub fn steer(&mut self, tx: &mut Tx) {
         match self.selected.filter(|id| self.is_running(*id)) {
-            Some(id) => {
-                let Some(q) = self.take_draft() else { return };
-                if let Some(t) = self.thread_mut(id) {
-                    t.queue.insert(0, q);
-                }
-                self.steer_queue(id);
+            // Steering restarts the CLI, which would end its background work: ask first, the
+            // draft kept.
+            Some(id) if self.background_of(id) => {
+                if !self.draft.text.trim().is_empty() || !self.attachments.is_empty() { self.confirm_stop = Some((id, StopWhat::Steer)); }
             }
+            Some(id) => self.steer_now(id),
             None => self.send(tx),
         }
     }
 
+    fn steer_now(&mut self, id: ThreadId) {
+        let Some(q) = self.take_draft() else { return };
+        if let Some(t) = self.thread_mut(id) {
+            t.queue.insert(0, q);
+        }
+        self.steer_queue(id);
+    }
+
     /// Sends queued message `qid` now: steering the running turn, or starting a turn if none runs.
     pub fn send_queued_now(&mut self, id: ThreadId, qid: u64, tx: &mut Tx) {
+        if self.background_of(id) {
+            self.confirm_stop = Some((id, StopWhat::SendNow(qid)));
+            return;
+        }
+        self.send_queued_now_anyway(id, qid, tx);
+    }
+
+    fn send_queued_now_anyway(&mut self, id: ThreadId, qid: u64, tx: &mut Tx) {
         let Some(t) = self.thread_mut(id) else { return };
         let Some(i) = t.queue.iter().position(|q| q.id == qid) else { return };
         let q = t.queue.remove(i);
@@ -1714,6 +2092,7 @@ impl App {
             format!("{}\n\nAttached: {}", q.text, names.join(", "))
         };
         t.items.push(Item { id: item, rev: 0, kind: Kind::User(shown) });
+        t.woken = false;
         t.model = q.model.clone();
         t.rev += 1;
         t.failed = false;
@@ -1780,12 +2159,74 @@ impl App {
         true
     }
 
-    /// The person stops the running turn (Esc or the stop button). The queue waits.
+    /// The person stops the running turn (Esc or the stop button). The queue waits. Stopping
+    /// ends the CLI, and with it what it runs in the background: that asks first.
     pub fn stop(&mut self, id: ThreadId) {
+        if self.background_of(id) {
+            self.confirm_stop = Some((id, StopWhat::Turn));
+            return;
+        }
+        self.stop_now(id);
+    }
+
+    fn stop_now(&mut self, id: ThreadId) {
         if let Some(r) = self.running.get(&id) {
             r.stop();
             if let Some(t) = self.thread_mut(id) { t.stop_requested = true; }
         }
+    }
+
+    /// Whether thread `id`'s CLI runs work in the background that ending it would stop.
+    pub fn background_of(&self, id: ThreadId) -> bool {
+        self.is_running(id) && self.threads.iter().any(|t| t.id == id && t.has_background())
+    }
+
+    /// Stops one of thread `id`'s tasks (a subagent or command) and nothing else.
+    pub fn stop_task(&mut self, id: ThreadId, task: &str) {
+        if let Some(r) = self.running.get(&id) { r.stop_task(task); }
+    }
+
+    /// The background line's "Stop all": asks, then stops each task.
+    pub fn ask_stop_background(&mut self, id: ThreadId) {
+        self.confirm_stop = Some((id, StopWhat::Background));
+    }
+
+    /// "Stop background work?" answered yes: does what was asked for.
+    pub fn confirm_stop(&mut self, tx: &mut Tx) {
+        let Some((id, what)) = self.confirm_stop.take() else { return };
+        match what {
+            StopWhat::Turn => self.stop_now(id),
+            StopWhat::Steer => self.steer_now(id),
+            StopWhat::SendNow(qid) => self.send_queued_now_anyway(id, qid, tx),
+            StopWhat::Background => {
+                let tasks: Vec<String> = self.threads.iter().find(|t| t.id == id).map(|t| t.background.iter().map(|b| b.id.clone()).collect()).unwrap_or_default();
+                for task in tasks { self.stop_task(id, &task); }
+            }
+            StopWhat::Quit => {
+                self.quit_ok = true;
+                self.stop_everything();
+                tx.quit();
+            }
+        }
+    }
+
+    /// The threads whose CLI is still at work: a turn, or work in the background.
+    pub fn at_work(&self) -> Vec<&Thread> {
+        self.threads.iter().filter(|t| self.is_running(t.id) || t.busy || t.has_background()).collect()
+    }
+
+    /// Quitting: asks first while any thread's CLI is at work, since quitting ends it. True if
+    /// the quit may go ahead now.
+    pub fn may_quit(&mut self) -> bool {
+        if self.quit_ok || self.at_work().is_empty() { return true; }
+        self.confirm_stop = Some((0, StopWhat::Quit));
+        false
+    }
+
+    /// Ends every CLI (the app is quitting): each one's process group, so nothing it started is
+    /// left behind writing to a closed pipe.
+    pub fn stop_everything(&mut self) {
+        for r in self.running.values() { r.stop(); }
     }
 
     /// Lands every event that arrived since the last frame, and starts queued messages whose
@@ -1833,7 +2274,7 @@ impl App {
     }
 
     pub(crate) fn apply(&mut self, id: ThreadId, e: Event) {
-        if matches!(e, Event::Ask(_) | Event::Exited { .. }) { self.wake(id); }
+        if matches!(e, Event::Ask(_) | Event::Done { .. } | Event::Exited { .. }) { self.wake(id); }
         if let Event::RateLimit(info) = &e {
             if let Some(l) = self.limits.as_mut() && l.apply_event(info) {
                 let _ = self.prefs.set(LIMITS_KEY, &l.to_json());
@@ -1848,18 +2289,22 @@ impl App {
                 let _ = self.prefs.set(CONTEXT_WINDOWS_KEY, &self.context_windows);
             }
         // A Claude turn spent from the plan and wrote to its transcript: read both again.
-        if matches!(e, Event::Exited { .. }) && self.threads.iter().any(|t| t.id == id && t.harness == Harness::Claude) {
+        if matches!(e, Event::Done { .. }) && self.threads.iter().any(|t| t.id == id && t.harness == Harness::Claude) {
             self.refresh_limits();
             self.rescan_usage();
         }
         let selected = self.selected == Some(id);
+        // Two ids: a subagent's first tool call makes a row and a card.
         let fresh = self.id();
-        let exited = matches!(e, Event::Exited { .. });
+        self.id();
+        let (done, exited) = (matches!(e, Event::Done { .. }), matches!(e, Event::Exited { .. }));
+        // The turn's diff ends with its result, though the process may live on for work in
+        // the background; or with the process, if it ended first. A turn the CLI started
+        // itself has none of its own.
+        let ends_diff = self.threads.iter().find(|t| t.id == id).is_some_and(|t| t.busy && !t.woken && (done || exited));
         self.apply_to(id, e, selected, fresh);
-        if exited {
-            self.keep(id);
-            self.end_checkpoint(id);
-        }
+        if ends_diff { self.end_checkpoint(id); }
+        if exited { self.keep(id); }
     }
 
     fn apply_to(&mut self, id: ThreadId, e: Event, selected: bool, fresh: u64) {
@@ -1868,9 +2313,21 @@ impl App {
         match e {
             Event::Session(s) => t.session = Some(s),
             Event::Model(m) => t.resolved_model = Some(m),
-            Event::Thinking | Event::RateLimit(_) => {}
+            Event::Thinking | Event::RateLimit(_) | Event::Lifecycle { .. } => {}
             Event::ContextUsed(n) => t.context = Some(n),
             Event::ContextWindow(w) => t.context_window = Some(w),
+            Event::TurnStart => {
+                if !t.busy {
+                    // A turn the CLI started itself, to report on what finished in the
+                    // background: a divider says what woke it.
+                    t.busy = true;
+                    t.woken = true;
+                    t.turn_started = Some(Instant::now());
+                    t.updated = SystemTime::now();
+                    let why = wake_reason(&std::mem::take(&mut t.woke));
+                    t.items.push(Item { id: fresh, rev: 0, kind: Kind::Wake(why) });
+                }
+            }
             Event::TextDelta(d) => match t.items.last_mut() {
                 Some(Item { kind: Kind::Assistant { text, streaming: true }, rev, .. }) => {
                     text.push_str(&d);
@@ -1882,21 +2339,31 @@ impl App {
                 end_stream(t);
                 if !s.trim().is_empty() { t.items.push(Item { id: fresh, rev: 0, kind: Kind::Assistant { text: s, streaming: false } }); }
             }
-            Event::ToolStart { id: call, name, detail, body } => {
+            Event::ToolStart { .. } => {
                 end_stream(t);
-                // An approval can arrive first and make the row itself.
-                if t.tool_row(&call).is_none() {
-                    t.items.push(Item { id: fresh, rev: 0, kind: Kind::Tool { call, name, detail, state: ToolState::Running, output: String::new(), body } });
-                }
+                // An approval can arrive first and make the row itself (call ids are only
+                // unique within a turn).
+                let turn = turn_start(&t.items);
+                let mut rows = t.items.split_off(turn);
+                add_to(&mut rows, e, fresh);
+                t.items.append(&mut rows);
+            }
+            // A subagent's own text and tool calls go on its card.
+            Event::Sub { parent, event } => {
+                if let Some(a) = t.agent_mut(&parent) { add_to(&mut a.items, *event, fresh); }
             }
             Event::Ask(ask) => {
                 end_stream(t);
                 let call = ask.tool_use_id.clone().unwrap_or_else(|| format!("ask-{}", ask.request_id));
-                let item = match t.tool_row(&call) {
-                    Some(row) => {
-                        row.rev += 1;
-                        row.id
-                    }
+                // The row can be a subagent's, inside its card (one in the background can ask
+                // after its turn).
+                let turn = turn_start(&t.items);
+                let found = match find_tool_mut(&mut t.items[turn..], &call) {
+                    Some(row) => Some(row.id),
+                    None => find_tool_mut(&mut t.items, &call).map(|row| row.id),
+                };
+                let item = match found {
+                    Some(row) => row,
                     None => {
                         let detail = harness::tool_detail(&ask.input);
                         let body = harness::tool_body(&ask.tool, &ask.input);
@@ -1904,6 +2371,7 @@ impl App {
                         fresh
                     }
                 };
+                t.bump(item);
                 let tool = ask.tool.clone();
                 t.asks.push(Pending { item, ask });
                 t.updated = SystemTime::now();
@@ -1913,17 +2381,64 @@ impl App {
             Event::AskCancelled { request_id } => {
                 if let Some(i) = t.asks.iter().position(|p| p.ask.request_id == request_id) {
                     let item = t.asks.remove(i).item;
-                    if let Some(row) = t.items.iter_mut().find(|x| x.id == item) { row.rev += 1; }
+                    t.bump(item);
                 }
             }
-            Event::ToolEnd { id: done, ok, output: out } => {
-                if let Some(item) = t.items.iter_mut().rev().find(|i| matches!(&i.kind, Kind::Tool { call, .. } if *call == done)) {
-                    if let Kind::Tool { state, output, .. } = &mut item.kind {
-                        *state = if ok { ToolState::Ok } else { ToolState::Failed };
-                        *output = out;
-                    }
-                    item.rev += 1;
+            Event::ToolEnd { id: done, ok, output } => end_call(&mut t.items, &done, ok, output),
+            Event::TaskStarted(ts) => {
+                if ts.ambient { return; }
+                let kind = match ts.kind.as_str() {
+                    "local_agent" => TaskKind::Agent,
+                    "local_bash" => TaskKind::Command,
+                    _ => TaskKind::Other,
+                };
+                if let Some(c) = &ts.call { t.bump_call(c); }
+                t.tasks.retain(|x| x.id != ts.id);
+                t.tasks.push(Task {
+                    id: ts.id, call: ts.call, kind, description: ts.description, subagent_type: ts.subagent_type, prompt: ts.prompt,
+                    parent: ts.parent_task, background: ts.background, status: TaskStatus::Running, progress: None, usage: None, summary: None,
+                    started: Instant::now(), ended: None,
+                });
+            }
+            Event::TaskProgress { id: task, description, last_tool, usage } => {
+                let Some(x) = t.tasks.iter_mut().rev().find(|x| x.id == task) else { return };
+                let what = if description.trim().is_empty() { last_tool } else { Some(description) };
+                if what.is_some() { x.progress = what; }
+                if usage.is_some() { x.usage = usage; }
+                if let Some(c) = x.call.clone() { t.bump_call(&c); }
+            }
+            Event::TaskUpdated { id: task, status, background, error } => {
+                let Some(x) = t.tasks.iter_mut().rev().find(|x| x.id == task) else { return };
+                if let Some(st) = status.as_deref().and_then(TaskStatus::from_cli) {
+                    x.status = st;
+                    if st != TaskStatus::Running { x.ended.get_or_insert_with(Instant::now); }
                 }
+                if let Some(b) = background { x.background = b; }
+                if let Some(e) = error.filter(|e| !e.trim().is_empty()) { x.summary = Some(e); }
+                if let Some(c) = x.call.clone() { t.bump_call(&c); }
+            }
+            Event::TaskDone { id: task, status, summary, usage } => {
+                let busy = t.busy;
+                let Some(x) = t.tasks.iter_mut().rev().find(|x| x.id == task) else { return };
+                x.status = TaskStatus::from_cli(&status).unwrap_or(TaskStatus::Completed);
+                x.ended.get_or_insert_with(Instant::now);
+                if !summary.trim().is_empty() { x.summary = Some(summary); }
+                if usage.is_some() { x.usage = usage; }
+                // Finished after the turn: the CLI reports on it in a turn of its own.
+                if !busy && x.parent.is_none() { let phrase = done_phrase(x); t.woke.push(phrase); }
+                let call = x.call.clone();
+                if let Some(c) = call {
+                    if let Some(a) = t.agent_mut(&c) { end_stream_in(&mut a.items); }
+                    t.bump_call(&c);
+                }
+            }
+            Event::Background(list) => {
+                t.background = list.into_iter().filter(|b| !b.ambient).collect();
+                for b in &t.background {
+                    if let Some(x) = t.tasks.iter_mut().find(|x| x.id == b.id) { x.background = true; }
+                }
+                // The last turn's end says whether work goes on.
+                if let Some(end) = t.items.iter_mut().rev().find(|i| matches!(i.kind, Kind::TurnEnd { .. })) { end.rev += 1; }
             }
             Event::Error(m) => {
                 end_stream(t);
@@ -1932,18 +2447,31 @@ impl App {
             }
             Event::Done { cost_usd, error } => {
                 end_stream(t);
+                // A process that runs several turns reports its whole cost each time.
+                let cost = cost_usd.map(|c| c - t.cost_seen.unwrap_or(0.0)).filter(|c| *c >= 0.0);
+                if cost_usd.is_some() { t.cost_seen = cost_usd; }
+                // A result held back until after the turn it belongs to had ended adds nothing.
+                if !t.busy && error.is_none() { return; }
                 if let Some(m) = error {
                     t.failed = true;
                     t.items.push(Item { id: fresh, rev: 0, kind: Kind::Error(m) });
                 }
                 let secs = t.turn_started.map_or(0.0, |s| s.elapsed().as_secs_f64());
-                let fresh2 = fresh + 1_000_000_000;
-                t.items.push(Item { id: fresh2, rev: 0, kind: Kind::TurnEnd { secs, cost_usd, stopped: false } });
+                t.items.push(Item { id: fresh + 1, rev: 0, kind: Kind::TurnEnd { secs, cost_usd: cost, stopped: false } });
+                t.busy = false;
+                t.unread = !selected;
+                t.updated = SystemTime::now();
+                // A queue that goes on once the process exits (at once, with nothing in the
+                // background) means the work isn't over.
+                let next = !t.queue.is_empty() && !t.has_background();
+                let alert = if t.failed { Alert::Failed } else { Alert::Done };
+                if !next { self.alerts.push((id, alert)); }
             }
             Event::Exited { code, stderr } => {
                 end_stream(t);
-                let ended = matches!(t.items.last(), Some(Item { kind: Kind::TurnEnd { .. }, .. }));
-                if !ended {
+                // A turn still under way when the process ended was cut short.
+                let cut = t.busy;
+                if cut {
                     let stopped = code.is_none();
                     if !stopped && code != Some(0) {
                         let msg = harness::first_line(stderr.trim().lines().last().unwrap_or(""), 400);
@@ -1952,31 +2480,79 @@ impl App {
                         t.items.push(Item { id: fresh, rev: 0, kind: Kind::Error(msg) });
                     }
                     let secs = t.turn_started.map_or(0.0, |s| s.elapsed().as_secs_f64());
-                    t.items.push(Item { id: fresh + 1_000_000_000, rev: 0, kind: Kind::TurnEnd { secs, cost_usd: None, stopped } });
+                    t.items.push(Item { id: fresh + 1, rev: 0, kind: Kind::TurnEnd { secs, cost_usd: None, stopped } });
                 }
-                // Nothing is listening for answers any more; the rows below are bumped as
-                // they fail.
+                // Nothing is listening for answers any more, and whatever the process still ran
+                // (in the background too) ended with it.
                 t.asks.clear();
-                for i in &mut t.items {
-                    if let Kind::Tool { state: s @ ToolState::Running, .. } = &mut i.kind {
-                        *s = ToolState::Failed;
-                        i.rev += 1;
-                    }
+                fail_running(&mut t.items);
+                let now = Instant::now();
+                for x in t.tasks.iter_mut().filter(|x| x.running()) {
+                    x.status = TaskStatus::Stopped;
+                    x.ended = Some(now);
                 }
+                t.background.clear();
+                t.woke.clear();
+                t.cost_seen = None;
                 t.busy = false;
-                t.unread = !selected;
+                if cut { t.unread = !selected; }
                 t.updated = SystemTime::now();
-                // Steering always sends next; otherwise the queue goes on after a turn that
-                // finished cleanly, and waits after a stop or a failure.
+                // Steering always sends next; otherwise the queue goes on after a run that
+                // ended cleanly, and waits after a stop or a failure.
                 let steering = std::mem::take(&mut t.steering);
                 let stopped_by_user = std::mem::take(&mut t.stop_requested);
                 let advance = !t.queue.is_empty() && (steering || (!stopped_by_user && code == Some(0)));
-                // A turn you stopped isn't news, and one with a queue behind it isn't over.
-                let alert = (!stopped_by_user && !advance).then_some(if t.failed { Alert::Failed } else { Alert::Done });
+                // A turn you stopped isn't news, one with a queue behind it isn't over, and one
+                // that ended with its result was told already.
+                let alert = (cut && !stopped_by_user && !advance).then_some(if t.failed { Alert::Failed } else { Alert::Done });
                 self.running.remove(&id);
                 if advance { self.ready.push(id); }
                 if let Some(a) = alert { self.alerts.push((id, a)); }
             }
+        }
+    }
+}
+
+/// What woke a turn the CLI started itself: what finished in the background.
+fn wake_reason(woke: &[String]) -> String {
+    match woke {
+        [] => "Background work finished".to_owned(),
+        [one] => one.clone(),
+        many => format!("{} background tasks finished", many.len()),
+    }
+}
+
+/// "Slow echo finished", "“cargo test” failed".
+fn done_phrase(t: &Task) -> String {
+    let name = match t.kind {
+        TaskKind::Agent => harness::first_line(&t.description, 60),
+        _ => format!("\u{201c}{}\u{201d}", harness::first_line(&t.description, 60)),
+    };
+    let verb = match t.status {
+        TaskStatus::Failed => "failed",
+        TaskStatus::Stopped => "was stopped",
+        _ => "finished",
+    };
+    format!("{name} {verb}")
+}
+
+/// Rows still running when their process ended failed, inside subagents' cards too.
+fn fail_running(items: &mut [Item]) {
+    for i in items {
+        match &mut i.kind {
+            Kind::Tool { state: s @ ToolState::Running, .. } => {
+                *s = ToolState::Failed;
+                i.rev += 1;
+            }
+            Kind::Agents(g) => {
+                for a in g.iter_mut() {
+                    if a.state == ToolState::Running { a.state = ToolState::Failed; }
+                    end_stream_in(&mut a.items);
+                    fail_running(&mut a.items);
+                }
+                i.rev += 1;
+            }
+            _ => {}
         }
     }
 }
@@ -2088,7 +2664,10 @@ pub mod scenes {
                     Kind::Assistant { text, .. } => Kind::Assistant { text: text.clone(), streaming: false },
                     Kind::Tool { call, name, detail, state, output, body } => Kind::Tool { call: format!("{n}-{call}"), name: name.clone(), detail: detail.clone(), state: *state, output: output.clone(), body: body.clone() },
                     Kind::Error(m) => Kind::Error(m.clone()),
+                    Kind::Wake(m) => Kind::Wake(m.clone()),
                     Kind::TurnEnd { secs, cost_usd, stopped } => Kind::TurnEnd { secs: *secs, cost_usd: *cost_usd, stopped: *stopped },
+                    // The demo has no subagents.
+                    Kind::Agents(_) => continue,
                 };
                 let id = s.id();
                 t.items.push(Item { id, rev: 0, kind });
@@ -2207,6 +2786,79 @@ pub mod scenes {
             reason: None,
         };
         t.asks.push(Pending { item, ask });
+    }
+
+    /// Real Claude Code 2.1.319 streams (trimmed), for the subagent and background scenes.
+    pub const SUBAGENTS: &str = include_str!("harness/fixtures/claude-subagents.jsonl");
+    pub const BACKGROUND_BASH: &str = include_str!("harness/fixtures/claude-background-bash.jsonl");
+
+    /// A new Claude thread in the demo, sent `prompt`, with the first `lines` lines of stream
+    /// `file` applied as its CLI would send them. Tasks are given the times they took.
+    pub fn play(s: &mut App, prompt: &str, file: &str, lines: usize) -> ThreadId {
+        demo(s);
+        let id = 120;
+        let mut t = Thread::new(id, harness::first_line(prompt, 60), Harness::Claude, models::DEFAULT.into());
+        t.project = PathBuf::from("/demo/api-client");
+        t.busy = true;
+        t.turn_started = Instant::now().checked_sub(Duration::from_secs(9));
+        let item = s.id();
+        t.items.push(Item { id: item, rev: 0, kind: Kind::User(prompt.into()) });
+        s.threads.insert(0, t);
+        s.selected = Some(id);
+        let mut p = harness::ParseState::default();
+        for line in file.lines().take(lines) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            for e in harness::claude::parse(&v, &mut p) { s.apply(id, e); }
+        }
+        s.alerts.clear();
+        let now = Instant::now();
+        let t = s.thread_mut(id).unwrap();
+        for (i, x) in t.tasks.iter_mut().enumerate() {
+            let took = x.usage.map_or(Duration::from_secs(14 + 3 * i as u64), |u| Duration::from_millis(u.duration_ms.max(1000)));
+            x.started = now.checked_sub(took).unwrap_or(now);
+            if x.ended.is_some() { x.ended = Some(now); }
+        }
+        id
+    }
+
+    /// Two subagents working: "Count files" done (opened, its own Bash row inside), "Slow echo"
+    /// in the background running its command.
+    pub fn agents(s: &mut App) {
+        let id = play(s, "Count the files in /tmp with one subagent, and run a slow echo in another in the background.", SUBAGENTS, 53);
+        let t = s.thread_mut(id).unwrap();
+        let first = t.items.iter().find_map(|i| match &i.kind { Kind::Agents(g) => Some(g[0].id), _ => None }).unwrap();
+        s.expanded.insert(first);
+    }
+
+    /// The turn over, "Slow echo" still at work: the turn's end says so, and above the composer
+    /// what runs in the background, with a message queued behind it.
+    pub fn background(s: &mut App) {
+        let id = play(s, "Count the files in /tmp with one subagent, and run a slow echo in another in the background.", SUBAGENTS, 70);
+        s.apply(id, Event::Done { cost_usd: Some(0.0082), error: None });
+        let q = s.id();
+        let t = s.thread_mut(id).unwrap();
+        t.queue.push(Queued { id: q, text: "Then tell me which of the two took longer.".into(), model: models::DEFAULT.into(), effort: harness::DEFAULT_EFFORT.into(), access: Access::Edits, images: Vec::new(), files: Vec::new() });
+        s.alerts.clear();
+    }
+
+    /// A background command's whole life: its call returns at once, the turn ends, and the turn
+    /// the CLI starts once it's done, after a divider saying what woke it.
+    pub fn wake(s: &mut App) {
+        play(s, "Run `sleep 25; echo BG_DONE` in the background, say STARTED, and FINISHED once it's done.", BACKGROUND_BASH, usize::MAX);
+    }
+
+    /// Steering while a subagent works in the background asks first.
+    pub fn stop_background(s: &mut App) {
+        background(s);
+        s.draft = TextEdit::new("Actually, skip the slow one");
+        s.confirm_stop = Some((120, StopWhat::Steer));
+    }
+
+    /// Quitting while threads are at work asks first.
+    pub fn quit(s: &mut App) {
+        background(s);
+        // The scenes run no CLIs: say what quitting would stop as if they did.
+        s.confirm_stop = Some((0, StopWhat::Quit));
     }
 
     /// A screenshot attached to the composer of the demo thread.

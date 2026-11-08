@@ -127,6 +127,16 @@ When Claude Code wants to run a tool your access level doesn't allow, the tool's
 
 This works the way the Claude Agent SDK talks to the CLI. The prompt goes in on stdin (`--input-format stream-json`), and `--permission-prompt-tool stdio` makes the CLI send a `can_use_tool` control request and wait for the app's `control_response`. stdin is closed after the turn's result so the CLI exits, so each turn is still one process.
 
+## Subagents and background work
+
+Claude Code threads show what subagents do, after T3 Code. Each `Agent` call is a card: a status mark (a spinner while it works, then green, red or grey for done, failed or stopped), its description, one line (what it's doing now while it runs, what it found once it's done), how many tool calls it made and how long it took. Its chevron opens what it was asked and its own messages and tool rows, drawn as the conversation's are, approvals included. Nothing a subagent says or runs goes into the main conversation. Agents launched one after another sit under **N subagents** with a count of each status ("1 running · 2 done"), which folds. A command run in the background says **In the background** on its row until it ends.
+
+Claude Code keeps running after a turn's result while work it started in the background (agents, commands) is still going, and once that's done it starts a turn of its own to report on it. The turn's end says what's still running ("1 agent still running in the background"); above the composer a line lists each task with what it's doing, how long it has run and a × that stops that one alone (the `stop_task` control request), and **Stop all**. The turn the CLI starts itself comes after a divider naming what woke it ("Slow echo finished"), with its own time and cost. stdin stays open while background work runs, so a task can still be stopped, and closes once it's all done.
+
+Nothing ends that work without asking: Stop, steering, sending a queued message now (each of which restarts the CLI), and quitting Yoke or closing its window while any thread's CLI is at work ask first, naming what would stop. Deleting the thread says so in its dialog. A message sent meanwhile waits in the queue, which says it waits for the background work. Yoke's `initialize` declares `perTaskStopAffordance` (without it, Claude Code's interrupt also kills background agents) and `forwardNestedSubagentToolCalls` (so a subagent's own subagents show their tool calls too).
+
+The parser follows Claude Code 2.1.319's stream: lines with a `parent_tool_use_id` are a subagent's; `system/task_started`, `task_progress`, `task_updated` and `task_notification` track each task; `background_tasks_changed` lists what runs in the background. Reopening a saved session reads each subagent's transcript (`<session>/subagents/agent-<id>.jsonl`) into its card, and the CLI's `<task-notification>` messages become dividers rather than messages from you. The tests replay real captures (`src/harness/fixtures/`).
+
 ## What's there
 
 - The sidebar is an inbox, after T3 Code's:
@@ -197,7 +207,7 @@ Rune runs any app headless, using the same renderer:
 
 ```sh
 cargo build
-target/debug/yoke --snap out.png --scene demo --size 1180x780 --theme light   # scenes: demo long empty picker effort settings usage queue approval attach collapsed
+target/debug/yoke --snap out.png --scene demo --size 1180x780 --theme light   # scenes: demo long empty picker effort settings usage queue approval attach collapsed agents background wake stop-background quit
 scripts/shots.sh                                              # re-renders shots/ (a scratch HOME, so none of your threads show)
 cargo test                                                    # parsers, shortcuts, queue/steer and approvals (against a stand-in claude)
 cargo test -- --ignored live_claude --nocapture               # drives the real `claude` through the UI (costs a few tokens)

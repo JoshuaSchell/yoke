@@ -1,5 +1,6 @@
 //! The window: sidebar of threads, and a main pane with the transcript over the composer.
 
+pub mod agents;
 pub mod composer;
 pub mod diff;
 pub mod hud;
@@ -113,6 +114,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
     // Files dropped anywhere in the window go to the composer.
     sidebar::delete_dialog(s, k, &mut layer);
     trust_dialog(s, k, &mut layer);
+    stop_dialog(s, k, &mut layer);
     icon_editor::dialog(s, k, &mut layer);
     rune_kit::root(window, layer)
         .on_drop_files(|s: &mut App, files: &[std::path::PathBuf], _: &mut Tx| s.attach(files))
@@ -133,6 +135,46 @@ fn trust_dialog(s: &App, k: &Kit, layer: &mut Vec<El>) {
         .child(Button::new("Trust and send").variant(ButtonVariant::Contrast).on_press_tx(|s: &mut App, tx: &mut Tx| s.trust(tx)).build(k).default_button().key("trust-confirm"));
     Dialog::new("trust", "Trust this project?").description(what).width(440.0).fit().open(true)
         .on_close(|s: &mut App| s.confirm_trust = None)
+        .child(buttons)
+        .build(k, layer);
+}
+
+/// "Stop background work?": before a stop that would end what a thread's CLI still runs in the
+/// background (or, quitting, any CLI at work), naming what stops, as T3 Code refuses to replace a
+/// process with background work. Return confirms, Esc keeps it all running.
+fn stop_dialog(s: &App, k: &Kit, layer: &mut Vec<El>) {
+    use rune_kit::{Button, ButtonVariant, Dialog};
+    use crate::app::StopWhat;
+    let Some((id, what)) = s.confirm_stop else { return };
+    let (title, description, action) = match what {
+        StopWhat::Quit => {
+            let working = s.at_work();
+            let names: Vec<String> = working.iter().take(3).map(|t| format!("\u{201c}{}\u{201d}", crate::harness::first_line(&t.title, 40))).collect();
+            let more = if working.len() > 3 { format!(" and {} more", working.len() - 3) } else { String::new() };
+            let bg: Vec<String> = working.iter().filter(|t| t.has_background()).map(|t| t.background_counts()).collect();
+            let bg = if bg.is_empty() { String::new() } else { format!(" That includes work in the background ({}).", bg.join("; ")) };
+            let n = if working.len() == 1 { "1 thread is".to_owned() } else { format!("{} threads are", working.len()) };
+            ("Quit Yoke?", format!("{n} still working: {}{more}. Quitting stops them.{bg}", names.join(", ")), "Quit")
+        }
+        _ => {
+            let Some(t) = s.threads.iter().find(|t| t.id == id) else { return };
+            let named: Vec<String> = t.background.iter().take(4).map(|b| crate::ui::agents::task_name(&b.description)).collect();
+            let more = if t.background.len() > 4 { format!(" and {} more", t.background.len() - 4) } else { String::new() };
+            let running = format!("Claude Code is still running {} in the background: {}{more}.", t.background_counts(), named.join(", "));
+            let (why, action) = match what {
+                StopWhat::Turn => ("Stopping ends the CLI, and they stop with it.", "Stop all"),
+                StopWhat::Steer => ("Steering restarts the CLI, which stops them. Queue the message instead (Return) to send it once they're done.", "Stop and steer"),
+                StopWhat::SendNow(_) => ("Sending now restarts the CLI, which stops them. Left in the queue, it goes once they're done.", "Stop and send"),
+                _ => ("What they've done so far stays.", "Stop them"),
+            };
+            ("Stop background work?", format!("{running} {why}"), action)
+        }
+    };
+    let buttons = row().key("stop-buttons").w_full().padding(16.0).gap(8.0).justify_end()
+        .child(Button::new("Cancel").variant(ButtonVariant::Ghost).on_press(|s: &mut App| s.confirm_stop = None).build(k).key("stop-cancel"))
+        .child(Button::new(action).variant(ButtonVariant::Danger).on_press_tx(|s: &mut App, tx: &mut Tx| s.confirm_stop(tx)).build(k).default_button().key("stop-confirm"));
+    Dialog::new("stop", title).description(description).width(460.0).fit().open(true)
+        .on_close(|s: &mut App| s.confirm_stop = None)
         .child(buttons)
         .build(k, layer);
 }

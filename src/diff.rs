@@ -97,7 +97,9 @@ pub fn link_turn_ends(t: &mut Thread) {
     }
     let mut bump = Vec::new();
     for c in &mut t.checkpoints {
-        let end = ends.iter().rev().find(|(p, _)| *p == c.prompt).map(|(_, id)| *id);
+        // The prompt's own turn: a turn the CLI started itself after it, to report on work
+        // in the background, ends with a row of its own.
+        let end = ends.iter().find(|(p, _)| *p == c.prompt).map(|(_, id)| *id);
         if end != c.end_item {
             c.end_item = end;
             bump.extend(end);
