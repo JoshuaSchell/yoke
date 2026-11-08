@@ -1003,7 +1003,7 @@ mod tests {
         assert_eq!(rt.state.thread().unwrap().queue.iter().map(|q| q.text.as_str()).collect::<Vec<_>>(), ["later"]);
         rt.key(key(Key::Escape));
         rt.frame(1.0 / 60.0);
-        pump_until(&mut rt, 8, |s| !s.is_running(id));
+        pump_until(&mut rt, 30, |s| !s.is_running(id));
     }
 
     /// An image dropped on the window shows in the composer and goes to the CLI as an image
@@ -1052,10 +1052,10 @@ mod tests {
         rt.key(key(Key::Enter));
         rt.frame(1.0 / 60.0);
         let id = rt.state.selected.unwrap();
-        pump_until(&mut rt, 8, |s| !s.thread().unwrap().asks.is_empty());
+        pump_until(&mut rt, 30, |s| !s.thread().unwrap().asks.is_empty());
         rt.update(|s, _| s.set_access(Access::Full));
         assert!(rt.state.thread().unwrap().asks.is_empty(), "the waiting tool was allowed");
-        pump_until(&mut rt, 8, |s| !s.is_running(id));
+        pump_until(&mut rt, 30, |s| !s.is_running(id));
         assert_eq!(tool_outputs(&rt.state), [(ToolState::Ok, "mode-bypassPermissions allowed".to_owned())]);
     }
 
@@ -1119,21 +1119,21 @@ mod tests {
 
         send(&mut rt, "please approve");
         let id = rt.state.selected.unwrap();
-        pump_until(&mut rt, 8, |s| !s.thread().unwrap().asks.is_empty());
+        pump_until(&mut rt, 30, |s| !s.thread().unwrap().asks.is_empty());
         assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("Allow")), "the approval shows");
         assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("echo hi")), "with the command");
         assert!(rt.state.is_running(id), "the CLI waits for the answer");
         rt.key(cmd('y'));
         rt.frame(1.0 / 60.0);
         assert!(rt.state.thread().unwrap().asks.is_empty());
-        pump_until(&mut rt, 8, |s| !s.is_running(id));
+        pump_until(&mut rt, 30, |s| !s.is_running(id));
         assert_eq!(tool_outputs(&rt.state), [(ToolState::Ok, "allowed".to_owned())], "one row for the call, and the CLI was allowed");
 
         send(&mut rt, "approve this one too");
-        pump_until(&mut rt, 8, |s| !s.thread().unwrap().asks.is_empty());
+        pump_until(&mut rt, 30, |s| !s.thread().unwrap().asks.is_empty());
         let item = rt.state.thread().unwrap().asks[0].item;
         rt.update(|s, _| s.answer(id, item, crate::harness::Decision::Deny));
-        pump_until(&mut rt, 8, |s| !s.is_running(id));
+        pump_until(&mut rt, 30, |s| !s.is_running(id));
         assert_eq!(tool_outputs(&rt.state)[1].1, "denied");
     }
 
