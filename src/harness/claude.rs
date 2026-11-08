@@ -43,10 +43,23 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
         }
         Some("system") if s("subtype") == Some("init") => {
             if let Some(id) = s("session_id") { out.push(Event::Session(id.into())); }
-            if let Some(m) = s("model") { out.push(Event::Model(m.into())); }
+            if let Some(m) = s("model") {
+                p.model = Some(m.to_owned());
+                out.push(Event::Model(m.into()));
+            }
         }
         Some("stream_event") => {
             let e = &v["event"];
+            // A model call's usage: when it starts, and its output once it ends. A subagent's
+            // calls (`parent_tool_use_id`) have a context of their own.
+            if v["parent_tool_use_id"].is_null() {
+                let usage = match e["type"].as_str() {
+                    Some("message_start") => Some(&e["message"]["usage"]),
+                    Some("message_delta") => Some(&e["usage"]),
+                    _ => None,
+                };
+                if let Some(n) = usage.and_then(context_tokens) { out.push(Event::ContextUsed(n)); }
+            }
             match e["type"].as_str() {
                 Some("message_start") => p.streamed_text = false,
                 Some("content_block_delta") => match e["delta"]["type"].as_str() {
@@ -98,11 +111,31 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
             let failed = v["is_error"].as_bool().unwrap_or(false) || s("subtype").is_some_and(|t| t != "success");
             let error = failed.then(|| s("result").map(str::to_owned).unwrap_or_else(|| s("subtype").unwrap_or("error").into()));
             if let Some(id) = s("session_id") { out.push(Event::Session(id.into())); }
+            if let Some(w) = context_window(&v["modelUsage"], p.model.as_deref()) { out.push(Event::ContextWindow(w)); }
             out.push(Event::Done { cost_usd: v["total_cost_usd"].as_f64(), error });
         }
         _ => {}
     }
     out
+}
+
+/// The tokens a model call's `usage` puts in the context: input, cache reads and writes, and
+/// output. `None` for a usage with none of them (a synthetic message).
+pub fn context_tokens(usage: &Value) -> Option<u64> {
+    let n: u64 = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"]
+        .iter().filter_map(|k| usage[*k].as_u64()).sum();
+    (n > 0).then_some(n)
+}
+
+/// The session model's context window from a `result`'s `modelUsage` (by model id): the entry
+/// for `model` (a `[1m]` suffix aside), else the one that read the most input, since a
+/// subagent's model may be in there too.
+fn context_window(usage: &Value, model: Option<&str>) -> Option<u64> {
+    let map = usage.as_object()?;
+    let base = |m: &str| m.split('[').next().unwrap_or(m).to_owned();
+    let entry = model.and_then(|m| map.get(m).or_else(|| map.iter().find(|(k, _)| base(k) == base(m)).map(|(_, v)| v)))
+        .or_else(|| map.values().max_by_key(|v| ["inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"].iter().filter_map(|k| v[*k].as_u64()).sum::<u64>()))?;
+    entry["contextWindow"].as_u64().filter(|w| *w > 0)
 }
 
 #[cfg(test)]
@@ -137,6 +170,22 @@ mod tests {
         let ev = run(&[r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","utilization":0.4,"resetsAt":1794108000},"session_id":"s1"}"#]);
         let [Event::RateLimit(info)] = ev.as_slice() else { panic!("{ev:?}") };
         assert_eq!(info["rateLimitType"], "five_hour");
+    }
+
+    /// Trimmed from Claude Code 2.1.319's stream for one Haiku reply.
+    #[test]
+    fn context_used_and_window() {
+        let ev = run(&[
+            r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-haiku-5-5"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":2,"cache_creation_input_tokens":9751,"cache_read_input_tokens":11382,"output_tokens":4}}},"parent_tool_use_id":null}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":900000,"output_tokens":1}}},"parent_tool_use_id":"toolu_1"}"#,
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"input_tokens":2,"cache_creation_input_tokens":9751,"cache_read_input_tokens":11382,"output_tokens":53}},"parent_tool_use_id":null}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"session_id":"s1","modelUsage":{"claude-sonnet-5-5":{"inputTokens":90000,"contextWindow":200000},"claude-haiku-5-5":{"inputTokens":2,"cacheReadInputTokens":11382,"contextWindow":1000000}}}"#,
+        ]);
+        let context: Vec<&Event> = ev.iter().filter(|e| matches!(e, Event::ContextUsed(_) | Event::ContextWindow(_))).collect();
+        assert_eq!(context, vec![&Event::ContextUsed(21139), &Event::ContextUsed(21188), &Event::ContextWindow(1_000_000)], "a subagent's call is left out, and the window is the session model's");
+        assert_eq!(context_window(&serde_json::json!({"claude-opus-5-5": {"contextWindow": 1_000_000}}), Some("claude-opus-5-5[1m]")), Some(1_000_000));
+        assert_eq!(context_window(&serde_json::json!({"a": {"inputTokens": 5, "contextWindow": 200_000}, "b": {"inputTokens": 50, "contextWindow": 400_000}}), None), Some(400_000));
     }
 
     #[test]

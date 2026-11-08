@@ -1,6 +1,6 @@
 //! What Settings stores beyond the look: the defaults a new thread starts from (harness, and
-//! each harness's model and effort, and the access level), how the prompt sends, and which
-//! of Settings' pages is showing. `ui::settings` draws the pages.
+//! each harness's model and effort, the access level, and whether it runs in a new worktree),
+//! how the prompt sends, and which of Settings' pages is showing. `ui::settings` draws the pages.
 //!
 //! A new thread (⌘N, and the first screen at launch) starts from these defaults; switching
 //! harness on the new-thread screen takes that harness's model and effort. Changing a
@@ -18,6 +18,9 @@ const HARNESS_KEY: &str = "new-thread.harness";
 const MODELS_KEY: &str = "new-thread.models";
 const EFFORTS_KEY: &str = "new-thread.efforts";
 const ACCESS_KEY: &str = "new-thread.access";
+const WORKTREE_KEY: &str = "new-thread.worktree";
+/// Before it was a setting, the composer's Local / New worktree chip was remembered here.
+const OLD_WORKTREE_KEY: &str = "composer.worktree";
 const SEND_KEY: &str = "chat.send";
 const FOLLOW_UP_KEY: &str = "chat.follow-up";
 const PEER_MESSAGES_KEY: &str = "agents.peer-messages";
@@ -117,6 +120,8 @@ pub struct Prefs {
     /// An effort per harness; missing is `harness::DEFAULT_EFFORT`.
     pub efforts: HashMap<Harness, String>,
     pub access: Access,
+    /// In a git repository, a new thread runs in a new worktree rather than the project's folder.
+    pub worktree: bool,
     pub send: SendKey,
     pub follow_up: FollowUp,
     /// Claude Code threads take messages from your other Claude Code sessions (`Turn::peer_messages`).
@@ -125,7 +130,7 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { harness: None, models: HashMap::new(), efforts: HashMap::new(), access: DEFAULT_ACCESS, send: SendKey::Return, follow_up: FollowUp::Queue, peer_messages: true }
+        Prefs { harness: None, models: HashMap::new(), efforts: HashMap::new(), access: DEFAULT_ACCESS, worktree: false, send: SendKey::Return, follow_up: FollowUp::Queue, peer_messages: true }
     }
 }
 
@@ -148,6 +153,7 @@ impl Prefs {
             models: per_harness(prefs.get(MODELS_KEY)),
             efforts: per_harness(prefs.get(EFFORTS_KEY)),
             access: prefs.get::<String>(ACCESS_KEY).and_then(|l| Access::from_label(&l)).unwrap_or(DEFAULT_ACCESS),
+            worktree: prefs.get::<bool>(WORKTREE_KEY).or_else(|| prefs.get::<bool>(OLD_WORKTREE_KEY)).unwrap_or(false),
             send: match prefs.get::<String>(SEND_KEY).as_deref() { Some("mod-return") => SendKey::ModReturn, _ => SendKey::Return },
             follow_up: match prefs.get::<String>(FOLLOW_UP_KEY).as_deref() { Some("steer") => FollowUp::Steer, _ => FollowUp::Queue },
             peer_messages: prefs.get::<bool>(PEER_MESSAGES_KEY).unwrap_or(true),
@@ -162,6 +168,8 @@ impl Prefs {
         let _ = prefs.set(MODELS_KEY, &by_harness_id(&self.models));
         let _ = prefs.set(EFFORTS_KEY, &by_harness_id(&self.efforts));
         let _ = prefs.set(ACCESS_KEY, self.access.label());
+        let _ = prefs.set(WORKTREE_KEY, &self.worktree);
+        let _ = prefs.remove(OLD_WORKTREE_KEY);
         let _ = prefs.set(SEND_KEY, self.send.id());
         let _ = prefs.set(FOLLOW_UP_KEY, self.follow_up.id());
         let _ = prefs.set(PEER_MESSAGES_KEY, &self.peer_messages);
@@ -192,6 +200,7 @@ impl App {
         self.model = self.default_model(self.harness);
         self.effort = self.default_effort(self.harness);
         self.access = self.defaults.access;
+        self.worktree_mode = self.defaults.worktree;
     }
 
     /// Whether the composer is starting a new thread, so a changed default shows there now.
@@ -229,6 +238,13 @@ impl App {
         if self.composing_new() { self.access = a; }
     }
 
+    /// Where a new thread in a git repository runs: a new worktree (`true`) or the project's folder.
+    pub fn set_default_worktree(&mut self, on: bool) {
+        self.defaults.worktree = on;
+        self.save_defaults();
+        if self.composing_new() { self.worktree_mode = on; }
+    }
+
     /// Clears every new-thread default back to the CLI's own choices.
     pub fn reset_defaults(&mut self) {
         let (send, follow_up) = (self.defaults.send, self.defaults.follow_up);
@@ -239,7 +255,7 @@ impl App {
 
     pub fn defaults_changed(&self) -> bool {
         let d = &self.defaults;
-        d.harness.is_some() || !d.models.is_empty() || !d.efforts.is_empty() || d.access != DEFAULT_ACCESS
+        d.harness.is_some() || !d.models.is_empty() || !d.efforts.is_empty() || d.access != DEFAULT_ACCESS || d.worktree
     }
 
     pub fn set_send_key(&mut self, k: SendKey) {

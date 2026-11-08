@@ -53,7 +53,7 @@ On Windows the same command builds an NSIS installer and on Linux a `.deb` and a
 - **While a turn runs**, Return **queues** the message: queued messages sit above the prompt and go in order when the turn ends. **⌘Return** (or the ↗ button on a queued message) **steers**: it stops the turn and sends the message straight away on the same session. After Esc the queue waits until you send from it. Settings › Chat › Follow-ups can make sending steer instead; the Steer key (⌘Return, or ⇧⌘Return when ⌘Return sends) then queues.
 - **⌘N** starts a new thread, **⌘O** adds a project, **⇧⌘U** shows usage and plan limits, **⇧⌘B** shows or hides the sidebar, **⇧⌘P** shows frame stats, and **⌘,** opens Settings. Settings takes over the main pane, with its pages down the left as in T3 Code; Esc, Done or picking a thread closes it. The pages:
   - **Appearance**: theme, and light, dark or the system's.
-  - **New threads**: what a new thread starts with: the agent (CLI), the access level, and each agent's model and reasoning effort. ⌘N and the first screen at launch start from these; switching agent on the new-thread screen takes that agent's; the composer can still change them before you send. Reset goes back to the CLIs' own defaults.
+  - **New threads**: what a new thread starts with: the agent (CLI), the access level, where it runs in a git repository (Local, or a New worktree), and each agent's model and reasoning effort. ⌘N and the first screen at launch start from these; switching agent on the new-thread screen takes that agent's; the composer can still change them before you send. Reset goes back to the CLIs' own defaults.
   - **Chat**: Send with (Return, or ⌘ Return for long prompts) and Follow-ups (queue or steer while a turn runs).
   - **Agents**: which CLIs were found, and how many models each reported. Look again searches once more (after installing one, say). **Messages from your other sessions** (on by default) lets your other Claude Code sessions, here or in a terminal, message a Claude Code thread here (`SendMessage`), for example to say which files they're editing. Each turn passes `--settings '{"crossSessionInbound":"accept"}'`, or `"refuse"` with the switch off. Without either, the CLI holds a message from a session in a different permission mode for an approval a thread here can't give, so the message would expire unread. A message can't give a thread more access than it has.
   - **Keyboard shortcuts** (below).
@@ -78,9 +78,12 @@ On Windows the same command builds an NSIS installer and on Linux a `.deb` and a
 
 ## Usage and plan limits
 
-The gauge in the toolbar (**⇧⌘U**), or the one in the composer while Claude Code is the harness, shows how close the Claude plan is to its limits and what Claude Code has spent, as T3 Code's usage page does.
+Two speedometers, whose needles swing as the numbers change. Hover either for the exact figures.
 
-- **Plan limits.** Each window the plan has (the 5-hour session, the week, a model's own weekly allowance such as Fable's) gets a meter: how much is used, when it resets, and a tick where even spending would be by now. "Ahead of pace" means you're spending faster than the window passes. Past 75% a meter turns amber ("Near limit"), and past 90% red. The composer's gauge shows the tightest window, and clicking it opens every meter in a popover.
+- **The composer's** shows how full the thread's **context window** is (Claude Code threads; the other CLIs don't say). It reads green, amber from 50% and red from 90%. A new thread's is at zero. The figure is the latest model call's input, cache reads and writes, and output, from the CLI's stream (a subagent's calls aside, since they have a context of their own), and for a reopened thread, the last reply in its transcript. The window's size is what Claude Code reported for the model after a turn; it's remembered per model, and until then it's taken as 1M for a `[1m]` model and 200K otherwise.
+- **The toolbar's** shows the **plan's** tightest window. A plan is there to be used, so it reads the other way: red below 50%, amber from 50% and green from 90%. Its tooltip lists every window and when each resets. Clicking it (or **⇧⌘U**) opens the Usage page, with how close the Claude plan is to its limits and what Claude Code has spent, as T3 Code's usage page does.
+
+- **Plan limits.** Each window the plan has (the 5-hour session, the week, a model's own weekly allowance such as Fable's) gets a meter: how much is used, when it resets, and a tick where even spending would be by now. "Ahead of pace" means you're spending faster than the window passes. Past 75% a meter turns amber ("Near limit"), and past 90% red.
   - The numbers come from the CLI's `get_usage` control request (what the Agent SDK's usage call and `/usage` read), sent to `claude -p --input-format stream-json` with no prompt, so no tokens are spent. It answers in about half a second.
   - They're read at launch, after every Claude Code turn, and every 5 minutes. During a turn the CLI's `rate_limit_event`s move the session and weekly meters live. The last reading is saved, so the gauge has numbers at the next launch straight away.
   - Signed in with an API key (no plan), there are no windows, and the page says so.
@@ -126,7 +129,7 @@ This works the way the Claude Agent SDK talks to the CLI. The prompt goes in on 
 - Settings › Agents counts the models each installed CLI reported. "Default" (let the CLI choose) isn't counted, and a CLI that isn't installed shows none.
 - The sidebar also lists each project's saved Claude Code sessions (`~/.claude/projects/<folder>/*.jsonl`), from the terminal or earlier runs, titled as Claude Code titles them; opening one reads its transcript, and replying resumes it.
 - Codex and OpenCode keep no history the app can read back, so Yoke saves those threads itself (`src/store.rs`) when each turn ends: they come back in their project at the next launch, and replying resumes the CLI's session. Deleting the thread deletes its file.
-- **Worktree threads**, as in T3 Code: in a git repository the composer's Local / New worktree chip picks where a new thread runs. In a worktree, the thread gets a branch of its own from the project's HEAD (`yoke/<first words of the prompt>-<id>`) in `~/.yoke/worktrees/<project>/`, so agents can change the same repository at once without touching each other's files or your checkout. The row shows the branch. Merging it back is up to you, and deleting the thread leaves the worktree and branch in place. Files git ignores (a local `.env`, `.cargo/config.toml`) aren't in a new worktree.
+- **Worktree threads**, as in T3 Code: in a git repository the composer's Local / New worktree chip picks where a new thread runs. It starts at Settings › New threads › Runs in, and a change on the chip is for that thread only. In a worktree, the thread gets a branch of its own from the project's HEAD (`yoke/<first words of the prompt>-<id>`) in `~/.yoke/worktrees/<project>/`, so agents can change the same repository at once without touching each other's files or your checkout. The row shows the branch. Merging it back is up to you, and deleting the thread leaves the worktree and branch in place. Files git ignores (a local `.env`, `.cargo/config.toml`) aren't in a new worktree.
 - Drop images (PNG, JPEG, GIF, WebP) anywhere on the window, or paste a screenshot into the prompt, to attach them. Claude Code gets them as image blocks; Codex as `--image`; OpenCode gets the paths in the prompt.
 - A transcript that streams Markdown as it arrives: code fences are syntax-coloured and tables, lists and inline code render. Text is selectable.
 - Tool calls appear as rows: icon, tool name, a one-line summary and a running/ok/failed status. Click a row to see its output.
@@ -170,7 +173,7 @@ src/ui/transcript.rs   virtualised, memoised transcript
 src/ui/composer.rs     prompt field and pickers
 src/picker.rs          the model picker's state: rail, search, favorites, keys
 src/ui/picker.rs       the model picker's chip and popover
-src/ui/usage.rs        the Usage page, the composer's gauge and its popover
+src/ui/usage.rs        the Usage page and the two gauges (context and plan)
 src/ui/hud.rs          frame stats (⇧⌘P)
 ```
 
@@ -180,7 +183,7 @@ Rune runs any app headless, using the same renderer:
 
 ```sh
 cargo build
-target/debug/yoke --snap out.png --scene demo --size 1180x780 --theme light   # scenes: demo long empty picker effort settings usage usage-popover queue approval attach collapsed
+target/debug/yoke --snap out.png --scene demo --size 1180x780 --theme light   # scenes: demo long empty picker effort settings usage queue approval attach collapsed
 scripts/shots.sh                                              # re-renders shots/ (a scratch HOME, so none of your threads show)
 cargo test                                                    # parsers, shortcuts, queue/steer and approvals (against a stand-in claude)
 cargo test -- --ignored live_claude --nocapture               # drives the real `claude` through the UI (costs a few tokens)

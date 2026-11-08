@@ -57,10 +57,11 @@ pub const LAST_PROJECT_KEY: &str = "project.last";
 /// The sidebar's projects, as folder paths in the order added, and the ones shut.
 pub const PROJECTS_KEY: &str = "projects";
 const COLLAPSED_KEY: &str = "projects.collapsed";
-/// New threads start in a worktree of their own (`worktree`).
-const WORKTREE_KEY: &str = "composer.worktree";
 /// The plan limits last read, so the gauge has numbers at launch.
 const LIMITS_KEY: &str = "usage.limits";
+/// Each Claude model's context window as Claude Code last reported it, by model id, so a
+/// thread's gauge has the right size before its first reply.
+const CONTEXT_WINDOWS_KEY: &str = "usage.context-windows";
 /// LiteLLM's Claude prices (`usage::trim_prices`) and when they were fetched (epoch seconds).
 const PRICES_KEY: &str = "usage.prices";
 const PRICES_AT_KEY: &str = "usage.prices-fetched";
@@ -143,6 +144,8 @@ pub struct App {
     /// Claude's plan limits, as last read (`harness::limits`), and why the last read failed.
     pub limits: Option<Limits>,
     pub limits_error: Option<String>,
+    /// Context windows by model id, as Claude Code reported them (`CONTEXT_WINDOWS_KEY`).
+    context_windows: HashMap<String, u64>,
     limits_rx: Option<Receiver<Result<Limits, String>>>,
     /// When the last read started, so a failing one is retried on the same beat.
     limits_asked: Option<Instant>,
@@ -207,7 +210,8 @@ pub struct App {
     sessions_tx: Sender<Listed>,
     /// Where Codex and OpenCode threads are kept (`store`); `None` in tests.
     store: Option<PathBuf>,
-    /// New threads start in a worktree of their own, where the project is a git repository.
+    /// The new thread being composed starts in a worktree of their own, where the project is a
+    /// git repository. Starts from `defaults.worktree`; the composer's chip changes it.
     pub worktree_mode: bool,
     worktrees: Receiver<(ThreadId, Result<Worktree, String>)>,
     worktrees_tx: Sender<(ThreadId, Result<Worktree, String>)>,
@@ -305,6 +309,22 @@ pub fn seed_projects(prefs: &mut Prefs) {
     let _ = prefs.set(PROJECTS_KEY, &found);
 }
 
+/// A thread's context window and how much of it is used, in tokens.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Context {
+    pub used: u64,
+    pub window: u64,
+    /// The window is the size Claude Code reported, not a guess.
+    pub measured: bool,
+}
+
+impl Context {
+    /// How full it is, 0 to 1.
+    pub fn fraction(&self) -> f64 {
+        if self.window == 0 { 0.0 } else { (self.used as f64 / self.window as f64).clamp(0.0, 1.0) }
+    }
+}
+
 pub struct Thread {
     pub id: ThreadId,
     pub title: String,
@@ -343,6 +363,10 @@ pub struct Thread {
     pub stop_requested: bool,
     /// Tools waiting for the person's approval, oldest first.
     pub asks: Vec<Pending>,
+    /// Tokens in its context after the latest model call (Claude Code), once known.
+    pub context: Option<u64>,
+    /// Its model's context window, as its last turn reported it.
+    pub context_window: Option<u64>,
 }
 
 /// A question from the CLI, shown on the row (`item`) of the tool it's about.
@@ -388,6 +412,8 @@ impl Thread {
             steering: false,
             stop_requested: false,
             asks: Vec::new(),
+            context: None,
+            context_window: None,
         }
     }
 }
@@ -464,8 +490,10 @@ impl App {
         };
         let prices = if prices.len() == 0 { usage::Prices::built_in() } else { prices };
         let usage_days = prefs.get::<u32>(USAGE_DAYS_KEY).filter(|d| USAGE_PERIODS.iter().any(|(p, _)| p == d)).unwrap_or(7);
+        let context_windows = prefs.get(CONTEXT_WINDOWS_KEY).unwrap_or_default();
         let mut app = App {
             sidebar: PaneState::new(272.0).range(200.0, 480.0),
+            context_windows,
             projects,
             current,
             threads: Vec::new(),
@@ -507,7 +535,8 @@ impl App {
             picker: crate::picker::Picker::load(&prefs),
             update: crate::updater::Updater::default(),
             store: store::dir(&prefs),
-            worktree_mode: prefs.get(WORKTREE_KEY).unwrap_or(false),
+            // `apply_defaults` sets it from Settings › New threads.
+            worktree_mode: false,
             worktrees,
             worktrees_tx,
             recording: None,
@@ -658,7 +687,7 @@ impl App {
             self.rescan_usage();
         }
         let minute = now.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() / 60);
-        let shown = self.usage_open || self.open_menu == Some("usage") || self.limits.is_some();
+        let shown = self.usage_open || self.limits.is_some();
         if shown && minute != self.usage_beat {
             self.usage_beat = minute;
             return true;
@@ -750,9 +779,10 @@ impl App {
         }
     }
 
+    /// The composer's Local / New worktree chip: for this new thread only. Settings › New
+    /// threads has the default each new thread starts from.
     pub fn toggle_worktree_mode(&mut self) {
         self.worktree_mode = !self.worktree_mode;
-        let _ = self.prefs.set(WORKTREE_KEY, &self.worktree_mode);
     }
 
     /// Writes thread `id`'s record if it's one the app keeps.
@@ -864,6 +894,18 @@ impl App {
 
     pub fn binary(&self, h: Harness) -> Option<PathBuf> {
         self.installed.iter().find(|(x, _)| *x == h).and_then(|(_, p)| p.clone())
+    }
+
+    /// How full the composer's thread's context is, for its gauge: Claude Code threads only
+    /// (the other CLIs don't say). A new thread's is empty.
+    pub fn context(&self) -> Option<Context> {
+        if self.active_harness() != Harness::Claude { return None; }
+        let t = self.thread();
+        let model = t.map_or(self.model.as_str(), |t| t.resolved_model.as_deref().unwrap_or(&t.model));
+        let known = t.and_then(|t| t.context_window).or_else(|| self.context_windows.get(model).copied());
+        // Before Claude Code has said: 1M for a `[1m]` model, else the 200K most have.
+        let window = known.unwrap_or(if model.contains("[1m]") { 1_000_000 } else { 200_000 });
+        Some(Context { used: t.and_then(|t| t.context).unwrap_or(0), window, measured: known.is_some() })
     }
 
     /// The harness the composer sends to: the thread's, else the picker's.
@@ -1149,7 +1191,16 @@ impl App {
             t.unread = false;
             t.rev += 1;
             if let Some(path) = t.saved.take() {
-                let kinds = if t.harness == Harness::Claude { history::load(&path) } else { store::load(&path) };
+                let kinds = if t.harness == Harness::Claude {
+                    let loaded = history::load(&path);
+                    if let Some((model, used)) = loaded.context {
+                        t.context = Some(used);
+                        t.resolved_model.get_or_insert(model);
+                    }
+                    loaded.rows
+                } else {
+                    store::load(&path)
+                };
                 for kind in kinds {
                     fresh += 1;
                     t.items.push(Item { id: fresh, rev: 0, kind });
@@ -1440,6 +1491,13 @@ impl App {
             }
             return;
         }
+        // Remembered for the model, so the next thread on it starts with the right size.
+        if let Event::ContextWindow(w) = e
+            && let Some(m) = self.threads.iter().find(|t| t.id == id).and_then(|t| t.resolved_model.clone())
+            && self.context_windows.get(&m) != Some(&w) {
+                self.context_windows.insert(m, w);
+                let _ = self.prefs.set(CONTEXT_WINDOWS_KEY, &self.context_windows);
+            }
         // A Claude turn spent from the plan and wrote to its transcript: read both again.
         if matches!(e, Event::Exited { .. }) && self.threads.iter().any(|t| t.id == id && t.harness == Harness::Claude) {
             self.refresh_limits();
@@ -1459,6 +1517,8 @@ impl App {
             Event::Session(s) => t.session = Some(s),
             Event::Model(m) => t.resolved_model = Some(m),
             Event::Thinking | Event::RateLimit(_) => {}
+            Event::ContextUsed(n) => t.context = Some(n),
+            Event::ContextWindow(w) => t.context_window = Some(w),
             Event::TextDelta(d) => match t.items.last_mut() {
                 Some(Item { kind: Kind::Assistant { text, streaming: true }, rev, .. }) => {
                     text.push_str(&d);
@@ -1592,6 +1652,7 @@ pub mod scenes {
         let mut t = Thread::new(100, "Add a retry with backoff to the fetch client".into(), Harness::Claude, "opus".into());
         t.resolved_model = Some("claude-opus-5-5".into());
         t.session = Some("demo".into());
+        (t.context, t.context_window) = (Some(64_300), Some(200_000));
         push(s, &mut t, Kind::User("Add a retry with exponential backoff to the fetch client, and cap it at 5 attempts.".into()));
         push(s, &mut t, Kind::Assistant { text: "I'll look at how the client is structured first.".into(), streaming: false });
         push(s, &mut t, Kind::Tool { call: "1".into(), name: "Grep".into(), detail: "fn fetch".into(), state: ToolState::Ok, output: "src/client.rs:42: pub async fn fetch(&self, req: Request)".into() });
@@ -1602,6 +1663,7 @@ pub mod scenes {
         push(s, &mut t, Kind::TurnEnd { secs: 48.3, cost_usd: Some(0.1842), stopped: false });
         let mut w = Thread::new(101, "Why is the settings window slow to open?".into(), Harness::Claude, models::DEFAULT.into());
         w.busy = true;
+        (w.context, w.context_window) = (Some(131_500), Some(200_000));
         w.turn_started = Instant::now().checked_sub(Duration::from_secs(34));
         push(s, &mut w, Kind::User("Why is the settings window slow to open?".into()));
         push(s, &mut w, Kind::Tool { call: "1".into(), name: "Bash".into(), detail: "cargo build --profile perf -p settings".into(), state: ToolState::Running, output: String::new() });
@@ -1739,12 +1801,6 @@ pub mod scenes {
         stand_in_usage(s);
         s.usage_days = 30;
         s.usage_open = true;
-    }
-
-    pub fn usage_popover(s: &mut App) {
-        demo(s);
-        stand_in_usage(s);
-        s.open_menu = Some("usage");
     }
 
     /// The working thread with two follow-ups queued and a third being typed.

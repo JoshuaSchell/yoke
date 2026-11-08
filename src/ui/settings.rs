@@ -141,6 +141,14 @@ fn new_threads(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         "What the agent may do without asking you first."
     };
     start.push(setting(k, "Access", access_help, access));
+    let places = [false, true];
+    let place = SegmentedControl::new(&["Local", "New worktree"], places.iter().position(|w| *w == s.defaults.worktree))
+        .label("Default place a new thread runs")
+        .fit()
+        .on_pick(move |s: &mut App, i: usize, _: &mut Tx| s.set_default_worktree(places[i]))
+        .build(k)
+        .key("default-worktree");
+    start.push(setting(k, "Runs in", "In a git repository: the project's folder, or a new worktree on a branch of its own, so several threads can change the code at once.", place));
 
     let mut per_harness = Vec::new();
     for h in &found {

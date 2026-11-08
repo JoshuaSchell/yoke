@@ -1,7 +1,8 @@
 //! Usage: how close the Claude plan is to its limits, and what Claude Code has spent.
 //!
-//! - The composer's gauge shows the window nearest its limit; it opens a popover with every
-//!   window, as T3 Code's usage banner does.
+//! - Two speedometers. The composer's shows how full the thread's context window is (green,
+//!   amber from half, red from 90%). The toolbar's shows the plan's tightest window, the other
+//!   way round, since a plan is there to be used. Hovering either gives the numbers.
 //! - The Usage page (⇧⌘U, or the gauge in the toolbar) takes the main pane, as Settings does:
 //!   the plan's meters, then spend at API prices from Claude Code's transcripts by day, model
 //!   and project.
@@ -13,17 +14,14 @@
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
-use rune::{El, Icon, ScrollSpec, TextStyle, Tx, col, el, icon, row, text};
-use rune_kit::{Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Popover, SegmentedControl, Spinner};
+use rune::{El, ScrollSpec, TextStyle, Tx, col, el, icon, row, text};
+use rune_kit::{Button, ButtonVariant, Kit, SegmentedControl, Spinner};
 use rune_theme_opencode::icons;
 
-use crate::app::{App, USAGE_PERIODS};
+use crate::app::{App, Context, USAGE_PERIODS};
 use crate::harness::Harness;
 use crate::harness::limits::{Limits, Window};
 use crate::usage::{self, Summary, compact, dollars};
-
-/// A gauge: an arc with a needle. For the toolbar button and the composer's chip.
-pub static GAUGE: Icon = Icon { name: "gauge", view: 20.0, body: r##"<path d="M3.6 14.6a7 7 0 1 1 12.8 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M10 11.8l3.2-3.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="11.8" r="1.4" fill="currentColor"/>"## };
 
 /// The page's reading column, as Settings'.
 const W: f32 = 720.0;
@@ -128,59 +126,96 @@ fn ago(t: SystemTime) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The composer's gauge
+// The gauges
 
-/// The chip in the composer's bar: the tightest window's fill and percentage, opening the
-/// popover. Nothing without Claude, or before the plan has been read.
-/// `compact` (a narrow composer) leaves out the little bar, keeping the gauge and the percent.
-pub fn chip(s: &App, k: &Kit, compact: bool, layer: &mut Vec<El>) -> Option<El> {
-    if s.active_harness() != Harness::Claude { return None; }
+/// Which end of a gauge is good. A context window fills toward trouble; a plan is paid for, so
+/// it's there to be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Good {
+    Low,
+    High,
+}
+
+/// A gauge's colour for `frac` (0 to 1): green, then amber from half, then red from 90%, or the
+/// other way round when high is good.
+pub fn tone(frac: f64, good: Good, k: &Kit) -> rune::Color {
+    let (low, high) = match good {
+        Good::Low => (k.c.success.icon, k.c.danger.icon),
+        Good::High => (k.c.danger.icon, k.c.success.icon),
+    };
+    if frac >= 0.9 { high } else if frac >= 0.5 { k.c.warning.icon } else { low }
+}
+
+/// The dial's sweep: 240 degrees, from lower left over the top to lower right.
+const SWEEP: f32 = std::f32::consts::PI * 4.0 / 3.0;
+
+/// A speedometer `size` points square: an arc that fills in `color` to `frac`, and a needle that
+/// swings there, springing when it changes. `None` draws an idle dial, the needle at rest.
+/// `backdrop` is what it sits on: the track is the colour mixed into it, opaque, since a
+/// translucent stroke would darken where its segments meet.
+pub fn dial(key: &str, frac: Option<f64>, color: rune::Color, needle: rune::Color, backdrop: rune::Color, size: f32) -> El {
+    let r = size * 0.4;
+    let w = (size * 0.12).max(1.5);
+    // Centred on the arc's height: from r above the hub to r/2 below it.
+    let (cx, cy) = (size / 2.0, size / 2.0 + r * 0.25);
+    let at = |t: f32, len: f32| {
+        let a = SWEEP * (t - 0.5);
+        [cx + len * a.sin(), cy - len * a.cos()]
+    };
+    let arc = |to: f32| {
+        let n = ((to * 40.0).ceil() as usize).max(1);
+        (0..=n).map(|i| at(to * i as f32 / n as f32, r)).collect::<Vec<_>>()
+    };
+    let f = frac.unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+    let track = if frac.is_some() { color.mix(backdrop, 0.8) } else { needle.mix(backdrop, 0.75) }.alpha(1.0);
+    let mut face = rune::Shape::new().stroke(arc(1.0), w, track);
+    if frac.is_some() && f > 0.0 {
+        face = face.stroke(arc(f), w, color);
+    }
+    // Drawn pointing at zero and turned to the value about the hub.
+    let hub: Vec<[f32; 2]> = (0..12).map(|i| {
+        let a = i as f32 * std::f32::consts::TAU / 12.0;
+        [cx + w * 0.95 * a.cos(), cy + w * 0.95 * a.sin()]
+    }).collect();
+    let hand = rune::Shape::new()
+        .line([cx, cy], at(0.0, r * 0.82), w * 0.85, rune::LineCap::Round, needle)
+        .fill(hub, needle);
+    let hand = rune::canvas(hand).key(format!("{key}-needle")).size(size, size).absolute(0.0, 0.0)
+        .origin(cx / size, cy / size)
+        .rotate(SWEEP * f);
+    rune::canvas(face).key(format!("{key}-dial")).size(size, size).a11y_hidden().child(hand)
+}
+
+/// "45.2K of 200K tokens (23%)".
+fn context_words(c: &Context) -> String {
+    format!("{} of {} tokens ({:.0}%)", compact(c.used), compact(c.window), c.fraction() * 100.0)
+}
+
+/// The composer's gauge: how full the thread's context window is. Claude Code threads only,
+/// since the other CLIs don't say; a new thread's is at zero. Hover for the numbers.
+pub fn context_gauge(s: &App, k: &Kit) -> Option<El> {
+    let ctx = s.context()?;
+    let c = &k.c;
+    let frac = ctx.fraction();
+    let mut help = format!("Context: {}", context_words(&ctx));
+    if !ctx.measured { help.push_str(" · the window's size is a guess until the first reply"); }
+    if frac >= 0.9 { help.push_str(" · Claude Code compacts the conversation when it fills"); }
+    Some(row().key("context-gauge").h(28.0).px(6.0).center_y().radius(8.0)
+        .label(format!("Context window: {}", context_words(&ctx)))
+        .help(help)
+        .child(dial("context", Some(frac), tone(frac, Good::Low, k), c.icon_base, c.surface_raised_base, 18.0)))
+}
+
+/// The plan's tightest window, for the toolbar's gauge, and every window's line for its tooltip.
+fn plan_reading(s: &App) -> Option<(&Window, String)> {
     let l = s.limits.as_ref().filter(|l| l.available)?;
     let w = l.tightest()?;
     let now = SystemTime::now();
-    let c = &k.c;
-    let open = s.open_menu == Some("usage");
-    let fill = fill_color(w, k);
-    let frac = (w.used / 100.0).clamp(0.0, 1.0) as f32;
-    let mini = row().w(28.0).h(4.0).radius(2.0).fill(fill.alpha(0.2)).clip_rounded(2.0)
-        .child(el().w_frac(frac).min_w(if frac > 0.0 { 4.0 } else { 0.0 }).h_full().radius(2.0).fill(fill));
-    let mut trigger = row().key("usage-chip").h(28.0).px(8.0).gap(6.0).center_y().radius(8.0)
-        .cursor(rune::Cursor::Pointer)
-        .fill(if open { c.surface_hover } else { rune::Color::TRANSPARENT })
-        .label(format!("Usage: {} {:.0}% used", w.label, w.used))
-        .help(format!("{} {:.0}% used · {}", w.label, w.used, resets(w, now).to_lowercase()))
-        .child(icon(&GAUGE, 14.0).color(c.icon_muted));
-    if !compact { trigger = trigger.child(mini); }
-    let trigger = trigger
-        .child(text(format!("{:.0}%", w.used)).font(k.ty.small.features("'tnum' 1")).color(c.text_muted));
-
-    let mut body = col().w(272.0).gap(12.0);
-    for w in &l.windows {
-        body = body.child(meter(w, now, k, true));
-    }
-    if let Some(sp) = &l.spend { body = body.child(spend_line(sp, k)); }
-    let today = s.usage.summary(usage::today(), 1).cost;
-    let week = s.usage.summary(usage::today(), 7).cost;
-    body = body.child(el().w_full().h(1.0).fill(c.border_weak))
-        .child(row().w_full().gap(8.0).center_y()
-            .child(text(format!("API value: {} today · {} this week", dollars(today), dollars(week))).font(k.ty.text_xsmall).color(c.text_faint).grow(1.0).min_w(0.0).truncate()))
-        .child(row().w_full().gap(8.0).center_y()
-            .child(text(format!("Read {}", ago(l.checked))).font(k.ty.text_xsmall).color(c.text_faint).grow(1.0))
-            .child(Button::new("Open usage")
-                .variant(ButtonVariant::Outline)
-                .control_size(ControlSize::Small)
-                .on_press(|s: &mut App| s.open_usage())
-                .build(k)
-                .key("usage-open-page")));
-    let pop = Popover::new("usage")
-        .trigger(trigger)
-        .title(format!("{} plan", plan_title(l)))
-        .child(body)
-        .open(open)
-        .on_close(|s: &mut App| s.open_menu = None)
-        .build(k, layer)
-        .on_press(|s: &mut App| s.toggle_menu("usage"));
-    Some(pop)
+    let lines: Vec<String> = l.windows.iter().map(|w| {
+        let reset = resets(w, now);
+        if reset.is_empty() { format!("{}: {:.0}% used", w.label, w.used) } else { format!("{}: {:.0}% used · {}", w.label, w.used, reset.to_lowercase()) }
+    }).collect();
+    Some((w, format!("{}\n{}", plan_title(l), lines.join("\n"))))
 }
 
 fn spend_line(sp: &crate::harness::limits::Spend, k: &Kit) -> El {
@@ -484,16 +519,29 @@ fn card(k: &Kit, rows: Vec<El>) -> El {
     c
 }
 
-/// The toolbar's Usage button.
+/// The toolbar's Usage button: a gauge of the plan's tightest window, which is there to be used,
+/// so it reads red near empty and green near full. Hover for every window; click for the page.
 pub fn toolbar_button(s: &App, k: &Kit) -> El {
+    let c = &k.c;
     let key = s.keys.label(crate::shortcuts::Cmd::Usage);
-    IconButton::new(&GAUGE)
-        .variant(IconButtonVariant::GhostMuted)
+    let reading = plan_reading(s);
+    let frac = reading.as_ref().map(|(w, _)| (w.used / 100.0).clamp(0.0, 1.0));
+    let color = frac.map_or(c.icon_muted, |f| tone(f, Good::High, k));
+    let face = dial("plan", frac, color, c.icon_muted, c.bg_base, 16.0);
+    let label = if s.usage_open { "Close Usage" } else { "Usage and plan limits" };
+    let help = match &reading {
+        Some((_, lines)) => format!("{lines}\n{label}"),
+        None => label.to_owned(),
+    };
+    Button::new(label)
+        .variant(ButtonVariant::GhostMuted)
         .expanded(s.usage_open)
-        .label(if s.usage_open { "Close Usage" } else { "Usage and plan limits" })
+        .help(help)
         .shortcut(&key)
+        .label_with(move |_, _| face)
         .on_press(|s: &mut App| if s.usage_open { s.close_usage() } else { s.open_usage() })
         .build(k)
+        .px(4.0)
         .key("usage-toggle")
 }
 

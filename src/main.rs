@@ -82,7 +82,6 @@ const SCENES: &[Scene] = &[
     ("settings-new-threads", app::scenes::settings_new_threads),
     ("settings-chat", app::scenes::settings_chat),
     ("usage", app::scenes::usage),
-    ("usage-popover", app::scenes::usage_popover),
     ("queue", app::scenes::queue),
     ("approval", app::scenes::approval),
     ("attach", app::scenes::attach),
@@ -529,26 +528,39 @@ mod tests {
         assert_eq!(rt.state.picker_summary().1, Some("Max"), "the chip shows the effort");
     }
 
-    /// The composer's gauge opens the plan's meters; "Open usage" opens the page, which
-    /// ⇧⌘U and Esc close, as does picking a thread.
+    /// The composer's gauge reads the thread's context window and the toolbar's the plan, each
+    /// with the numbers in its tooltip; the toolbar's opens the page, which ⇧⌘U and Esc close.
     #[test]
-    fn usage_gauge_popover_and_page() {
+    fn usage_gauges_and_page() {
+        use crate::ui::usage::{Good, tone};
         let mut app = new_app();
         crate::app::scenes::demo(&mut app);
         let mut rt = headless(app);
-        let (x, y) = rt.find("usage-chip").expect("the gauge shows for a Claude thread");
+        let help = |rt: &Runtime<App>, key: &str| rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).and_then(|e| e.help.clone()).unwrap_or_default();
+        let ctx = help(&rt, "context-gauge");
+        assert!(ctx.contains("64.3K of 200K tokens (32%)"), "{ctx}");
+        let plan = help(&rt, "usage-toggle");
+        assert!(plan.contains("Session: 78% used") && plan.contains("Weekly · Fable: 12% used"), "{plan}");
+        assert!(rt.find("context-needle").is_some() && rt.find("plan-needle").is_some());
+
+        // Context is good low, the plan good high.
+        let k = crate::ui::theme::kit(rt.state.theme, true);
+        assert_eq!(tone(0.2, Good::Low, k), k.c.success.icon);
+        assert_eq!(tone(0.6, Good::Low, k), k.c.warning.icon);
+        assert_eq!(tone(0.95, Good::Low, k), k.c.danger.icon);
+        assert_eq!(tone(0.2, Good::High, k), k.c.danger.icon);
+        assert_eq!(tone(0.95, Good::High, k), k.c.success.icon);
+
+        // A new thread's context is empty.
+        rt.update(|s, _| s.new_thread());
+        rt.frame(0.1);
+        assert!(help(&rt, "context-gauge").contains("0 of "), "{}", help(&rt, "context-gauge"));
+
+        let (x, y) = rt.find("usage-toggle").unwrap();
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
         rt.frame(0.2);
-        assert_eq!(rt.state.open_menu, Some("usage"));
-        assert!(rt.find("meter-session").is_some() && rt.find("meter-weekly_scoped:Fable").is_some());
-        // The popover settles beside its trigger over the next frames.
-        for i in 0..20 { rt.frame(0.2 + i as f64 / 60.0); }
-        let (bx, by) = rt.find("usage-open-page").unwrap();
-        rt.pointer_down(bx, by);
-        rt.pointer_up(bx, by);
-        rt.frame(0.4);
-        assert!(rt.state.usage_open && rt.state.open_menu.is_none());
+        assert!(rt.state.usage_open);
         assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("Spend at API prices")));
         assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("Opus 5.5")));
         rt.key(key(Key::Escape));
@@ -560,10 +572,11 @@ mod tests {
         rt.key(shift_cmd('u'));
         rt.frame(0.7);
         assert!(!rt.state.usage_open);
-        // Codex has no Claude plan to meter.
+        // Codex doesn't say how full its context is.
         rt.update(|s, _| s.select(102));
         rt.frame(0.8);
-        assert!(rt.find("usage-chip").is_none());
+        assert!(rt.find("context-gauge").is_none());
+        assert!(rt.find("usage-toggle").is_some(), "the plan's gauge stays");
     }
 
     /// The real plan and transcripts land in the app and on screen (no tokens spent):
@@ -583,7 +596,7 @@ mod tests {
         let l = rt.state.limits.clone().expect("the plan was read");
         eprintln!("after {:?}: {:?} {:?}; {} transcripts, 7 days {}", start.elapsed(), l.plan, l.windows.iter().map(|w| format!("{} {:.0}%", w.label, w.used)).collect::<Vec<_>>(),
             rt.state.usage.files, crate::usage::dollars(rt.state.usage.summary(crate::usage::today(), 7).cost));
-        assert!(rt.find("usage-chip").is_some(), "the gauge shows on the new-thread screen");
+        assert!(rt.find("context-gauge").is_some(), "the gauge shows on the new-thread screen");
         rt.key(shift_cmd('u'));
         rt.frame(0.1);
         assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("Cost by day")));
@@ -923,13 +936,18 @@ mod tests {
         app.set_default_model(Harness::Claude, &opus.label);
         app.set_default_effort(Harness::Claude, "high");
         app.set_default_access(Access::ReadOnly);
+        app.set_default_worktree(true);
         assert_eq!((app.model.as_str(), app.effort.as_str(), app.access), (opus.value.as_str(), "high", Access::ReadOnly), "the new-thread screen takes them at once");
+        assert!(app.worktree_mode);
+        app.toggle_worktree_mode();
+        assert!(!app.worktree_mode && app.defaults.worktree, "the composer's chip is for this thread only");
 
         app.model = crate::harness::models::DEFAULT.into();
         app.effort = "low".into();
         app.access = Access::Full;
         app.new_thread();
         assert_eq!((app.model.as_str(), app.effort.as_str(), app.access), (opus.value.as_str(), "high", Access::ReadOnly), "⌘N starts from the defaults");
+        assert!(app.worktree_mode, "in a new worktree again");
 
         app.set_default_harness(Harness::Codex);
         assert_eq!(app.harness, Harness::Codex);
@@ -943,11 +961,18 @@ mod tests {
         assert_eq!(again.default_model(Harness::Claude), opus.value);
         assert_eq!(again.default_effort(Harness::Claude), "high");
         assert_eq!(again.defaults.access, Access::ReadOnly);
+        assert!(again.defaults.worktree && again.worktree_mode, "the launch screen starts in a worktree too");
 
         assert!(again.defaults_changed());
         again.reset_defaults();
         assert!(!again.defaults_changed());
         assert_eq!(again.default_model(Harness::Claude), crate::harness::models::DEFAULT);
+        assert!(!again.worktree_mode);
+
+        // The chip's old remembered choice becomes the default.
+        let mut old = rune::prefs::Prefs::memory();
+        let _ = old.set("composer.worktree", &true);
+        assert!(App::new(Some(std::env::current_dir().unwrap()), old).worktree_mode);
     }
 
     /// Settings › Agents: messages from your other sessions are on by default, and the switch

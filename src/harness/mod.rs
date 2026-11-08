@@ -4,7 +4,7 @@
 //! into [`Event`]s with the harness's parser and sends them to the UI thread, waking it. Nothing
 //! here touches the UI; `poll` drains the channel.
 
-mod claude;
+pub(crate) mod claude;
 mod codex;
 pub mod limits;
 pub mod models;
@@ -233,6 +233,11 @@ pub enum Event {
     AskCancelled { request_id: String },
     /// Claude Code's `rate_limit_event`: a plan window moved (its `rate_limit_info`).
     RateLimit(serde_json::Value),
+    /// Tokens in the conversation's context as of the latest model call: its input, cache
+    /// reads and writes, and output.
+    ContextUsed(u64),
+    /// The size of the model's context window, in tokens (Claude Code's `result`).
+    ContextWindow(u64),
     /// The process exited; always the last event of a turn.
     Exited { code: Option<i32>, stderr: String },
 }
@@ -276,6 +281,8 @@ impl AskRequest {
 pub struct ParseState {
     /// Claude: whether the current message streamed text deltas (so its final copy is skipped).
     streamed_text: bool,
+    /// Claude: the session's model (`system/init`), to pick its window from `result`.
+    model: Option<String>,
     /// Lines the parser wants written back to the CLI's stdin (refusing requests we don't
     /// handle, so the CLI doesn't wait on them).
     pub(crate) replies: Vec<String>,

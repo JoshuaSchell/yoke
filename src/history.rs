@@ -148,10 +148,19 @@ fn prompt(v: &Value) -> Option<String> {
     Some(t.to_owned())
 }
 
-/// The transcript of session file `path`, as rows.
-pub fn load(path: &Path) -> Vec<Kind> {
-    let Ok(file) = std::fs::read_to_string(path) else { return Vec::new() };
+/// A saved session, as `load` reads it.
+#[derive(Default)]
+pub struct Loaded {
+    pub rows: Vec<Kind>,
+    /// The model of its last reply (`claude-opus-5-5`), and the tokens in its context then.
+    pub context: Option<(String, u64)>,
+}
+
+/// The transcript of session file `path`, as rows, and how full its context was at the end.
+pub fn load(path: &Path) -> Loaded {
+    let Ok(file) = std::fs::read_to_string(path) else { return Loaded::default() };
     let mut out: Vec<Kind> = Vec::new();
+    let mut context = None;
     for line in file.lines() {
         if !(line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"")) { continue; }
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
@@ -172,6 +181,10 @@ pub fn load(path: &Path) -> Vec<Kind> {
                 }
             }
             Some("assistant") => {
+                let model = v["message"]["model"].as_str().filter(|m| !m.starts_with('<'));
+                if let (Some(m), Some(n)) = (model, crate::harness::claude::context_tokens(&v["message"]["usage"])) {
+                    context = Some((m.to_owned(), n));
+                }
                 for b in v["message"]["content"].as_array().into_iter().flatten() {
                     match b["type"].as_str() {
                         Some("text") => {
@@ -193,7 +206,7 @@ pub fn load(path: &Path) -> Vec<Kind> {
             _ => {}
         }
     }
-    out
+    Loaded { rows: out, context }
 }
 
 #[cfg(test)]
@@ -236,7 +249,8 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":"Fix the build"},"isSidechain":false}"#,
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looking."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo build"}}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok","is_error":false}]}}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Fixed."}]}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","usage":{"input_tokens":10,"cache_read_input_tokens":90,"output_tokens":5},"content":[{"type":"text","text":"Fixed."}]}}"#,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","usage":{"input_tokens":0},"content":[]}}"#,
         ].join("\n");
         assert_eq!(title(&file).as_deref(), Some("Fix the build"));
         let titled = format!("{file}\n{}", r#"{"type":"ai-title","aiTitle":"Build fix"}"#);
@@ -245,8 +259,10 @@ mod tests {
 
         let path = std::env::temp_dir().join(format!("yoke-history-{}.jsonl", std::process::id()));
         std::fs::write(&path, &file).unwrap();
-        let rows = load(&path);
+        let loaded = load(&path);
         let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.context, Some(("claude-opus-5-5".to_owned(), 105)), "the last real reply's context");
+        let rows = loaded.rows;
         assert!(matches!(&rows[0], Kind::User(p) if p == "Fix the build"));
         assert!(matches!(&rows[2], Kind::Tool { state: ToolState::Ok, output, .. } if output == "ok"));
         assert_eq!(rows.len(), 4);

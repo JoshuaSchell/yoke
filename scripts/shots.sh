@@ -31,6 +31,5 @@ snap effort-dark effort OpenCode Dark
 snap settings-dark settings OpenCode Dark
 snap usage-dark usage OpenCode Dark
 snap usage-light usage OpenCode Light
-snap usage-popover-dark usage-popover OpenCode Dark
 snap nord-dark demo Nord Dark
 snap gruvbox-light demo Gruvbox Light

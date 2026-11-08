@@ -47,8 +47,8 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         .on_input_key(|s: &mut App, ev: &rune::KeyEvent, tx: &mut Tx| s.prompt_key(ev, tx) || shortcuts::dispatch(s, ev, tx));
     let field = rune::auto_grow(field, 2, 12);
 
-    // Narrower than this (as last laid out), the usage meter drops its bar and the model chip
-    // its effort before the pickers' labels are cut.
+    // Narrower than this (as last laid out), the model chip drops its effort before the
+    // pickers' labels are cut.
     let narrow = rune::memo::layout_with("composer", |r| r[2] < 520.0).unwrap_or(false);
     // Harness, model and effort: one chip and its popover (`ui::picker`).
     let model_pick = crate::ui::picker::view(s, k, narrow, layer);
@@ -109,8 +109,8 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
             .key("send"));
     }
 
-    // In a narrow window the pickers give way (their labels cut with "…"); the usage meter and
-    // the buttons keep their size, so send never falls outside the card.
+    // In a narrow window the pickers give way (their labels cut with "…"); the context gauge
+    // and the buttons keep their size, so send never falls outside the card.
     let mut bar = row().w_full().gap(2.0).center_y()
         .child(model_pick)
         .child(dot(k))
@@ -120,9 +120,9 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         bar = bar.child(dot(k)).child(worktree_chip(s, k));
     }
     let mut bar = bar.child(rune::el().grow(1.0));
-    // How close the Claude plan is to its limits, opening the windows' meters.
-    if let Some(chip) = crate::ui::usage::chip(s, k, narrow, layer) {
-        bar = bar.child(chip.mr(4.0));
+    // How full the thread's context window is.
+    if let Some(gauge) = crate::ui::usage::context_gauge(s, k) {
+        bar = bar.child(gauge.mr(4.0));
     }
     let bar = bar.child(actions);
 
