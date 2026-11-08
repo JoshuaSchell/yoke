@@ -83,9 +83,10 @@ pub fn on_focus(s: &mut App, focused: bool, _: &mut Tx) {
     }
 }
 
-/// Settles threads idle for `AUTO_SETTLE`, at most once a minute, and asks to be woken when
-/// the next one is due.
+/// Settles threads idle for `App::settle_after`, at most once a minute, and asks to be woken
+/// when the next one is due; and now and then looks for merged worktree branches.
 fn sweep(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
+    s.check_merged(clock);
     if clock < s.next_sweep { return false; }
     s.next_sweep = clock + SWEEP_EVERY;
     let (moved, next) = s.auto_settle();
@@ -143,6 +144,46 @@ mod tests {
         s.unsettle(5);
         s.auto_settle();
         assert_eq!(App::lane(s.threads.iter().find(|t| t.id == 5).unwrap()), Lane::Inbox);
+    }
+
+    /// Settings › Chat › Settle after: one day settles the two-day-old thread; Never none.
+    #[test]
+    fn settle_after_follows_the_setting() {
+        let mut s = app();
+        s.set_settle_after(1);
+        s.threads = vec![thread(1, 2), thread(2, 0)];
+        assert!(s.auto_settle().0);
+        assert_eq!(s.threads.iter().map(App::lane).collect::<Vec<_>>(), [Lane::Settled, Lane::Inbox]);
+        s.set_settle_after(0);
+        s.threads = vec![thread(3, 400)];
+        assert_eq!(s.auto_settle(), (false, None));
+        assert_eq!(App::lane(&s.threads[0]), Lane::Inbox);
+    }
+
+    /// A thread whose branch was merged settles, unless it's running or kept by hand; once it
+    /// does something again the same merge doesn't settle it a second time.
+    #[test]
+    fn merged_branches_settle_once() {
+        let mut s = app();
+        let in_worktree = |id: u64| {
+            let mut t = thread(id, 0);
+            t.project = std::path::PathBuf::from("/repo");
+            t.worktree = Some(crate::worktree::Worktree { path: format!("/wt/{id}").into(), branch: format!("yoke/b{id}") });
+            t
+        };
+        let mut busy = in_worktree(2);
+        busy.busy = true;
+        let mut kept = in_worktree(3);
+        kept.session = Some("s3".into());
+        s.threads = vec![in_worktree(1), busy, kept, in_worktree(4), thread(5, 0)];
+        s.settle(3);
+        s.unsettle(3);
+        let ids = |s: &App| s.merge_candidates().into_iter().map(|(id, _, _)| id).collect::<Vec<_>>();
+        assert_eq!(ids(&s), [1, 4], "idle worktree threads only, not one kept by hand");
+        s.land_merged(vec![1, 2, 3]);
+        assert_eq!(s.threads.iter().map(App::lane).collect::<Vec<_>>(), [Lane::Settled, Lane::Working, Lane::Inbox, Lane::Inbox, Lane::Inbox]);
+        s.unsettle(1);
+        assert_eq!(ids(&s), [4], "no second look at a thread its merge already settled");
     }
 
     #[test]

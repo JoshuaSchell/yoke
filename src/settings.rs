@@ -24,6 +24,22 @@ const OLD_WORKTREE_KEY: &str = "composer.worktree";
 const SEND_KEY: &str = "chat.send";
 const FOLLOW_UP_KEY: &str = "chat.follow-up";
 const PEER_MESSAGES_KEY: &str = "agents.peer-messages";
+const SETTLE_AFTER_KEY: &str = "inbox.settle-after-days";
+const SETTLE_MERGED_KEY: &str = "inbox.settle-merged";
+
+/// How many days a thread sits untouched before it settles on its own, as T3 Code's default.
+pub const SETTLE_AFTER_DAYS: u32 = 7;
+/// The choices Settings › Chat offers; 0 is never.
+pub const SETTLE_CHOICES: [u32; 6] = [1, 3, 7, 14, 30, 0];
+
+/// "7 days", "1 day", "Never".
+pub fn settle_label(days: u32) -> String {
+    match days {
+        0 => "Never".into(),
+        1 => "1 day".into(),
+        n => format!("{n} days"),
+    }
+}
 
 /// Settings' pages, in the order the rail lists them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -126,11 +142,16 @@ pub struct Prefs {
     pub follow_up: FollowUp,
     /// Claude Code threads take messages from your other Claude Code sessions (`Turn::peer_messages`).
     pub peer_messages: bool,
+    /// Days untouched before a thread settles on its own; 0 never.
+    pub settle_after: u32,
+    /// A worktree thread settles once its branch is merged, or its pull request is merged or
+    /// closed, as T3 Code's settle on merge.
+    pub settle_merged: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { harness: None, models: HashMap::new(), efforts: HashMap::new(), access: DEFAULT_ACCESS, worktree: false, send: SendKey::Return, follow_up: FollowUp::Queue, peer_messages: true }
+        Prefs { harness: None, models: HashMap::new(), efforts: HashMap::new(), access: DEFAULT_ACCESS, worktree: false, send: SendKey::Return, follow_up: FollowUp::Queue, peer_messages: true, settle_after: SETTLE_AFTER_DAYS, settle_merged: true }
     }
 }
 
@@ -157,6 +178,8 @@ impl Prefs {
             send: match prefs.get::<String>(SEND_KEY).as_deref() { Some("mod-return") => SendKey::ModReturn, _ => SendKey::Return },
             follow_up: match prefs.get::<String>(FOLLOW_UP_KEY).as_deref() { Some("steer") => FollowUp::Steer, _ => FollowUp::Queue },
             peer_messages: prefs.get::<bool>(PEER_MESSAGES_KEY).unwrap_or(true),
+            settle_after: prefs.get::<u32>(SETTLE_AFTER_KEY).filter(|d| *d <= 90).unwrap_or(SETTLE_AFTER_DAYS),
+            settle_merged: prefs.get::<bool>(SETTLE_MERGED_KEY).unwrap_or(true),
         }
     }
 
@@ -173,6 +196,8 @@ impl Prefs {
         let _ = prefs.set(SEND_KEY, self.send.id());
         let _ = prefs.set(FOLLOW_UP_KEY, self.follow_up.id());
         let _ = prefs.set(PEER_MESSAGES_KEY, &self.peer_messages);
+        let _ = prefs.set(SETTLE_AFTER_KEY, &self.settle_after);
+        let _ = prefs.set(SETTLE_MERGED_KEY, &self.settle_merged);
     }
 }
 
@@ -247,8 +272,9 @@ impl App {
 
     /// Clears every new-thread default back to the CLI's own choices.
     pub fn reset_defaults(&mut self) {
-        let (send, follow_up) = (self.defaults.send, self.defaults.follow_up);
-        self.defaults = Prefs { send, follow_up, ..Prefs::default() };
+        let d = &self.defaults;
+        let (send, follow_up, settle_after, settle_merged) = (d.send, d.follow_up, d.settle_after, d.settle_merged);
+        self.defaults = Prefs { send, follow_up, settle_after, settle_merged, ..Prefs::default() };
         self.save_defaults();
         if self.composing_new() { self.apply_defaults(); }
     }
@@ -256,6 +282,19 @@ impl App {
     pub fn defaults_changed(&self) -> bool {
         let d = &self.defaults;
         d.harness.is_some() || !d.models.is_empty() || !d.efforts.is_empty() || d.access != DEFAULT_ACCESS || d.worktree
+    }
+
+    /// Threads untouched this long settle on their own; 0 turns it off.
+    pub fn set_settle_after(&mut self, days: u32) {
+        self.defaults.settle_after = days;
+        self.save_defaults();
+        self.next_sweep = 0.0;
+    }
+
+    pub fn set_settle_merged(&mut self, on: bool) {
+        self.defaults.settle_merged = on;
+        self.save_defaults();
+        self.next_merge_check = 0.0;
     }
 
     pub fn set_send_key(&mut self, k: SendKey) {

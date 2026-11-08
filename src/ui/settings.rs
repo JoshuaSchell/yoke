@@ -12,7 +12,7 @@ use rune_theme_opencode::icons;
 use crate::app::{APPEARANCES, App};
 use crate::harness::{self, Access, Harness};
 use crate::picker::effort_label;
-use crate::settings::{FollowUp, PAGES, Page, SendKey};
+use crate::settings::{FollowUp, PAGES, Page, SETTLE_CHOICES, SendKey, settle_label};
 use crate::shortcuts::{self, Cmd};
 use crate::ui::theme::THEMES;
 
@@ -27,7 +27,7 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let body = match page {
         Page::Appearance => appearance(s, k),
         Page::NewThreads => new_threads(s, k, layer),
-        Page::Chat => chat(s, k),
+        Page::Chat => chat(s, k, layer),
         Page::Agents => agents(s, k),
         Page::Shortcuts => shortcuts_page(s, k),
         Page::Advanced => advanced(s, k),
@@ -202,7 +202,7 @@ fn new_threads(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     page
 }
 
-fn chat(s: &App, k: &Kit) -> El {
+fn chat(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let mod_return = if cfg!(target_os = "macos") { "⌘ Return" } else { "Ctrl+Return" };
     let sends = [SendKey::Return, SendKey::ModReturn];
     let send = SegmentedControl::new(&["Return", mod_return], sends.iter().position(|k| *k == s.defaults.send))
@@ -228,10 +228,37 @@ fn chat(s: &App, k: &Kit) -> El {
         FollowUp::Queue => format!("Sending while the agent works waits for the turn to end.{other}"),
         FollowUp::Steer => format!("Sending while the agent works stops the turn and sends straight away, on the same session.{other}"),
     };
-    card(k, vec![
-        setting(k, "Send with", &send_help, send),
-        setting(k, "Follow-ups", &follow_help, follow),
-    ])
+    let labels: Vec<String> = SETTLE_CHOICES.iter().map(|d| settle_label(*d)).collect();
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let after = pick("settle-after", &labels, &settle_label(s.defaults.settle_after), "Settle after", "settle-after", s)
+        .width(130.0)
+        .on_choose(|s: &mut App, v: &str, _: &mut Tx| {
+            if let Some(d) = SETTLE_CHOICES.iter().find(|d| settle_label(**d) == v) { s.set_settle_after(*d); }
+            s.open_menu = None;
+        })
+        .build(k, layer);
+    let after_help = if s.defaults.settle_after == 0 {
+        "Threads stay in the inbox until you settle them (⇧⌘S, or ✓ on the row).".to_owned()
+    } else {
+        format!("A thread nobody has touched for {} moves to Settled. Not one that's running, asking, holding a queue, or you moved back by hand.", settle_label(s.defaults.settle_after))
+    };
+    let merged = Switch::new(s.defaults.settle_merged)
+        .hide_label()
+        .label("Settle when merged")
+        .on_toggle(|s: &mut App| s.set_settle_merged(!s.defaults.settle_merged))
+        .build(k)
+        .key("settle-merged");
+    let merged_help = "A worktree thread moves to Settled once main has its branch's commits, or its pull request is merged or closed (looked up with gh, if it's installed and signed in). Checked every few minutes.";
+    col().w_full().gap(12.0)
+        .child(card(k, vec![
+            setting(k, "Send with", &send_help, send),
+            setting(k, "Follow-ups", &follow_help, follow),
+        ]))
+        .child(section_title(k, "Settling", Some("Threads leave the inbox for the Settled shelf on their own, as in T3 Code. Anything they do brings them back.")))
+        .child(card(k, vec![
+            setting(k, "Settle after", &after_help, after),
+            setting(k, "Settle when merged", merged_help, merged),
+        ]))
 }
 
 fn agents(s: &App, k: &Kit) -> El {

@@ -44,8 +44,8 @@ pub fn migrate_from_rune_code() {
     }
 }
 
-/// A thread nobody has touched for this long settles on its own (T3 Code's default).
-pub const AUTO_SETTLE: Duration = Duration::from_secs(7 * 24 * 3600);
+/// How often worktree threads' branches are looked at for a merge, at most.
+pub const MERGE_CHECK_EVERY: f64 = 300.0;
 /// How many settled threads the shelf lists before "Show more".
 pub const SETTLED_PAGE: usize = 30;
 const SETTLED_KEY: &str = "settled";
@@ -196,8 +196,16 @@ pub struct App {
     pub unseen: usize,
     /// When `attention::sweep` next looks for threads to settle, on `poll`'s clock.
     pub next_sweep: f64,
+    /// When it next looks for merged worktree branches, and whether a look is under way.
+    pub next_merge_check: f64,
+    merge_checking: bool,
+    merged: Receiver<Vec<ThreadId>>,
+    merged_tx: Sender<Vec<ThreadId>>,
+    /// Threads settled because their branch was merged, so that coming back to the inbox
+    /// (doing something) isn't undone by the same merge.
+    merge_settled: HashSet<ThreadId>,
     /// Settled (true) or kept in the inbox (false) by hand, by session id, so the choice
-    /// outlives the app and beats `AUTO_SETTLE`.
+    /// outlives the app and beats settling on its own.
     settled_by_hand: HashMap<String, bool>,
     /// The thread the delete dialog asks about (the row's ✕, or ⇧⌘⌫).
     pub confirm_delete: Option<ThreadId>,
@@ -448,6 +456,7 @@ impl App {
         let (discover_tx, discovered) = channel();
         let (sessions_tx, sessions) = channel();
         let (worktrees_tx, worktrees) = channel();
+        let (merged_tx, merged) = channel();
         let installed = harness::detect();
         let harness = installed.iter().find(|(_, p)| p.is_some()).map_or(Harness::Claude, |(h, _)| *h);
         let mut projects: Vec<Project> = prefs.get::<Vec<String>>(PROJECTS_KEY).unwrap_or_default().into_iter()
@@ -547,6 +556,11 @@ impl App {
             alerts: Vec::new(),
             unseen: 0,
             next_sweep: 0.0,
+            next_merge_check: 0.0,
+            merge_checking: false,
+            merged,
+            merged_tx,
+            merge_settled: HashSet::new(),
             settled_by_hand,
             confirm_delete: None,
             claude_home: if cfg!(test) { None } else { history::claude_home() },
@@ -740,7 +754,7 @@ impl App {
             if self.threads.iter().any(|t| t.harness == x.harness && t.session.as_deref() == Some(x.session.as_str())) { continue; }
             let id = self.id();
             let mut t = Thread::new(id, x.title, x.harness, x.model);
-            let idle = x.modified.elapsed().is_ok_and(|d| d >= AUTO_SETTLE);
+            let idle = self.settle_after().is_some_and(|after| x.modified.elapsed().is_ok_and(|d| d >= after));
             t.settled = self.settled_by_hand.get(&x.session).copied().unwrap_or(idle);
             // A Claude thread's transcript is Claude Code's session file, kept under the
             // worktree's folder; others are in the record.
@@ -797,7 +811,7 @@ impl App {
             if self.threads.iter().any(|t| t.session.as_deref() == Some(x.id.as_str())) { continue; }
             let id = self.id();
             let mut t = Thread::new(id, x.title, Harness::Claude, models::DEFAULT.into());
-            let idle = x.modified.elapsed().is_ok_and(|d| d >= AUTO_SETTLE);
+            let idle = self.settle_after().is_some_and(|after| x.modified.elapsed().is_ok_and(|d| d >= after));
             t.settled = self.settled_by_hand.get(&x.id).copied().unwrap_or(idle);
             t.session = Some(x.id);
             t.project = project.to_owned();
@@ -1107,27 +1121,92 @@ impl App {
         true
     }
 
-    /// Settles every thread nobody has touched for `AUTO_SETTLE`, as T3 Code does: not one
-    /// running, asking, holding a queue, or kept in the inbox by hand. The automatic move
-    /// isn't saved as a choice. Returns whether any moved, and when the next one is due.
+    /// How long a thread sits untouched before it settles on its own (Settings › Chat), or
+    /// `None` when it never does.
+    pub fn settle_after(&self) -> Option<Duration> {
+        let days = self.defaults.settle_after;
+        (days > 0).then(|| Duration::from_secs(u64::from(days) * 24 * 3600))
+    }
+
+    /// Whether thread `t` may settle on its own: not settled, running, asking or holding a
+    /// queue, and not kept in the inbox by hand.
+    fn may_auto_settle(&self, t: &Thread) -> bool {
+        let kept = t.session.as_ref().is_some_and(|s| self.settled_by_hand.get(s) == Some(&false));
+        !t.settled && !t.busy && t.asks.is_empty() && t.queue.is_empty() && !kept
+    }
+
+    /// Settles every thread nobody has touched for `settle_after`, as T3 Code does, that may
+    /// (`may_auto_settle`). The automatic move isn't saved as a choice. Returns whether any
+    /// moved, and when the next one is due.
     pub fn auto_settle(&mut self) -> (bool, Option<Duration>) {
-        let kept = |t: &Thread, by_hand: &HashMap<String, bool>| t.session.as_ref().is_some_and(|s| by_hand.get(s) == Some(&false));
+        let Some(after) = self.settle_after() else { return (false, None) };
         let mut moved = false;
         let mut next: Option<Duration> = None;
-        for t in &mut self.threads {
-            if t.settled || t.busy || !t.asks.is_empty() || !t.queue.is_empty() || kept(t, &self.settled_by_hand) { continue; }
-            let idle = t.updated.elapsed().unwrap_or_default();
-            if idle >= AUTO_SETTLE {
+        let due: Vec<(usize, Duration)> = self.threads.iter().enumerate()
+            .filter(|(_, t)| self.may_auto_settle(t))
+            .map(|(i, t)| (i, t.updated.elapsed().unwrap_or_default()))
+            .collect();
+        for (i, idle) in due {
+            if idle >= after {
+                let t = &mut self.threads[i];
                 t.settled = true;
                 t.unread = false;
                 t.rev += 1;
                 moved = true;
             } else {
-                let due = AUTO_SETTLE - idle;
-                next = Some(next.map_or(due, |n| n.min(due)));
+                let left = after - idle;
+                next = Some(next.map_or(left, |n| n.min(left)));
             }
         }
         (moved, next)
+    }
+
+    /// Looks, off the UI thread, for worktree threads whose branch has been merged into the
+    /// default branch, or whose pull request was merged or closed (with `gh`, if it's there),
+    /// as T3 Code settles on merge. At most every `MERGE_CHECK_EVERY` on `poll`'s clock, and
+    /// only while Settings › Chat says so. `land_merged` settles them.
+    pub fn check_merged(&mut self, clock: f64) {
+        if !self.defaults.settle_merged || self.merge_checking || clock < self.next_merge_check { return; }
+        self.next_merge_check = clock + MERGE_CHECK_EVERY;
+        let look = self.merge_candidates();
+        if look.is_empty() { return; }
+        self.merge_checking = true;
+        let (tx, wake) = (self.merged_tx.clone(), self.waker.clone());
+        std::thread::spawn(move || {
+            let gh = harness::find("gh");
+            let merged = look.into_iter()
+                .filter(|(_, project, branch)| worktree::branch_merged(project, branch)
+                    || gh.as_deref().is_some_and(|gh| worktree::pull_request_done(gh, project, branch)))
+                .map(|(id, _, _)| id)
+                .collect();
+            let _ = tx.send(merged);
+            if let Some(w) = wake { w(); }
+        });
+    }
+
+    /// The worktree threads `check_merged` looks at: (thread, project, branch).
+    pub(crate) fn merge_candidates(&self) -> Vec<(ThreadId, PathBuf, String)> {
+        self.threads.iter()
+            .filter(|t| self.may_auto_settle(t) && !self.merge_settled.contains(&t.id))
+            .filter_map(|t| Some((t.id, t.project.clone(), t.worktree.as_ref()?.branch.clone())))
+            .filter(|(_, project, _)| !project.as_os_str().is_empty())
+            .collect()
+    }
+
+    /// Settles the threads `check_merged` found merged, if they still may. Not saved as a
+    /// choice, as with `auto_settle`.
+    pub(crate) fn land_merged(&mut self, ids: Vec<ThreadId>) {
+        self.merge_checking = false;
+        for id in ids {
+            let ok = self.threads.iter().find(|t| t.id == id).is_some_and(|t| self.may_auto_settle(t));
+            if !ok { continue; }
+            self.merge_settled.insert(id);
+            if let Some(t) = self.thread_mut(id) {
+                t.settled = true;
+                t.unread = false;
+                t.rev += 1;
+            }
+        }
     }
 
     /// Back to the inbox from the Settled shelf.
@@ -1153,7 +1232,7 @@ impl App {
     }
 
     /// A thread doing something comes back to the inbox. The automatic return isn't saved as
-    /// a choice: the activity itself keeps it fresh past `AUTO_SETTLE`.
+    /// a choice: the activity itself keeps it fresh past `settle_after`.
     fn wake(&mut self, id: ThreadId) {
         let Some(t) = self.thread_mut(id).filter(|t| t.settled) else { return };
         t.settled = false;
@@ -1437,6 +1516,10 @@ impl App {
         while let Ok((h, list)) = self.discovered.try_recv() {
             changed = true;
             self.land_models(h, list);
+        }
+        while let Ok(ids) = self.merged.try_recv() {
+            changed = true;
+            self.land_merged(ids);
         }
         while let Ok((id, made)) = self.worktrees.try_recv() {
             changed = true;

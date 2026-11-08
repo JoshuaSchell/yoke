@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <!-- Horns: one bar across the brow, turned up square at each end. -->
-  <path fill="#EFE7D8" d="M180 180 H260 V260 H764 V180 H844 V340 H180 Z"/>
-  <!-- Ears, held out level under the horns. -->
-  <path fill="#C4935F" d="M232 372 H352 V430 H232 Z M672 372 H792 V430 H672 Z"/>
-  <!-- Head, chamfered toward the muzzle. -->
-  <path fill="#C4935F" d="M352 260 H672 V620 L665 664 H359 L352 620 Z"/>
-  <!-- Muzzle. -->
-  <path fill="#EFE7D8" d="M359 664 H665 L632 880 H392 Z"/>
-  <!-- Eyes and nostrils, cut through to the black. -->
-  <path fill="#000000" d="M406 424 H470 V488 H406 Z M554 424 H618 V488 H554 Z M436 760 H474 V826 H436 Z M550 760 H588 V826 H550 Z"/>
+  <defs><linearGradient id="w" x1="0" y1="170" x2="0" y2="830" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#C9CBD1"/></linearGradient></defs>
+  <g fill="url(#w)">
+    <path d="M440 366 C356 344 288 270 254 194 C238 158 186 164 192 210 C206 332 304 424 440 440 Z"/>
+    <path d="M584 366 C668 344 736 270 770 194 C786 158 838 164 832 210 C818 332 720 424 584 440 Z"/>
+    <ellipse cx="262" cy="458" rx="96" ry="52" transform="rotate(-18 262 458)"/>
+    <ellipse cx="762" cy="458" rx="96" ry="52" transform="rotate(18 762 458)"/>
+    <path d="M512 316 C644 316 728 384 728 494 C728 584 694 644 654 690 L370 690 C330 644 296 584 296 494 C296 384 380 316 512 316 Z"/>
+    <ellipse cx="512" cy="694" rx="200" ry="130"/>
+  </g>
 </svg>

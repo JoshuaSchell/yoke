@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Renders assets/Yoke.icon (an Icon Composer document: a flat, blocky ox's head on black, no glass)
+# Renders assets/Yoke.icon (an Icon Composer document: a white glass ox's head on black)
 # into the app icons cargo-packager and the app use:
 #   icon.icns (macOS bundle), icon.png (1024, Linux), icon-256.png (embedded, runtime),
 #   icon.ico (Windows installer and exe).

@@ -380,15 +380,22 @@ fn write_line(stdin: &Mutex<Option<ChildStdin>>, line: &str) -> bool {
 /// Where each harness's binary is, if installed. Looks on PATH and in the usual install spots,
 /// since a GUI app launched from Finder doesn't get the shell's PATH.
 pub fn detect() -> Vec<(Harness, Option<PathBuf>)> {
+    ALL.into_iter().map(|h| (h, find(h.binary()))).collect()
+}
+
+/// Where a command-line tool is: on PATH, or where installers put them, since an app opened
+/// from Finder gets a short PATH.
+pub fn find(name: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
-    for extra in [".local/bin", ".claude/local", ".bun/bin", ".npm-global/bin", ".opencode/bin", ".cargo/bin"] {
+    for extra in [".local/bin", ".claude/local", ".bun/bin", ".npm-global/bin", ".opencode/bin", ".cargo/bin", ".nix-profile/bin"] {
         dirs.push(home.join(extra));
     }
-    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
-    ALL.into_iter()
-        .map(|h| (h, dirs.iter().map(|d| d.join(h.binary())).find(|p| p.is_file())))
-        .collect()
+    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/run/current-system/sw/bin", "/nix/var/nix/profiles/default/bin"].map(PathBuf::from));
+    if let Some(user) = std::env::var_os("USER") {
+        dirs.push(PathBuf::from("/etc/profiles/per-user").join(user).join("bin"));
+    }
+    dirs.iter().map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 /// Starts `turn`, sending `(tag, event)` to `tx` and waking the UI after each batch.
