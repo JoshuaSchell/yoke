@@ -468,6 +468,9 @@ mod tests {
     #[test]
     fn model_picker() {
         let mut app = new_app();
+        // As if Claude Code were installed, so this runs where it isn't (CI).
+        app.installed.retain(|(h, _)| *h != Harness::Claude);
+        app.installed.push((Harness::Claude, Some("/usr/bin/true".into())));
         app.choose_harness(Harness::Claude);
         app.models.insert(Harness::Claude, crate::harness::models::fallback(Harness::Claude));
         let mut rt = headless(app);

@@ -1,0 +1,50 @@
+# Builds Yoke for Apple silicon and publishes it.
+#
+# - A tag like v0.2.0 (matching Cargo.toml's version) tests, packages the .dmg and publishes a
+#   GitHub Release with it attached.
+# - Run by hand (Actions › Release › Run workflow), it builds the .dmg as a workflow artifact
+#   and publishes nothing: a dry run.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (the version rust-toolchain.toml pins)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: The tag matches Cargo.toml's version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml's version $version"
+            exit 1
+          fi
+      - run: cargo test --locked
+      - name: cargo-packager
+        run: cargo install cargo-packager --locked --version 0.11.8
+      - name: Package (Yoke.app and the .dmg, ad-hoc signed)
+        run: cargo packager --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Yoke-macos-aarch64
+          path: target/release/*.dmg
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" target/release/*.dmg \
+            --title "Yoke ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --notes "For Apple silicon Macs. Open the .dmg and drag Yoke to Applications. Yoke isn't notarized yet, so the first time, right-click it and choose Open."

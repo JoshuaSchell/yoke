@@ -26,6 +26,14 @@ cargo run --release -- ~/code/app   # or adds and opens a project folder
 
 The sidebar lists every project, as T3 Code does, each with its threads under its name. **⌘O** (or the + beside Projects) adds a project, the + on a project starts a thread in it, and the × under the pointer takes it out of the sidebar (its folder and saved sessions stay). On the first launch, the folders Claude Code has sessions in become the projects, temporary folders aside. Where the app is started from doesn't matter: it opens the project used last.
 
+## Install
+
+Download the `.dmg` from [Releases](https://github.com/JoshuaSchell/yoke/releases) (Apple silicon), open it and drag Yoke to Applications. It isn't notarized yet, so the first time, right-click it and choose Open.
+
+## Release
+
+Bump `version` in `Cargo.toml`, commit, then tag and push: `git tag v0.2.0 && git push origin v0.2.0`. The Release workflow (`.github/workflows/release.yml`) tests, packages and publishes a GitHub Release with the `.dmg`. Run it by hand from the Actions tab for a dry run that only builds the `.dmg`. The CI workflow runs the tests on every push to `main`.
+
 ## Package
 
 ```sh
