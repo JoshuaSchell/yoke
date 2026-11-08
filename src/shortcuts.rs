@@ -59,9 +59,6 @@ pub const ALL: [Cmd; 19] = [
     Cmd::AccessMenu,
 ];
 
-/// Keys the prompt field owns, listed in Settings but not rebindable.
-pub const FIXED: [(&str, &str); 2] = [("Send, or queue while a turn runs", "↩"), ("New line", "⇧↩")];
-
 impl Cmd {
     pub fn id(self) -> &'static str {
         match self {
@@ -101,7 +98,7 @@ impl Cmd {
             Cmd::SettleThread => "Settle thread and go to the next",
             Cmd::DeleteThread => "Delete thread",
             Cmd::Stop => "Stop the running turn",
-            Cmd::Steer => "Steer: send into the running turn now",
+            Cmd::Steer => "Steer: send into the running turn now (or queue, if sending steers)",
             Cmd::Allow => "Allow the waiting tool",
             Cmd::AlwaysAllow => "Always allow the waiting tool",
             Cmd::HarnessMenu => "Choose harness",
@@ -290,9 +287,10 @@ pub fn run(s: &mut App, c: Cmd, tx: &mut Tx) -> bool {
             let Some(id) = s.selected.filter(|id| s.is_running(*id)) else { return false };
             s.stop(id);
         }
+        // Steer, or queue when Settings › Chat makes sending steer.
         Cmd::Steer => {
             if s.draft.text.trim().is_empty() { return false; }
-            s.steer(tx);
+            s.submit_other(tx);
         }
         Cmd::Allow => return s.answer_first(Decision::Allow),
         Cmd::AlwaysAllow => return s.answer_first(Decision::AlwaysAllow),

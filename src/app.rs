@@ -93,6 +93,10 @@ pub struct App {
     pub picker: crate::picker::Picker,
     /// Settings (⌘,) fills the main pane instead of the thread.
     pub settings: bool,
+    /// The page Settings shows.
+    pub settings_page: crate::settings::Page,
+    /// What a new thread starts with, and how the prompt sends (`settings`).
+    pub defaults: crate::settings::Prefs,
     /// The Usage page (⇧⌘U) fills it the same way.
     pub usage_open: bool,
     /// Its period, in days (`USAGE_PERIODS`).
@@ -362,7 +366,7 @@ impl App {
         };
         let prices = if prices.len() == 0 { usage::Prices::built_in() } else { prices };
         let usage_days = prefs.get::<u32>(USAGE_DAYS_KEY).filter(|d| USAGE_PERIODS.iter().any(|(p, _)| p == d)).unwrap_or(7);
-        App {
+        let mut app = App {
             sidebar: PaneState::new(272.0).range(200.0, 480.0),
             project: Project { name, path: project },
             threads: Vec::new(),
@@ -374,6 +378,8 @@ impl App {
             access: Access::Edits,
             open_menu: None,
             settings: false,
+            settings_page: crate::settings::Page::default(),
+            defaults: crate::settings::Prefs::load(&prefs),
             usage_open: false,
             usage_days,
             limits,
@@ -419,7 +425,9 @@ impl App {
             running: HashMap::new(),
             ready: Vec::new(),
             next_id: 1,
-        }
+        };
+        app.apply_defaults();
+        app
     }
 
     /// Called once the window exists: keeps the waker, asks each installed CLI for its models,
@@ -727,10 +735,12 @@ impl App {
         true
     }
 
+    /// ⌘N: the new-thread screen, with the composer back on the new-thread defaults.
     pub fn new_thread(&mut self) {
         self.close_settings();
         self.usage_open = false;
         self.selected = None;
+        self.apply_defaults();
         self.draft.focused = true;
         self.open_menu = None;
     }
@@ -919,10 +929,11 @@ impl App {
         if self.selected == Some(id) { self.selected = None; }
     }
 
+    /// Switches the new-thread composer to `h`, with its default model and effort.
     pub fn choose_harness(&mut self, h: Harness) {
         self.harness = h;
-        self.model = models::DEFAULT.into();
-        if !h.efforts().contains(&self.effort.as_str()) { self.effort = harness::DEFAULT_EFFORT.into(); }
+        self.model = self.default_model(h);
+        self.effort = self.default_effort(h);
     }
 
     /// The draft with the composer's current choices, emptying the composer. `None` if blank.
@@ -1345,6 +1356,19 @@ pub mod scenes {
     pub fn settings(s: &mut App) {
         demo(s);
         s.settings = true;
+    }
+
+    /// Settings › New threads, with Claude Code set to start on Opus at high effort.
+    pub fn settings_new_threads(s: &mut App) {
+        settings(s);
+        s.settings_page = crate::settings::Page::NewThreads;
+        s.defaults.models.insert(Harness::Claude, "opus".into());
+        s.defaults.efforts.insert(Harness::Claude, "high".into());
+    }
+
+    pub fn settings_chat(s: &mut App) {
+        settings(s);
+        s.settings_page = crate::settings::Page::Chat;
     }
 
     /// A Max plan part-way through its session, and 90 days of made-up spend, held still: the

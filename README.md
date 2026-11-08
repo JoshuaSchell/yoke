@@ -33,9 +33,15 @@ cargo packager --release                # target/release/Rune Code.app and Rune 
 
 On Windows the same command builds an NSIS installer and on Linux a `.deb` and an `.AppImage` (untested so far). The config is `[package.metadata.packager]` in `Cargo.toml`. The macOS bundle is ad-hoc signed, with no Apple account: copied from the `.dmg` after a browser download, it needs right-click › Open the first time. The icon's source is `assets/icon.svg`; `scripts/icons.sh` renders the `.icns`, `.png` and `.ico` from it.
 
-- **Return** sends and **Shift-Return** adds a newline. **Esc** stops a running turn, killing the CLI's whole process group so a tool command it started can't keep the turn alive.
-- **While a turn runs**, Return **queues** the message: queued messages sit above the prompt and go in order when the turn ends. **⌘Return** (or the ↗ button on a queued message) **steers**: it stops the turn and sends the message straight away on the same session. After Esc the queue waits until you send from it.
-- **⌘N** starts a new thread, **⌘O** opens another folder, **⇧⌘U** shows usage and plan limits, **⇧⌘B** shows or hides the sidebar, **⇧⌘P** shows frame stats, and **⌘,** opens Settings (theme, appearance, frame stats, keyboard shortcuts, which CLIs were found). Settings takes over the main pane; Esc, Done or picking a thread closes it.
+- **Return** sends and **Shift-Return** adds a newline (or, with Settings › Chat › Send with set to ⌘ Return, **⌘Return** sends and Return adds a newline). **Esc** stops a running turn, killing the CLI's whole process group so a tool command it started can't keep the turn alive.
+- **While a turn runs**, Return **queues** the message: queued messages sit above the prompt and go in order when the turn ends. **⌘Return** (or the ↗ button on a queued message) **steers**: it stops the turn and sends the message straight away on the same session. After Esc the queue waits until you send from it. Settings › Chat › Follow-ups can make sending steer instead; the Steer key (⌘Return, or ⇧⌘Return when ⌘Return sends) then queues.
+- **⌘N** starts a new thread, **⌘O** opens another folder, **⇧⌘U** shows usage and plan limits, **⇧⌘B** shows or hides the sidebar, **⇧⌘P** shows frame stats, and **⌘,** opens Settings. Settings takes over the main pane, with its pages down the left as in T3 Code; Esc, Done or picking a thread closes it. The pages:
+  - **Appearance**: theme, and light, dark or the system's.
+  - **New threads**: what a new thread starts with: the agent (CLI), the access level, and each agent's model and reasoning effort. ⌘N and the first screen at launch start from these; switching agent on the new-thread screen takes that agent's; the composer can still change them before you send. Reset goes back to the CLIs' own defaults.
+  - **Chat**: Send with (Return, or ⌘ Return for long prompts) and Follow-ups (queue or steer while a turn runs).
+  - **Agents**: which CLIs were found, and how many models each reported. Look again searches once more (after installing one, say).
+  - **Keyboard shortcuts** (below).
+  - **Advanced**: frame stats, the settings file (Show in Finder), and the version.
 - **Every shortcut can be changed** in Settings › Keyboard shortcuts. Click one and press the new keys: Esc cancels, ⌫ clears, and a chord that's already in use is refused. The list covers new thread, sidebar, settings, frame stats, focus prompt, previous/next thread (⌥⌘↑/↓), settle thread (⇧⌘S), delete thread (⇧⌘⌫), stop, steer, and opening the pickers (⇧⌘M for the model picker, which ⇧⌘H and ⇧⌘E also open; ⇧⌘A for access). Changes save to `~/Library/Application Support/dev.rune-code/prefs.json`, along with the appearance. The menu bar's Settings… item picks up a new chord at the next launch.
 - The window answers macOS tiling (Window › Fill, Center, Move & Resize, and their Fn-Control shortcuts).
 - The composer has two pickers:
@@ -69,7 +75,7 @@ The gauge in the toolbar (**⇧⌘U**), or the one in the composer while Claude 
 
 ## Uninstall
 
-Rune Code keeps one small file of its own, `prefs.json` (shortcuts, appearance, theme, the last folder, settled threads, the model lists, favorite models, the last plan-limits reading and Claude's prices), in `dev.rune-code` in the platform's config folder. Pasted screenshots wait in the temp folder's `rune-code-pastes` and are deleted a day later, at the next launch. On macOS, the system also keeps a GPU shader cache for the app.
+Rune Code keeps one small file of its own, `prefs.json` (shortcuts, appearance, theme, new-thread defaults, the send and follow-up settings, the last folder, settled threads, the model lists, favorite models, the last plan-limits reading and Claude's prices), in `dev.rune-code` in the platform's config folder. Pasted screenshots wait in the temp folder's `rune-code-pastes` and are deleted a day later, at the next launch. On macOS, the system also keeps a GPU shader cache for the app.
 
 | Installed with | Remove the app | Remove its data |
 | --- | --- | --- |
@@ -100,7 +106,7 @@ This works the way the Claude Agent SDK talks to the CLI. The prompt goes in on 
   - With the sidebar hidden, a badge on the sidebar button's corner says something wants you: amber for an approval, red for a failure, the accent colour for a finished turn.
 - The toolbar starts with a "folder › thread title" breadcrumb, as T3 Code's header does.
 - Claude Code threads carry Claude's spark in its terracotta, the mark T3 Code uses (from its MIT-licensed `Icons.tsx`), instead of the OpenCode icon set's Anthropic "A".
-- **Themes**: OpenCode, Nord and Gruvbox, each in light and dark (Settings › Theme; Appearance picks light, dark or the system's). Nord and Gruvbox keep the OpenCode kit's fonts, spacing and shadows and recolour it: every grey in OpenCode's palette maps by its lightness onto the theme's own ramp, and the accent, status and code colours come from the theme (`src/ui/theme.rs`).
+- **Themes**: OpenCode, Nord and Gruvbox, each in light and dark (Settings › Appearance › Theme; Mode picks light, dark or the system's). Nord and Gruvbox keep the OpenCode kit's fonts, spacing and shadows and recolour it: every grey in OpenCode's palette maps by its lightness onto the theme's own ramp, and the accent, status and code colours come from the theme (`src/ui/theme.rs`).
 - Settings › Agents counts the models each installed CLI reported. "Default" (let the CLI choose) isn't counted, and a CLI that isn't installed shows none.
 - The sidebar also lists the project's saved Claude Code sessions (`~/.claude/projects/<folder>/*.jsonl`), from the terminal or earlier runs, titled as Claude Code titles them; opening one reads its transcript, and replying resumes it.
 - Drop images (PNG, JPEG, GIF, WebP) anywhere on the window, or paste a screenshot into the prompt, to attach them. Claude Code gets them as image blocks; Codex as `--image`; OpenCode gets the paths in the prompt.

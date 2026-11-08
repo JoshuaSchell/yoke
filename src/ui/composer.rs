@@ -15,10 +15,13 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let running = s.thread().is_some_and(|t| t.busy);
     let typed = !s.draft.text.trim().is_empty() || !s.attachments.is_empty();
     let h = s.active_harness();
-    let steer_key = s.keys.label(Cmd::Steer);
+    let (send_key, other_key) = s.send_labels();
+    let steers = s.defaults.follow_up == crate::settings::FollowUp::Steer;
+    let (steer_key, queue_key) = if steers { (send_key.clone(), other_key) } else { (other_key, send_key.clone()) };
     let stop_key = s.keys.label(Cmd::Stop);
     let style = TextStyle { line_height: 22.0, ..k.ty.body };
     let placeholder = match s.thread() {
+        Some(_) if running && steers => format!("Steer {}…", h.name()),
         Some(_) if running => format!("Queue a follow-up for {}…", h.name()),
         Some(_) => format!("Reply to {}…", h.name()),
         None => format!("Ask {} anything about {}…", h.name(), s.project.name),
@@ -31,7 +34,7 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         .caret(c.text_strong, k.selection())
         .label("Prompt")
         .on_edit(|s: &mut App| &mut s.draft)
-        .on_submit(|s: &mut App, tx: &mut Tx| s.send(tx))
+        .on_submit(|s: &mut App, tx: &mut Tx| s.submit(tx))
         // A pasted image (a screenshot) attaches; text pastes as usual.
         .on_input_paste(|s: &mut App, content: &rune::ClipboardContent, _: &mut Tx| {
             let Some(image) = content.image() else { return false };
@@ -40,7 +43,8 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         })
         // The field sees keys before the window does (it would take Escape and ⌘↩ itself), so
         // the shortcut table runs here first.
-        .on_input_key(|s: &mut App, ev: &rune::KeyEvent, tx: &mut Tx| shortcuts::dispatch(s, ev, tx));
+        // With ⌘↩ sending (Settings › Chat), ↩ and ⇧⌘↩ are the prompt's own.
+        .on_input_key(|s: &mut App, ev: &rune::KeyEvent, tx: &mut Tx| s.prompt_key(ev, tx) || shortcuts::dispatch(s, ev, tx));
     let field = rune::auto_grow(field, 2, 12);
 
     // Harness, model and effort: one chip and its popover (`ui::picker`).
@@ -76,7 +80,7 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
                     .variant(IconButtonVariant::Submit)
                     .control_size(ControlSize::Large)
                     .label("Queue: send when the turn ends")
-                    .shortcut("↩")
+                    .shortcut(&queue_key)
                     .on_press_tx(|s: &mut App, tx: &mut Tx| s.send(tx))
                     .build(k)
                     .key("queue"));
@@ -94,7 +98,7 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
             .variant(IconButtonVariant::Submit)
             .control_size(ControlSize::Large)
             .label("Send")
-            .shortcut("↩")
+            .shortcut(&send_key)
             .disabled(!typed)
             .on_press_tx(|s: &mut App, tx: &mut Tx| s.send(tx))
             .build(k)
@@ -129,12 +133,15 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let card = card
         .child(col().w_full().px(16.0).pt(14.0).pb(6.0).child(field))
         .child(col().w_full().px(10.0).pb(10.0).child(bar));
+    let newline = if s.defaults.send == crate::settings::SendKey::ModReturn { "↩" } else { "⇧↩" };
     let hint = if running {
-        let steer = if steer_key.is_empty() { String::new() } else { format!("  ·  {steer_key} steer") };
+        // The send key first, then the other of queue and steer.
+        let (first, second) = if steers { (("steer", &steer_key), ("queue", &queue_key)) } else { (("queue", &queue_key), ("steer", &steer_key)) };
+        let other = if second.1.is_empty() { String::new() } else { format!("  ·  {} {}", second.1, second.0) };
         let stop = if stop_key.is_empty() { String::new() } else { format!("  ·  {stop_key} stop") };
-        format!("↩ queue{steer}{stop}")
+        format!("{} {}{other}{stop}", first.1, first.0)
     } else {
-        format!("{}  ·  ↩ send  ·  ⇧↩ newline", s.project.path.display())
+        format!("{}  ·  {send_key} send  ·  {newline} newline", s.project.path.display())
     };
     let hint = text(hint).font(k.ty.text_xsmall).color(c.text_faint).truncate();
     let mut stack = col().w_full().max_w(MAX_W).gap(8.0).items_center();

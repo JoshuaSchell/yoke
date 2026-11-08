@@ -10,6 +10,7 @@ mod bench;
 mod harness;
 mod history;
 mod picker;
+mod settings;
 mod shortcuts;
 mod ui;
 mod usage;
@@ -76,6 +77,8 @@ const SCENES: &[Scene] = &[
     ("picker", app::scenes::picker),
     ("effort", app::scenes::effort),
     ("settings", app::scenes::settings),
+    ("settings-new-threads", app::scenes::settings_new_threads),
+    ("settings-chat", app::scenes::settings_chat),
     ("usage", app::scenes::usage),
     ("usage-popover", app::scenes::usage_popover),
     ("queue", app::scenes::queue),
@@ -583,6 +586,7 @@ mod tests {
         let mut rt = headless(app);
         rt.update(|s, _| {
             s.open_settings();
+            s.show_settings_page(crate::settings::Page::Shortcuts);
             shortcuts::begin_recording(s, Cmd::NewThread);
         });
         rt.frame(1.0 / 60.0);
@@ -700,6 +704,89 @@ mod tests {
         assert_eq!(rt.state.thread().unwrap().queue.len(), 1, "the queue waits after a stop");
     }
 
+    /// Settings › New threads: the defaults show on the new-thread screen at once, ⌘N goes
+    /// back to them after the composer changed, switching agent takes that agent's, and they
+    /// survive a relaunch. Reset clears them.
+    #[test]
+    fn new_threads_start_from_the_defaults() {
+        let mut app = new_app();
+        let bin = fake_claude("claude-defaults");
+        app.installed = vec![(Harness::Claude, Some(bin.clone())), (Harness::Codex, Some(bin))];
+        app.choose_harness(Harness::Claude);
+        let opus = app.models(Harness::Claude).iter().find(|m| m.value != crate::harness::models::DEFAULT).unwrap().clone();
+        app.set_default_model(Harness::Claude, &opus.label);
+        app.set_default_effort(Harness::Claude, "high");
+        app.set_default_access(Access::ReadOnly);
+        assert_eq!((app.model.as_str(), app.effort.as_str(), app.access), (opus.value.as_str(), "high", Access::ReadOnly), "the new-thread screen takes them at once");
+
+        app.model = crate::harness::models::DEFAULT.into();
+        app.effort = "low".into();
+        app.access = Access::Full;
+        app.new_thread();
+        assert_eq!((app.model.as_str(), app.effort.as_str(), app.access), (opus.value.as_str(), "high", Access::ReadOnly), "⌘N starts from the defaults");
+
+        app.set_default_harness(Harness::Codex);
+        assert_eq!(app.harness, Harness::Codex);
+        assert_eq!(app.model, crate::harness::models::DEFAULT, "Codex has no default model of its own");
+        app.choose_harness(Harness::Claude);
+        assert_eq!((app.model.as_str(), app.effort.as_str()), (opus.value.as_str(), "high"), "switching back takes Claude's");
+
+        let prefs = std::mem::replace(&mut app.prefs, rune::prefs::Prefs::memory());
+        let mut again = App::new(std::env::current_dir().unwrap(), prefs);
+        assert_eq!(again.defaults.harness, Some(Harness::Codex));
+        assert_eq!(again.default_model(Harness::Claude), opus.value);
+        assert_eq!(again.default_effort(Harness::Claude), "high");
+        assert_eq!(again.defaults.access, Access::ReadOnly);
+
+        assert!(again.defaults_changed());
+        again.reset_defaults();
+        assert!(!again.defaults_changed());
+        assert_eq!(again.default_model(Harness::Claude), crate::harness::models::DEFAULT);
+    }
+
+    /// Settings › Chat: with ⌘↩ sending, ↩ is a newline; with follow-ups steering, sending into
+    /// a running turn steers and ⇧⌘↩ queues instead.
+    #[test]
+    fn send_key_and_follow_up_settings() {
+        use crate::settings::{FollowUp, SendKey};
+        let mut app = new_app();
+        app.installed = vec![(Harness::Claude, Some(fake_claude("claude-chat")))];
+        app.choose_harness(Harness::Claude);
+        app.set_send_key(SendKey::ModReturn);
+        app.set_follow_up(FollowUp::Steer);
+        let mut rt = headless(app);
+        let enter = |cmd: bool, shift: bool| KeyEvent { key: Key::Enter, mods: Mods { cmd, shift, ..Mods::default() } };
+        let typed = |rt: &mut Runtime<App>, text: &str, k: KeyEvent| {
+            rt.key(key(Key::Text(text.into())));
+            rt.frame(1.0 / 60.0);
+            rt.key(k);
+            rt.frame(1.0 / 60.0);
+        };
+
+        typed(&mut rt, "first", enter(false, false));
+        assert_eq!(rt.state.selected, None, "Return didn't send");
+        assert_eq!(rt.state.draft.text, "first\n");
+        typed(&mut rt, "slow", enter(true, false));
+        let id = rt.state.selected.expect("⌘↩ sent");
+        assert!(rt.state.is_running(id));
+
+        // Sending into the running turn steers: it stops, and "now" goes straight away.
+        let started = Instant::now();
+        typed(&mut rt, "now", enter(true, false));
+        pump_until(&mut rt, 8, |s| s.thread().unwrap().queue.is_empty() && !s.is_running(id));
+        assert!(started.elapsed() < Duration::from_secs(8), "steering didn't wait out the slow turn");
+        assert_eq!(user_messages(&rt.state), ["first\nslow", "now"]);
+
+        // ⇧⌘↩ does the other: it queues.
+        typed(&mut rt, "slow again", enter(true, false));
+        assert!(rt.state.is_running(id));
+        typed(&mut rt, "later", enter(true, true));
+        assert_eq!(rt.state.thread().unwrap().queue.iter().map(|q| q.text.as_str()).collect::<Vec<_>>(), ["later"]);
+        rt.key(key(Key::Escape));
+        rt.frame(1.0 / 60.0);
+        pump_until(&mut rt, 8, |s| !s.is_running(id));
+    }
+
     /// An image dropped on the window shows in the composer and goes to the CLI as an image
     /// block; a file that isn't an image is refused with a note.
     #[test]
@@ -772,6 +859,21 @@ mod tests {
         assert_eq!(rt.state.prefs.get::<String>("theme").as_deref(), Some("Gruvbox"));
         for _ in 0..60 { rt.frame(1.0 / 60.0); }
         assert!(!rt.elements().iter().any(|e| e.key.as_deref() == Some("composer")), "the composer is hidden");
+        // The rail switches pages; New threads' access menu sets the default.
+        let click = |rt: &mut Runtime<App>, key: &str| {
+            let (x, y) = rt.find(key).unwrap_or_else(|| panic!("{key} on screen"));
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            for _ in 0..20 { rt.frame(1.0 / 60.0); }
+        };
+        click(&mut rt, "settings-page-new-threads");
+        assert_eq!(rt.state.settings_page, crate::settings::Page::NewThreads);
+        click(&mut rt, "default-access-trigger");
+        assert_eq!(rt.state.open_menu, Some("default-access"));
+        // Read only, Ask first, Edit files, Full access.
+        click(&mut rt, "option3");
+        assert_eq!(rt.state.defaults.access, Access::Full);
+        assert_eq!(rt.state.prefs.get::<String>("new-thread.access").as_deref(), Some("Full access"));
         rt.update(|s, _| s.select(102));
         rt.frame(1.0 / 60.0);
         assert!(!rt.state.settings);

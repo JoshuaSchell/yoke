@@ -13,7 +13,7 @@ pub mod usage;
 
 use std::time::Duration;
 
-use rune::{Cx, El, KeyEvent, Spring, Tx, col, el, row, text};
+use rune::{Cx, El, Icon, KeyEvent, Spring, Tx, col, el, row, text};
 use rune_kit::shell::{PaneMotion, SidebarPeek, SidebarToggle, SplitView, Toolbar};
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit};
 use rune_theme_opencode::icons;
@@ -28,7 +28,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
 
     let mut main = col().key("main").w_full().h_full().min_h(0.0);
     main = if s.settings {
-        main.child(settings::view(s, k))
+        main.child(settings::view(s, k, &mut layer))
     } else if s.usage_open {
         main.child(usage::page(s, k))
     } else {
@@ -57,7 +57,7 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
         .on_press(|s: &mut App| s.hud = !s.hud)
         .build(k)
         .key("hud-toggle");
-    let settings_button = IconButton::new(&icons::SETTINGS_GEAR)
+    let settings_button = IconButton::new(&COG)
         .variant(IconButtonVariant::GhostMuted)
         .expanded(s.settings)
         .label(if s.settings { "Close Settings" } else { "Settings" })
@@ -95,6 +95,16 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
             s.composer_error = Some(format!("{name} isn't an image. Drop a PNG, JPEG, GIF or WebP."));
         })
 }
+
+/// Settings' toolbar icon: an eight-toothed cog round a hub, on the 16-point grid and 1-point
+/// line of the OpenCode set (whose own settings glyph, a hexagon round a circle, reads as a
+/// nut). Tooth tips at radius 6.5, roots on a 5.0 circle, each tooth 17° across at the tip
+/// and 26° at the root.
+pub static COG: Icon = Icon {
+    name: "cog",
+    view: 16.0,
+    body: r#"<path d="M6.88 3.13L7.04 1.57L8.96 1.57L9.12 3.13A5.0 5.0 0 0 1 10.65 3.76L11.87 2.77L13.23 4.13L12.24 5.35A5.0 5.0 0 0 1 12.87 6.88L14.43 7.04L14.43 8.96L12.87 9.12A5.0 5.0 0 0 1 12.24 10.65L13.23 11.87L11.87 13.23L10.65 12.24A5.0 5.0 0 0 1 9.12 12.87L8.96 14.43L7.04 14.43L6.88 12.87A5.0 5.0 0 0 1 5.35 12.24L4.13 13.23L2.77 11.87L3.76 10.65A5.0 5.0 0 0 1 3.13 9.12L1.57 8.96L1.57 7.04L3.13 6.88A5.0 5.0 0 0 1 3.76 5.35L2.77 4.13L4.13 2.77L5.35 3.76A5.0 5.0 0 0 1 6.88 3.13Z" stroke="currentColor" stroke-linejoin="round"/><circle cx="8" cy="8" r="2" stroke="currentColor"/>"#,
+};
 
 /// Window background around the card.
 const FRAME: f32 = 8.0;
