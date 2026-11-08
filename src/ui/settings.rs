@@ -254,11 +254,24 @@ fn agents(s: &App, k: &Kit) -> El {
         .on_press(|s: &mut App| s.rescan_clis())
         .build(k)
         .key("clis-rescan");
+    let peers = Switch::new(s.defaults.peer_messages)
+        .hide_label()
+        .label("Messages from your other sessions")
+        .on_toggle(|s: &mut App| s.set_peer_messages(!s.defaults.peer_messages))
+        .build(k)
+        .key("peer-messages");
+    let peers_help = if s.defaults.peer_messages {
+        "Your Claude Code sessions on this computer, here or in a terminal, can message a thread here, for example to say which files they're editing. A message can't give a thread more access than it has. Takes effect from each thread's next message."
+    } else {
+        "Threads here turn away messages from your other Claude Code sessions, and the sender is told. Takes effect from each thread's next message."
+    };
     col().w_full().gap(12.0)
         .child(row().w_full().center_y().gap(8.0)
             .child(section_title(k, "Agent CLIs", Some("Found on PATH and in the usual install folders.")).grow(1.0).min_w(0.0))
             .child(col().pt(16.0).child(again)))
         .child(card(k, clis))
+        .child(section_title(k, "Claude Code", None))
+        .child(card(k, vec![setting(k, "Messages from your other sessions", peers_help, peers)]))
 }
 
 fn advanced(s: &App, k: &Kit) -> El {

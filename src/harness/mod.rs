@@ -146,6 +146,8 @@ impl Harness {
                 if let Some(m) = model { c.args(["--model", m]); }
                 if let Some(e) = effort { c.args(["--effort", e]); }
                 if let Some(id) = &t.resume { c.args(["--resume", id]); }
+                let inbound = if t.peer_messages { "accept" } else { "refuse" };
+                c.args(["--settings", &format!(r#"{{"crossSessionInbound":"{inbound}"}}"#)]);
             }
             Harness::Codex => {
                 c.args(["exec", "--json", "--skip-git-repo-check"]);
@@ -290,6 +292,11 @@ pub struct Turn {
     pub cwd: PathBuf,
     /// Images sent with the prompt.
     pub images: Vec<PathBuf>,
+    /// Claude Code: deliver messages from your other Claude Code sessions (`SendMessage`), such
+    /// as one saying which files it's editing, or turn them away. Unset, the CLI holds a
+    /// message from a session in another permission mode for approval, which a thread here
+    /// can't give, so it would expire unread.
+    pub peer_messages: bool,
 }
 
 /// `path` as an API image block (base64), or `None` if it can't be read or isn't an image type

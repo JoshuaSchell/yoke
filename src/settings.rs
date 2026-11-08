@@ -20,6 +20,7 @@ const EFFORTS_KEY: &str = "new-thread.efforts";
 const ACCESS_KEY: &str = "new-thread.access";
 const SEND_KEY: &str = "chat.send";
 const FOLLOW_UP_KEY: &str = "chat.follow-up";
+const PEER_MESSAGES_KEY: &str = "agents.peer-messages";
 
 /// Settings' pages, in the order the rail lists them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,11 +119,13 @@ pub struct Prefs {
     pub access: Access,
     pub send: SendKey,
     pub follow_up: FollowUp,
+    /// Claude Code threads take messages from your other Claude Code sessions (`Turn::peer_messages`).
+    pub peer_messages: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Prefs {
-        Prefs { harness: None, models: HashMap::new(), efforts: HashMap::new(), access: DEFAULT_ACCESS, send: SendKey::Return, follow_up: FollowUp::Queue }
+        Prefs { harness: None, models: HashMap::new(), efforts: HashMap::new(), access: DEFAULT_ACCESS, send: SendKey::Return, follow_up: FollowUp::Queue, peer_messages: true }
     }
 }
 
@@ -147,6 +150,7 @@ impl Prefs {
             access: prefs.get::<String>(ACCESS_KEY).and_then(|l| Access::from_label(&l)).unwrap_or(DEFAULT_ACCESS),
             send: match prefs.get::<String>(SEND_KEY).as_deref() { Some("mod-return") => SendKey::ModReturn, _ => SendKey::Return },
             follow_up: match prefs.get::<String>(FOLLOW_UP_KEY).as_deref() { Some("steer") => FollowUp::Steer, _ => FollowUp::Queue },
+            peer_messages: prefs.get::<bool>(PEER_MESSAGES_KEY).unwrap_or(true),
         }
     }
 
@@ -160,6 +164,7 @@ impl Prefs {
         let _ = prefs.set(ACCESS_KEY, self.access.label());
         let _ = prefs.set(SEND_KEY, self.send.id());
         let _ = prefs.set(FOLLOW_UP_KEY, self.follow_up.id());
+        let _ = prefs.set(PEER_MESSAGES_KEY, &self.peer_messages);
     }
 }
 
@@ -244,6 +249,13 @@ impl App {
 
     pub fn set_follow_up(&mut self, f: FollowUp) {
         self.defaults.follow_up = f;
+        self.save_defaults();
+    }
+
+    /// Settings › Agents: whether Claude Code threads take your other sessions' messages, from
+    /// each thread's next turn.
+    pub fn set_peer_messages(&mut self, on: bool) {
+        self.defaults.peer_messages = on;
         self.save_defaults();
     }
 

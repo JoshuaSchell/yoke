@@ -1057,6 +1057,7 @@ impl App {
         self.wake(id);
         let item = self.id();
         let cwd = self.project.path.clone();
+        let peer_messages = self.defaults.peer_messages;
         let Some(t) = self.thread_mut(id) else { return };
         let shown = if q.images.is_empty() { q.text.clone() } else {
             let names: Vec<String> = q.images.iter().map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())).collect();
@@ -1067,7 +1068,7 @@ impl App {
         t.rev += 1;
         t.failed = false;
         t.updated = SystemTime::now();
-        let turn = Turn { harness: t.harness, prompt: q.text, model: q.model, effort: q.effort, access: q.access, resume: t.session.clone(), cwd, images: q.images };
+        let turn = Turn { harness: t.harness, prompt: q.text, model: q.model, effort: q.effort, access: q.access, resume: t.session.clone(), cwd, images: q.images, peer_messages };
         let h = t.harness;
         let Some(bin) = self.binary(h) else {
             let e = self.id();

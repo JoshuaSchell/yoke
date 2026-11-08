@@ -271,7 +271,7 @@ mod tests {
     }
 
     fn args(h: Harness, effort: &str) -> Vec<String> {
-        let turn = crate::harness::Turn { harness: h, prompt: "hi".into(), model: "Default".into(), effort: effort.into(), access: Access::Edits, resume: None, cwd: ".".into(), images: Vec::new() };
+        let turn = crate::harness::Turn { harness: h, prompt: "hi".into(), model: "Default".into(), effort: effort.into(), access: Access::Edits, resume: None, cwd: ".".into(), images: Vec::new(), peer_messages: true };
         h.command(std::path::Path::new("x"), &turn).get_args().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
@@ -788,6 +788,24 @@ mod tests {
         assert_eq!(again.default_model(Harness::Claude), crate::harness::models::DEFAULT);
     }
 
+    /// Settings › Agents: messages from your other sessions are on by default, and the switch
+    /// turns them off and saves that.
+    #[test]
+    fn peer_messages_switch() {
+        let mut app = new_app();
+        assert!(app.defaults.peer_messages, "on by default");
+        app.open_settings();
+        app.show_settings_page(crate::settings::Page::Agents);
+        let mut rt = headless(app);
+        rt.frame(0.5);
+        let (x, y) = rt.find("peer-messages").expect("the switch shows on Agents");
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0);
+        assert!(!rt.state.defaults.peer_messages);
+        assert_eq!(crate::settings::Prefs::load(&rt.state.prefs).peer_messages, false, "saved");
+    }
+
     /// Settings › Chat: with ⌘↩ sending, ↩ is a newline; with follow-ups steering, sending into
     /// a running turn steers and ⇧⌘↩ queues instead.
     #[test]
@@ -856,7 +874,7 @@ mod tests {
         assert!(rt.state.attachments.is_empty());
         let t = rt.state.thread().expect("a thread started");
         assert!(matches!(&t.items[0].kind, Kind::User(m) if m.contains("Attached: shot.png")));
-        let turn = crate::harness::Turn { harness: Harness::Claude, prompt: "look".into(), model: "Default".into(), effort: crate::harness::DEFAULT_EFFORT.into(), access: Access::Edits, resume: None, cwd: ".".into(), images: vec![png] };
+        let turn = crate::harness::Turn { harness: Harness::Claude, prompt: "look".into(), model: "Default".into(), effort: crate::harness::DEFAULT_EFFORT.into(), access: Access::Edits, resume: None, cwd: ".".into(), images: vec![png], peer_messages: true };
         let msg: serde_json::Value = serde_json::from_str(Harness::Claude.stdin_lines(&turn).last().unwrap()).unwrap();
         assert_eq!(msg["message"]["content"][0]["text"], "look");
         assert_eq!(msg["message"]["content"][1]["source"]["media_type"], "image/png");
@@ -964,7 +982,7 @@ mod tests {
 
     #[test]
     fn claude_takes_the_prompt_on_stdin_and_asks_over_stdio() {
-        let turn = |access| crate::harness::Turn { harness: Harness::Claude, prompt: "hi there".into(), model: "Default".into(), effort: crate::harness::DEFAULT_EFFORT.into(), access, resume: None, cwd: ".".into(), images: Vec::new() };
+        let turn = |access| crate::harness::Turn { harness: Harness::Claude, prompt: "hi there".into(), model: "Default".into(), effort: crate::harness::DEFAULT_EFFORT.into(), access, resume: None, cwd: ".".into(), images: Vec::new(), peer_messages: true };
         let claude_args = |access| -> Vec<String> {
             Harness::Claude.command(std::path::Path::new("x"), &turn(access)).get_args().map(|a| a.to_string_lossy().into_owned()).collect()
         };
@@ -974,6 +992,10 @@ mod tests {
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "default"]), "{a:?}");
         assert!(!a.iter().any(|x| x.contains("hi there")), "the prompt isn't an argument");
         assert!(claude_args(Access::Edits).windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
+        assert!(a.windows(2).any(|w| w == ["--settings", r#"{"crossSessionInbound":"accept"}"#]), "{a:?}");
+        let off = crate::harness::Turn { peer_messages: false, ..turn(Access::Ask) };
+        let a: Vec<String> = Harness::Claude.command(std::path::Path::new("x"), &off).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(a.windows(2).any(|w| w == ["--settings", r#"{"crossSessionInbound":"refuse"}"#]), "{a:?}");
         let lines = Harness::Claude.stdin_lines(&turn(Access::Ask));
         let msg: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
         assert_eq!((msg["type"].as_str(), msg["message"]["content"].as_str()), (Some("user"), Some("hi there")));
