@@ -132,7 +132,8 @@ fn ago(t: SystemTime) -> String {
 
 /// The chip in the composer's bar: the tightest window's fill and percentage, opening the
 /// popover. Nothing without Claude, or before the plan has been read.
-pub fn chip(s: &App, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
+/// `compact` (a narrow composer) leaves out the little bar, keeping the gauge and the percent.
+pub fn chip(s: &App, k: &Kit, compact: bool, layer: &mut Vec<El>) -> Option<El> {
     if s.active_harness() != Harness::Claude { return None; }
     let l = s.limits.as_ref().filter(|l| l.available)?;
     let w = l.tightest()?;
@@ -143,13 +144,14 @@ pub fn chip(s: &App, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     let frac = (w.used / 100.0).clamp(0.0, 1.0) as f32;
     let mini = row().w(28.0).h(4.0).radius(2.0).fill(fill.alpha(0.2)).clip_rounded(2.0)
         .child(el().w_frac(frac).min_w(if frac > 0.0 { 4.0 } else { 0.0 }).h_full().radius(2.0).fill(fill));
-    let trigger = row().key("usage-chip").h(28.0).px(8.0).gap(6.0).center_y().radius(8.0)
+    let mut trigger = row().key("usage-chip").h(28.0).px(8.0).gap(6.0).center_y().radius(8.0)
         .cursor(rune::Cursor::Pointer)
         .fill(if open { c.surface_hover } else { rune::Color::TRANSPARENT })
         .label(format!("Usage: {} {:.0}% used", w.label, w.used))
         .help(format!("{} {:.0}% used · {}", w.label, w.used, resets(w, now).to_lowercase()))
-        .child(icon(&GAUGE, 14.0).color(c.icon_muted))
-        .child(mini)
+        .child(icon(&GAUGE, 14.0).color(c.icon_muted));
+    if !compact { trigger = trigger.child(mini); }
+    let trigger = trigger
         .child(text(format!("{:.0}%", w.used)).font(k.ty.small.features("'tnum' 1")).color(c.text_muted));
 
     let mut body = col().w(272.0).gap(12.0);

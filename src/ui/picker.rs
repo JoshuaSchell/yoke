@@ -36,13 +36,15 @@ fn quick_key(n: usize) -> String {
 }
 
 /// The chip, with the popover pushed into `layer` while it's open.
-pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
+/// `compact` (a narrow composer) leaves the effort to the popover.
+pub fn view(s: &App, k: &Kit, compact: bool, layer: &mut Vec<El>) -> El {
     let c = &k.c;
     let open = s.picker_open();
     let h = s.active_harness();
     let (model, effort) = s.picker_summary();
     let key = s.keys.label(crate::shortcuts::Cmd::ModelMenu);
-    let mut chip = row().key("model-chip").h(28.0).pl(6.0).pr(8.0).gap(6.0).center_y().radius(8.0)
+    // Shrinks with the composer, the model's name cut first, so the send button stays in.
+    let mut chip = row().key("model-chip").h(28.0).pl(6.0).pr(8.0).gap(6.0).center_y().radius(8.0).shrink()
         .cursor(Cursor::Pointer)
         .role("button")
         .expanded(open)
@@ -51,14 +53,14 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         .label(format!("Model: {}, {model}{}", h.name(), effort.map_or(String::new(), |e| format!(", {e} reasoning"))))
         .help(if key.is_empty() { "Choose model".to_owned() } else { format!("Choose model ({key})") })
         .child(harness_icon(h, 14.0, k))
-        .child(text(model).font(k.ty.ui_medium).color(c.text_strong));
-    if let Some(e) = effort {
+        .child(text(model).font(k.ty.ui_medium).color(c.text_strong).truncate().min_w(16.0));
+    if let Some(e) = effort.filter(|_| !compact) {
         chip = chip.child(text(e).font(k.ty.ui).color(c.text_muted));
     }
     let chip = chip
         .child(icon(&icons::CHEVRON_DOWN, 12.0).color(c.icon_weaker))
         .on_press(|s: &mut App| s.toggle_picker());
-    let trigger = row().key(TRIGGER).child(chip);
+    let trigger = row().key(TRIGGER).shrink().child(chip);
     if open {
         layer.push(scrim("model-picker-scrim", |s: &mut App| s.close_picker()));
         let surface = popover::raised(k, panel(s, k).key("model-picker").role("dialog").label("Choose model").focus_return(TRIGGER), 12.0);
