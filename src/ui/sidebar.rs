@@ -199,7 +199,7 @@ pub fn delete_dialog(s: &App, k: &Kit, layer: &mut Vec<El>) {
     let buttons = row().key("delete-buttons").w_full().padding(16.0).gap(8.0).justify_end()
         .child(Button::new("Cancel").variant(ButtonVariant::Ghost).on_press(|s: &mut App| s.confirm_delete = None).build(k).key("delete-cancel"))
         .child(Button::new("Delete").variant(ButtonVariant::Danger).on_press(move |s: &mut App| s.delete(id)).build(k).default_button().key("delete-confirm"));
-    Dialog::new("delete", "Delete thread?").description(what).width(400.0).fit().open(true)
+    Dialog::new("delete", "Delete thread?").description(what).width(420.0).fit().open(true)
         .on_close(|s: &mut App| s.confirm_delete = None)
         .child(buttons)
         .build(k, layer);

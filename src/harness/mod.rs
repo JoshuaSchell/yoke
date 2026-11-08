@@ -66,14 +66,6 @@ impl Access {
             Access::Full => "bypassPermissions",
         }
     }
-    /// Whether this level lets `tool` run without asking.
-    pub fn allows(self, tool: &str) -> bool {
-        match self {
-            Access::Full => true,
-            Access::Edits => matches!(tool, "Edit" | "Write" | "MultiEdit" | "NotebookEdit"),
-            Access::ReadOnly | Access::Ask => false,
-        }
-    }
     /// What `h` actually gets: harnesses that can't ask treat "Ask first" as read only.
     pub fn for_harness(self, h: Harness) -> Access {
         if self == Access::Ask && !h.asks() { Access::ReadOnly } else { self }
@@ -113,6 +105,12 @@ impl Harness {
     /// than refusing whatever the access level doesn't allow.
     pub fn asks(self) -> bool {
         matches!(self, Harness::Claude)
+    }
+
+    /// Whether Yoke can set what it may do (Claude Code's permission modes, Codex's sandbox).
+    /// OpenCode's `run` takes no such flag: its own config decides.
+    pub fn has_access(self) -> bool {
+        !matches!(self, Harness::OpenCode)
     }
 
     /// Reasoning effort levels offered in the picker; the first is the CLI's own default (no
@@ -160,19 +158,22 @@ impl Harness {
                 if let Some(e) = effort { c.args(["-c", &format!("model_reasoning_effort=\"{e}\"")]); }
                 for img in &t.images { c.arg("--image").arg(img); }
                 if let Some(id) = &t.resume { c.args(["resume", id]); }
-                c.arg(&t.prompt);
+                // Ends the options, so a prompt starting with "-" isn't read as one.
+                c.arg("--").arg(&t.prompt);
             }
             Harness::OpenCode => {
                 c.args(["run", "--format", "json"]);
                 if let Some(m) = model { c.args(["--model", m]); }
                 if let Some(id) = &t.resume { c.args(["--session", id]); }
                 // No image flag we've confirmed: name the files so the agent can read them.
-                if t.images.is_empty() {
-                    c.arg(&t.prompt);
+                let prompt = if t.images.is_empty() {
+                    t.prompt.clone()
                 } else {
                     let paths: Vec<String> = t.images.iter().map(|p| p.display().to_string()).collect();
-                    c.arg(format!("{}\n\nAttached images: {}", t.prompt, paths.join(", ")));
-                }
+                    format!("{}\n\nAttached images: {}", t.prompt, paths.join(", "))
+                };
+                // A prompt starting with "-" would be read as an option; a space in front isn't.
+                c.arg(if prompt.starts_with('-') { format!(" {prompt}") } else { prompt });
             }
         }
         c
@@ -222,7 +223,7 @@ pub enum Event {
     Text(String),
     /// The model is reasoning (no text to show yet).
     Thinking,
-    ToolStart { id: String, name: String, detail: String },
+    ToolStart { id: String, name: String, detail: String, body: ToolBody },
     ToolEnd { id: String, ok: bool, output: String },
     /// The turn finished (successfully or not).
     Done { cost_usd: Option<f64>, error: Option<String> },
@@ -266,11 +267,33 @@ pub enum Decision {
 }
 
 impl AskRequest {
+    /// The suggested rules "Always allow" may save: rules that allow, kept in this project's
+    /// own `.claude/settings.local.json` or for this session. A suggestion that would change
+    /// the mode, add a folder, or write the user's global settings is left out, so the button
+    /// only ever adds what the card shows.
+    pub fn safe_rules(&self) -> Vec<serde_json::Value> {
+        self.suggestions.iter()
+            .filter(|s| s["type"] == "addRules" && s["behavior"] == "allow" && matches!(s["destination"].as_str(), Some("localSettings" | "session")))
+            .cloned()
+            .collect()
+    }
+
+    /// The safe rules as the card names them: "Bash(cargo build:*)".
+    pub fn rule_labels(&self) -> Vec<String> {
+        self.safe_rules().iter().flat_map(|s| s["rules"].as_array().cloned().unwrap_or_default()).filter_map(|r| {
+            let tool = r["toolName"].as_str()?;
+            Some(match r["ruleContent"].as_str() {
+                Some(c) => format!("{tool}({c})"),
+                None => tool.to_owned(),
+            })
+        }).collect()
+    }
+
     /// The control response line that answers this request.
     pub fn reply(&self, d: &Decision) -> String {
         let response = match d {
             Decision::Allow => serde_json::json!({"behavior": "allow", "updatedInput": self.input}),
-            Decision::AlwaysAllow => serde_json::json!({"behavior": "allow", "updatedInput": self.input, "updatedPermissions": self.suggestions}),
+            Decision::AlwaysAllow => serde_json::json!({"behavior": "allow", "updatedInput": self.input, "updatedPermissions": self.safe_rules()}),
             Decision::Deny => serde_json::json!({"behavior": "deny", "message": "The user denied this in Yoke."}),
         };
         serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": self.request_id, "response": response}}).to_string()
@@ -463,14 +486,61 @@ pub fn spawn<T: Clone + Send + 'static>(bin: &Path, turn: Turn, tag: T, tx: Send
     Running { child, stdin }
 }
 
-/// A short, one-line description of a tool call's input, for its row.
+/// A short, one-line description of a tool call's input, for its row. A path is kept whole,
+/// since the row's button opens it (the row cuts it to fit as it draws).
 pub(crate) fn tool_detail(input: &serde_json::Value) -> String {
     for k in ["command", "file_path", "filePath", "path", "pattern", "url", "query", "description", "prompt"] {
         if let Some(s) = input.get(k).and_then(|v| v.as_str()) {
-            return first_line(s, 160);
+            let path = matches!(k, "file_path" | "filePath" | "path") && !s.contains('\n');
+            return if path { s.trim().to_owned() } else { first_line(s, 160) };
         }
     }
     String::new()
+}
+
+/// What a tool call carries that's worth reading in full once its row is opened: an edit's
+/// text before and after, a written file, or a command too long for the row.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum ToolBody {
+    #[default]
+    None,
+    /// A command, or a file's text.
+    Code(String),
+    /// Each replacement in a file: the text before and after.
+    Edits(Vec<(String, String)>),
+}
+
+/// The most of one text a body keeps (a written file can be large), cut at a line's end.
+const BODY_MAX: usize = 64 * 1024;
+
+fn capped(s: &str) -> String {
+    if s.len() <= BODY_MAX { return s.to_owned(); }
+    let cut = s[..s.floor_char_boundary(BODY_MAX)].rfind('\n').unwrap_or(s.floor_char_boundary(BODY_MAX));
+    s[..cut].to_owned()
+}
+
+fn field<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|k| v.get(*k).and_then(|x| x.as_str()))
+}
+
+/// A tool call's body from its input, as Claude Code, OpenCode and Codex name the fields.
+pub(crate) fn tool_body(name: &str, input: &serde_json::Value) -> ToolBody {
+    let edit = |e: &serde_json::Value| Some((capped(field(e, &["old_string", "oldString"])?), capped(field(e, &["new_string", "newString"])?)));
+    match name.to_ascii_lowercase().as_str() {
+        "edit" | "replace" => edit(input).map_or(ToolBody::None, |e| ToolBody::Edits(vec![e])),
+        "multiedit" => {
+            let edits: Vec<_> = input["edits"].as_array().into_iter().flatten().filter_map(edit).collect();
+            if edits.is_empty() { ToolBody::None } else { ToolBody::Edits(edits) }
+        }
+        "write" | "write_file" => field(input, &["content"]).map_or(ToolBody::None, |c| ToolBody::Code(capped(c))),
+        "notebookedit" => field(input, &["new_source"]).map_or(ToolBody::None, |c| ToolBody::Code(capped(c))),
+        // The row shows a command's first line; the whole of a longer one is here.
+        "bash" | "shell" | "run_shell_command" => match field(input, &["command"]) {
+            Some(c) if first_line(c, 160) != c.trim() => ToolBody::Code(capped(c.trim())),
+            _ => ToolBody::None,
+        },
+        _ => ToolBody::None,
+    }
 }
 
 pub(crate) fn first_line(s: &str, max: usize) -> String {

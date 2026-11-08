@@ -10,10 +10,10 @@ publish = false
 # our changes; upstream takes issues, not PRs). Pinned to a commit so every build gets the
 # same Rune. To change Rune: commit and push on the fork's `rune-code` branch, then bump `rev`.
 # Locally, `.cargo/config.toml` (not committed) swaps in the clone at ../rune.
-rune = { git = "https://github.com/JoshuaSchell/rune", rev = "1a105febc679d59c073b3995e63bd06192b964f1", features = ["native-file-dialog"] }
-rune-kit = { git = "https://github.com/JoshuaSchell/rune", rev = "1a105febc679d59c073b3995e63bd06192b964f1", features = ["markdown"] }
-rune-theme-opencode = { git = "https://github.com/JoshuaSchell/rune", rev = "1a105febc679d59c073b3995e63bd06192b964f1" }
-rune-notify = { git = "https://github.com/JoshuaSchell/rune", rev = "1a105febc679d59c073b3995e63bd06192b964f1" }
+rune = { git = "https://github.com/JoshuaSchell/rune", rev = "5fa812c615d39a241a7c2f48e52d6269c6525622", features = ["native-file-dialog"] }
+rune-kit = { git = "https://github.com/JoshuaSchell/rune", rev = "5fa812c615d39a241a7c2f48e52d6269c6525622", features = ["markdown"] }
+rune-theme-opencode = { git = "https://github.com/JoshuaSchell/rune", rev = "5fa812c615d39a241a7c2f48e52d6269c6525622" }
+rune-notify = { git = "https://github.com/JoshuaSchell/rune", rev = "5fa812c615d39a241a7c2f48e52d6269c6525622" }
 serde_json = "1"
 base64 = "0.22"
 # Local dates for the usage page (days, "resets 9:20 PM").

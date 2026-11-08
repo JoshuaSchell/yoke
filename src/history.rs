@@ -81,7 +81,7 @@ pub fn projects() -> Vec<PathBuf> {
         if found.iter().any(|(_, p)| *p == cwd) { continue; }
         found.push((when, cwd));
     }
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by_key(|f| std::cmp::Reverse(f.0));
     found.into_iter().map(|(_, p)| p).collect()
 }
 
@@ -114,7 +114,7 @@ pub fn list(project: &Path) -> Vec<Session> {
             Some(Session { id, title, modified, path })
         })
         .collect();
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|x| std::cmp::Reverse(x.modified));
     out
 }
 
@@ -198,6 +198,7 @@ pub fn load(path: &Path) -> Loaded {
                             // A call with no result in the file was cut off.
                             state: ToolState::Failed,
                             output: String::new(),
+                            body: crate::harness::tool_body(b["name"].as_str().unwrap_or_default(), &b["input"]),
                         }),
                         _ => {}
                     }

@@ -43,10 +43,33 @@ pub struct Updater {
     last: Option<Instant>,
 }
 
+impl Updater {
+    /// How long ago the last check started.
+    pub fn checked(&self) -> Option<Duration> {
+        self.last.map(|t| t.elapsed())
+    }
+
+    /// A check or a download is under way.
+    pub fn working(&self) -> bool {
+        matches!(self.status, Status::Checking | Status::Installing(_))
+    }
+}
+
 impl Default for Updater {
     fn default() -> Updater {
         Updater { status: Status::Idle, rx: None, last: None }
     }
+}
+
+/// Whether this process runs from an app bundle, so updates come to it. Asked once.
+pub fn installed() -> bool {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INSTALLED.get_or_init(|| bundle().is_some())
+}
+
+/// Whether `YOKE_UPDATE_ENDPOINT` may point here: https, or http on this computer.
+fn allowed_endpoint(url: &str) -> bool {
+    url.starts_with("https://") || ["http://127.0.0.1:", "http://127.0.0.1/", "http://localhost:", "http://localhost/"].iter().any(|p| url.starts_with(p))
 }
 
 /// The app bundle this process runs from (`…/Yoke.app`), or `None` outside one.
@@ -85,7 +108,9 @@ impl App {
     pub fn check_for_update(&mut self) {
         if self.update.rx.is_some() || matches!(self.update.status, Status::Ready(_)) || self.waker.is_none() { return; }
         self.update.last = Some(Instant::now());
-        let endpoint = std::env::var("YOKE_UPDATE_ENDPOINT").ok();
+        // Somewhere else only over https, or on this computer for trying an update locally: a
+        // plain-http endpoint elsewhere could offer an older signed build as the newest.
+        let endpoint = std::env::var("YOKE_UPDATE_ENDPOINT").ok().filter(|e| allowed_endpoint(e));
         let Some(exe) = std::env::current_exe().ok().filter(|e| bundle_of(e).is_some()) else { return };
         let (tx, rx) = channel();
         self.update.rx = Some(rx);
@@ -138,6 +163,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_https_or_this_computer_can_stand_in_for_releases() {
+        assert!(allowed_endpoint("https://example.com/latest.json"));
+        assert!(allowed_endpoint("http://127.0.0.1:8080/latest.json"));
+        assert!(!allowed_endpoint("http://example.com/latest.json"));
+        assert!(!allowed_endpoint("http://127.0.0.1.example.com/latest.json"));
+    }
 
     #[test]
     fn finds_the_bundle_it_runs_from() {

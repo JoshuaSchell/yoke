@@ -18,6 +18,7 @@ use crate::harness::Decision;
 pub enum Cmd {
     NewThread,
     OpenFolder,
+    OpenInEditor,
     ToggleSidebar,
     Settings,
     Usage,
@@ -37,9 +38,10 @@ pub enum Cmd {
     AccessMenu,
 }
 
-pub const ALL: [Cmd; 19] = [
+pub const ALL: [Cmd; 20] = [
     Cmd::NewThread,
     Cmd::OpenFolder,
+    Cmd::OpenInEditor,
     Cmd::ToggleSidebar,
     Cmd::Settings,
     Cmd::Usage,
@@ -64,6 +66,7 @@ impl Cmd {
         match self {
             Cmd::NewThread => "new-thread",
             Cmd::OpenFolder => "open-folder",
+            Cmd::OpenInEditor => "open-in-editor",
             Cmd::ToggleSidebar => "toggle-sidebar",
             Cmd::Settings => "settings",
             Cmd::Usage => "usage",
@@ -88,6 +91,7 @@ impl Cmd {
         match self {
             Cmd::NewThread => "New thread",
             Cmd::OpenFolder => "Add a project",
+            Cmd::OpenInEditor => "Open the thread's folder in your editor",
             Cmd::ToggleSidebar => "Show or hide the sidebar",
             Cmd::Settings => "Open Settings",
             Cmd::Usage => "Show usage and plan limits",
@@ -112,6 +116,7 @@ impl Cmd {
         match self {
             Cmd::NewThread => "mod+n",
             Cmd::OpenFolder => "mod+o",
+            Cmd::OpenInEditor => "mod+shift+o",
             Cmd::ToggleSidebar => "mod+shift+b",
             Cmd::Settings => "mod+comma",
             Cmd::Usage => "mod+shift+u",
@@ -239,6 +244,11 @@ pub fn dispatch(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         if ev.key == rune::Key::Escape { s.confirm_delete = None; return true; }
         return false;
     }
+    // "Trust this project?" likewise: Escape keeps the draft and sends nothing.
+    if s.confirm_trust.is_some() {
+        if ev.key == rune::Key::Escape { s.confirm_trust = None; return true; }
+        return false;
+    }
     for c in ALL {
         if s.keys.matches(c, ev) && run(s, c, tx) {
             return true;
@@ -253,7 +263,7 @@ pub fn run(s: &mut App, c: Cmd, tx: &mut Tx) -> bool {
     if s.settings {
         match c {
             Cmd::Stop => { s.close_settings(); return true; }
-            Cmd::Settings | Cmd::Usage | Cmd::FrameStats | Cmd::ToggleSidebar => {}
+            Cmd::Settings | Cmd::Usage | Cmd::FrameStats | Cmd::ToggleSidebar | Cmd::OpenInEditor => {}
             _ => s.close_settings(),
         }
     }
@@ -261,13 +271,17 @@ pub fn run(s: &mut App, c: Cmd, tx: &mut Tx) -> bool {
     if s.usage_open {
         match c {
             Cmd::Stop => { s.close_usage(); return true; }
-            Cmd::Settings | Cmd::Usage | Cmd::FrameStats | Cmd::ToggleSidebar => {}
+            Cmd::Settings | Cmd::Usage | Cmd::FrameStats | Cmd::ToggleSidebar | Cmd::OpenInEditor => {}
             _ => s.close_usage(),
         }
     }
     match c {
         Cmd::NewThread => { s.new_thread(); }
         Cmd::OpenFolder => s.choose_folder(tx),
+        Cmd::OpenInEditor => {
+            if s.open_target().is_none() { return false; }
+            s.open_in(s.editor());
+        }
         Cmd::ToggleSidebar => { s.sidebar.toggle(); }
         Cmd::Settings => { s.open_settings(); }
         Cmd::Usage => { if s.usage_open { s.close_usage() } else { s.open_usage() } }
@@ -300,9 +314,8 @@ pub fn run(s: &mut App, c: Cmd, tx: &mut Tx) -> bool {
         }
         Cmd::Allow => return s.answer_first(Decision::Allow),
         Cmd::AlwaysAllow => return s.answer_first(Decision::AlwaysAllow),
-        // The harness, model and effort all live in the model picker.
-        Cmd::HarnessMenu | Cmd::ModelMenu | Cmd::EffortMenu => s.toggle_picker(),
-        Cmd::AccessMenu => s.toggle_menu("access"),
+        // The harness, model, effort and access all live in the model picker.
+        Cmd::HarnessMenu | Cmd::ModelMenu | Cmd::EffortMenu | Cmd::AccessMenu => s.toggle_picker(),
     }
     true
 }

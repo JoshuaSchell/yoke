@@ -9,7 +9,7 @@
 
 use serde_json::Value;
 
-use super::{AskRequest, Event, ParseState, output_text, tool_detail};
+use super::{AskRequest, Event, ParseState, output_text, tool_body, tool_detail};
 
 pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
     let s = |k: &str| v.get(k).and_then(Value::as_str);
@@ -87,6 +87,7 @@ pub fn parse(v: &Value, p: &mut ParseState) -> Vec<Event> {
                         id: b["id"].as_str().unwrap_or_default().into(),
                         name: b["name"].as_str().unwrap_or("tool").into(),
                         detail: tool_detail(&b["input"]),
+                        body: tool_body(b["name"].as_str().unwrap_or_default(), &b["input"]),
                     }),
                     _ => {}
                 }
@@ -195,7 +196,7 @@ mod tests {
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"a\nb","is_error":false}]}}"#,
         ]);
         assert_eq!(ev, vec![
-            Event::ToolStart { id: "t1".into(), name: "Bash".into(), detail: "ls -la".into() },
+            Event::ToolStart { id: "t1".into(), name: "Bash".into(), detail: "ls -la".into(), body: crate::harness::ToolBody::Code("ls -la\nmore".into()) },
             Event::ToolEnd { id: "t1".into(), ok: true, output: "a\nb".into() },
         ]);
     }
@@ -235,5 +236,68 @@ mod tests {
         // Our own initialize's answer is ignored.
         let v: Value = serde_json::from_str(r#"{"type":"control_response","response":{"subtype":"success","request_id":"yoke-init","response":{}}}"#).unwrap();
         assert!(parse(&v, &mut p).is_empty());
+    }
+
+    /// An edit carries its before and after, a write its file, and a long command the whole of
+    /// itself; a short command is all on its row already.
+    #[test]
+    fn tool_calls_carry_their_bodies() {
+        use crate::harness::{ToolBody, tool_body};
+        use serde_json::json;
+        assert_eq!(tool_body("Edit", &json!({"file_path": "a.rs", "old_string": "x", "new_string": "y"})), ToolBody::Edits(vec![("x".into(), "y".into())]));
+        assert_eq!(tool_body("MultiEdit", &json!({"edits": [{"old_string": "a", "new_string": "b"}, {"old_string": "c", "new_string": "d"}]})), ToolBody::Edits(vec![("a".into(), "b".into()), ("c".into(), "d".into())]));
+        assert_eq!(tool_body("edit", &json!({"filePath": "a.ts", "oldString": "1", "newString": "2"})), ToolBody::Edits(vec![("1".into(), "2".into())]), "OpenCode's names");
+        assert_eq!(tool_body("Write", &json!({"file_path": "a.rs", "content": "fn main() {}"})), ToolBody::Code("fn main() {}".into()));
+        assert_eq!(tool_body("Bash", &json!({"command": "ls -la"})), ToolBody::None);
+        assert_eq!(tool_body("Bash", &json!({"command": "cd x &&\\\n  cargo test"})), ToolBody::Code("cd x &&\\\n  cargo test".into()));
+        assert_eq!(tool_body("Grep", &json!({"pattern": "fn"})), ToolBody::None);
+        let big = "line\n".repeat(20_000);
+        let ToolBody::Code(kept) = tool_body("Write", &json!({"content": big})) else { panic!() };
+        assert!(kept.len() <= 64 * 1024 && kept.ends_with("line"), "a large file is cut at a line's end");
+    }
+
+    /// "Always allow" saves only rules that allow, in the project's local settings or the
+    /// session: not a mode change, an added folder, or the user's global settings.
+    #[test]
+    fn always_allow_keeps_only_local_allow_rules() {
+        use crate::harness::{AskRequest, Decision};
+        use serde_json::json;
+        let local = json!({"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "cargo check:*"}], "behavior": "allow", "destination": "localSettings"});
+        let ask = AskRequest {
+            request_id: "r1".into(),
+            tool_use_id: None,
+            tool: "Bash".into(),
+            input: json!({"command": "cargo check"}),
+            suggestions: vec![
+                local.clone(),
+                json!({"type": "addRules", "rules": [{"toolName": "Bash"}], "behavior": "allow", "destination": "userSettings"}),
+                json!({"type": "setMode", "mode": "bypassPermissions", "destination": "session"}),
+                json!({"type": "addDirectories", "directories": ["/"], "destination": "session"}),
+            ],
+            reason: None,
+        };
+        assert_eq!(ask.safe_rules(), vec![local]);
+        assert_eq!(ask.rule_labels(), ["Bash(cargo check:*)"]);
+        let reply: serde_json::Value = serde_json::from_str(&ask.reply(&Decision::AlwaysAllow)).unwrap();
+        assert_eq!(reply["response"]["response"]["updatedPermissions"].as_array().unwrap().len(), 1);
+    }
+
+    /// A prompt that starts with "-" reaches Codex and OpenCode as the prompt, not an option.
+    #[test]
+    fn a_prompt_starting_with_a_dash_isnt_an_option() {
+        use crate::harness::{Access, DEFAULT_EFFORT, Harness, Turn};
+        let turn = Turn { harness: Harness::Codex, prompt: "--dangerously-bypass-approvals-and-sandbox".into(), model: crate::harness::models::DEFAULT.into(), effort: DEFAULT_EFFORT.into(), access: Access::ReadOnly, resume: None, cwd: ".".into(), images: Vec::new(), peer_messages: false };
+        let args = |h: Harness| h.command(std::path::Path::new("cli"), &turn).get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let codex = args(Harness::Codex);
+        assert_eq!(&codex[codex.len() - 2..], ["--", "--dangerously-bypass-approvals-and-sandbox"]);
+        assert_eq!(args(Harness::OpenCode).last().unwrap(), " --dangerously-bypass-approvals-and-sandbox");
+    }
+
+    /// A reset time past what the clock holds is dropped, not a crash.
+    #[test]
+    fn an_impossible_reset_time_doesnt_crash() {
+        let mut l = crate::harness::limits::Limits::from_json(&serde_json::json!({"available": true, "windows": [{"id": "session", "label": "Session", "used": 10.0}], "checked": 1})).unwrap_or_else(|| panic!("limits parse"));
+        let _ = l.apply_event(&serde_json::json!({"rateLimitType": "five_hour", "utilization": 0.5, "resetsAt": 1e20}));
+        let _ = crate::harness::limits::Limits::from_json(&serde_json::json!({"available": true, "windows": [{"id": "session", "label": "Session", "used": 10.0, "resets": u64::MAX}], "checked": u64::MAX}));
     }
 }

@@ -57,9 +57,13 @@ pub fn kit(theme: Theme, dark: bool) -> &'static Kit {
 
 /// Markdown in the theme's code colours.
 pub fn markdown(theme: Theme, k: &Kit) -> MarkdownStyle {
-    let style = MarkdownStyle::from_kit(k);
-    let Some(spec) = theme.spec(k.dark) else { return style };
+    MarkdownStyle::from_kit(k).syntax_theme(syntax(theme, k))
+}
+
+/// The theme's code colours, for Markdown's code blocks and the code in tool rows.
+pub fn syntax(theme: Theme, k: &Kit) -> SyntaxTheme {
     let mut syn = SyntaxTheme::from_kit(k);
+    let Some(spec) = theme.spec(k.dark) else { return syn };
     for (kind, c) in [
         (Syntax::Keyword, spec.syntax[0]),
         (Syntax::String, spec.syntax[1]),
@@ -71,7 +75,7 @@ pub fn markdown(theme: Theme, k: &Kit) -> MarkdownStyle {
     ] {
         syn = syn.with(kind, hex(c));
     }
-    style.syntax_theme(syn)
+    syn
 }
 
 /// A theme for one appearance, as sRGB hex.

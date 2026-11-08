@@ -2,15 +2,17 @@
 //! picker's chip, and access), and the send / queue / steer / stop buttons.
 
 use rune::{El, TextStyle, Tx, col, icon, row, text, text_input};
-use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Select};
+use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit};
 use rune_theme_opencode::icons;
 
 use crate::app::{App, Thread};
-use crate::harness::{self, ACCESS, Access};
+use crate::harness;
 use crate::shortcuts::{self, Cmd};
 use crate::ui::transcript::MAX_W;
 
-pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
+/// `floating`: over the transcript (a thread), the card is frosted glass, and a fade behind the
+/// hint line keeps it legible over the text scrolling under it.
+pub fn view(s: &App, k: &Kit, floating: bool, layer: &mut Vec<El>) -> El {
     let c = &k.c;
     let running = s.thread().is_some_and(|t| t.busy);
     let typed = !s.draft.text.trim().is_empty() || !s.attachments.is_empty();
@@ -52,83 +54,84 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let narrow = rune::memo::layout_with("composer", |r| r[2] < 520.0).unwrap_or(false);
     // Harness, model and effort: one chip and its popover (`ui::picker`).
     let model_pick = crate::ui::picker::view(s, k, narrow, layer);
-    // "Ask first" only for harnesses that can ask; the others would treat it as read only.
-    let access: Vec<&str> = ACCESS.iter().filter(|a| **a != Access::Ask || h.asks()).map(|a| a.label()).collect();
-    let access_pick = Select::new("access", &access)
-        .current(Some(s.access.for_harness(h).label()))
-        .label("Access")
-        .open(s.open_menu == Some("access"))
-        .on_toggle(|s: &mut App| s.toggle_menu("access"))
-        .on_close(|s: &mut App| s.open_menu = None)
-        .on_choose(|s: &mut App, v: &str, _: &mut Tx| {
-            if let Some(a) = Access::from_label(v) { s.set_access(a); }
-            s.open_menu = None;
-        })
-        .build(k, layer)
-        .shrink();
 
     // While a turn runs: Stop, and once something is typed, Steer (now) and Queue (after).
     let mut actions = row().gap(6.0).center_y();
     if running {
         if typed {
             actions = actions
-                .child(IconButton::new(&icons::ARROW_UP_RIGHT)
+                .child(round(IconButton::new(&icons::ARROW_UP_RIGHT)
                     .variant(IconButtonVariant::GhostMuted)
                     .control_size(ControlSize::Large)
                     .label("Steer: stop the turn and send this now")
                     .shortcut(&steer_key)
                     .on_press_tx(|s: &mut App, tx: &mut Tx| s.steer(tx))
-                    .build(k)
+                    .build(k))
                     .key("steer"))
-                .child(IconButton::new(&icons::ARROW_UP)
+                .child(round(IconButton::new(&SEND)
                     .variant(IconButtonVariant::Submit)
                     .control_size(ControlSize::Large)
                     .label("Queue: send when the turn ends")
                     .shortcut(&queue_key)
                     .on_press_tx(|s: &mut App, tx: &mut Tx| s.send(tx))
-                    .build(k)
+                    .build(k))
                     .key("queue"));
         }
-        actions = actions.child(IconButton::new(&icons::STOP)
+        actions = actions.child(round(IconButton::new(&STOP)
             .variant(IconButtonVariant::Contrast)
             .control_size(ControlSize::Large)
             .label("Stop")
             .shortcut(&stop_key)
             .on_press(|s: &mut App| if let Some(id) = s.selected { s.stop(id) })
-            .build(k)
+            .build(k))
             .key("stop"));
-    } else {
-        actions = actions.child(IconButton::new(&icons::ARROW_UP)
+    } else if typed {
+        actions = actions.child(round(IconButton::new(&SEND)
             .variant(IconButtonVariant::Submit)
             .control_size(ControlSize::Large)
             .label("Send")
             .shortcut(&send_key)
-            .disabled(!typed)
             .on_press_tx(|s: &mut App, tx: &mut Tx| s.send(tx))
-            .build(k)
+            .build(k))
             .key("send"));
+    } else {
+        // Nothing to send yet: a quiet outline of the button, rather than the filled one
+        // greyed out, which read as a stray square.
+        actions = actions.child(row().key("send").role("button").label("Send").disabled(true)
+            .size(SEND_SIZE, SEND_SIZE).radius(SEND_SIZE / 2.0).center()
+            .fill(c.surface_raised_base).border(1.0, c.border_weak)
+            .child(icon(&SEND, 16.0).key("icon").color(c.icon_faint).a11y_hidden()));
     }
 
     // In a narrow window the pickers give way (their labels cut with "…"); the context gauge
     // and the buttons keep their size, so send never falls outside the card.
+    // The paperclip, then harness, model, effort and access: one chip (access is in its popover).
+    let clip = IconButton::new(&PAPERCLIP)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Large)
+        .label("Attach a file")
+        .help("Attach a file (or drop files on the window, or paste an image)")
+        .on_press_tx(|s: &mut App, tx: &mut Tx| s.choose_attachment(tx))
+        .build(k)
+        .key("attach");
     let mut bar = row().w_full().gap(2.0).center_y()
-        .child(model_pick)
-        .child(dot(k))
-        .child(access_pick);
+        .child(clip)
+        .child(model_pick);
     // Local or a new worktree, for a new thread in a git repository (as in T3 Code).
     if s.thread().is_none() && s.project().is_some_and(|p| p.repo) {
         bar = bar.child(dot(k)).child(worktree_chip(s, k));
     }
     let mut bar = bar.child(rune::el().grow(1.0));
     // How full the thread's context window is.
-    if let Some(gauge) = crate::ui::usage::context_gauge(s, k) {
+    if let Some(gauge) = crate::ui::usage::context_gauge(s, k, layer) {
         bar = bar.child(gauge.mr(4.0));
     }
     let bar = bar.child(actions);
 
     let (border, width) = if s.drop_over { (c.border_focus, 2.0) } else { (c.border_weak, 1.0) };
-    let mut card = col().key("composer").w_full().max_w(MAX_W).radius(18.0).fill(c.surface_raised_base).border(width, border)
+    let mut card = col().key("composer").w_full().max_w(MAX_W).radius(18.0).border(width, border)
         .shadow(8.0, 24.0, rune::Color::BLACK.alpha(0.10));
+    card = if floating { card.backdrop_blur(GLASS_BLUR).fill(c.surface_raised_base.alpha(GLASS)) } else { card.fill(c.surface_raised_base) };
     if s.drop_over {
         card = card.child(row().w_full().px(16.0).pt(12.0).gap(8.0).center_y()
             .child(icon(&icons::PHOTO, 14.0).color(c.icon_base))
@@ -164,9 +167,24 @@ pub fn view(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     if let Some(t) = s.thread().filter(|t| !t.queue.is_empty()) {
         stack = stack.child(queue(t, running, &steer_key, k));
     }
-    row().w_full().justify_center().px(24.0).pb(14.0).pt(4.0)
-        .child(stack.child(card).child(hint))
+    let dock = row().key("composer-dock").w_full().justify_center().px(24.0).pb(14.0).pt(4.0);
+    let dock = if floating {
+        // Under the card's lower half and the hint: the pane's colour, faded in from clear.
+        let bg = c.bg_base;
+        dock.child(rune::el().key("dock-solid").pin(Some(0.0), None, Some(0.0), Some(0.0)).h(DOCK_SOLID).fill(bg).a11y_hidden())
+            .child(rune::el().key("dock-fade").pin(Some(0.0), None, Some(0.0), Some(DOCK_SOLID)).h(DOCK_FADE).gradient(bg.alpha(0.0), bg).a11y_hidden())
+    } else {
+        dock
+    };
+    dock.child(stack.child(card).child(hint))
 }
+
+/// The floating card's fill (the rest shows the blurred conversation behind) and its blur.
+const GLASS: f32 = 0.72;
+const GLASS_BLUR: f32 = 6.0;
+/// The band behind the hint line: solid from the pane's foot this high, then fading out above.
+const DOCK_SOLID: f32 = 30.0;
+const DOCK_FADE: f32 = 28.0;
 
 /// Where a new thread runs: the project's folder, or a worktree of its own on a new branch.
 fn worktree_chip(s: &App, k: &Kit) -> El {
@@ -183,7 +201,7 @@ fn worktree_chip(s: &App, k: &Kit) -> El {
         .on_press(|s: &mut App| s.toggle_worktree_mode())
 }
 
-/// Images waiting to go with the next message, each with a remove button.
+/// Files waiting to go with the next message (images as thumbnails), each with a remove button.
 fn attachments(s: &App, k: &Kit) -> El {
     let c = &k.c;
     let mut strip = row().key("attachments").w_full().px(14.0).pt(12.0).gap(8.0).wrap();
@@ -192,7 +210,10 @@ fn attachments(s: &App, k: &Kit) -> El {
         let name = a.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         let thumb = match a.thumb.as_ref().filter(|t| t.error().is_none()) {
             Some(t) => rune::el().size(56.0, 56.0).radius(10.0).fill(c.layer_02).pixels_fit(t.pixels(), rune::SurfaceFit::Fill),
-            None => row().size(56.0, 56.0).radius(10.0).fill(c.layer_02).center().child(icon(&icons::PHOTO, 18.0).color(c.icon_weaker)),
+            None => {
+                let glyph = if crate::app::is_image(&a.path) { &icons::PHOTO } else if a.dir { &icons::FOLDER } else { &icons::FILE_DOCUMENT };
+                row().size(56.0, 56.0).radius(10.0).fill(c.layer_02).center().child(icon(glyph, 18.0).color(c.icon_weaker))
+            }
         };
         let remove = IconButton::new(&icons::CLOSE_SMALL)
             .variant(IconButtonVariant::GhostMuted)
@@ -248,6 +269,35 @@ fn queue(t: &Thread, running: bool, steer_key: &str, k: &Kit) -> El {
     }
     list
 }
+
+/// A paperclip, on the set's 16-point grid and 1.25-point line.
+static PAPERCLIP: rune::Icon = rune::Icon {
+    name: "yoke-paperclip",
+    view: 16.0,
+    body: r#"<path d="M13.25 7.6L8.1 12.75a3.25 3.25 0 0 1-4.6-4.6l5.5-5.5a2.15 2.15 0 0 1 3.05 3.05l-5.45 5.45a1.08 1.08 0 0 1-1.52-1.52L10 4.7" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+/// The send, queue, steer and stop buttons: circles, a little larger than the pickers' row.
+const SEND_SIZE: f32 = 30.0;
+
+fn round(b: El) -> El {
+    b.size(SEND_SIZE, SEND_SIZE).radius(SEND_SIZE / 2.0)
+}
+
+/// Send: a 1.75-point arrow with round ends, heavier than the set's hairline one so it holds
+/// its own on the filled circle.
+static SEND: rune::Icon = rune::Icon {
+    name: "yoke-send",
+    view: 16.0,
+    body: r#"<path d="M8 12.75V3.5M3.75 7.5L8 3.25L12.25 7.5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
+
+/// Stop: a rounded square, as the send arrow's weight.
+static STOP: rune::Icon = rune::Icon {
+    name: "yoke-stop",
+    view: 16.0,
+    body: r#"<rect x="4.5" y="4.5" width="7" height="7" rx="1.5" fill="currentColor"/>"#,
+};
 
 fn dot(k: &Kit) -> El {
     text("·").font(k.ty.small).color(k.c.text_faint).px(2.0)

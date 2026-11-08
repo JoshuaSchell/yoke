@@ -192,30 +192,112 @@ fn context_words(c: &Context) -> String {
 }
 
 /// The composer's gauge: how full the thread's context window is. Claude Code threads only,
-/// since the other CLIs don't say; a new thread's is at zero. Hover for the numbers.
-pub fn context_gauge(s: &App, k: &Kit) -> Option<El> {
+/// since the other CLIs don't say; a new thread's is at zero. Hovering opens a card with the
+/// numbers (`context_card`).
+pub fn context_gauge(s: &App, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
     let ctx = s.context()?;
     let c = &k.c;
     let frac = ctx.fraction();
-    let mut help = format!("Context: {}", context_words(&ctx));
-    if !ctx.measured { help.push_str(" · the window's size is a guess until the first reply"); }
-    if frac >= 0.9 { help.push_str(" · Claude Code compacts the conversation when it fills"); }
+    if s.hover == Some("context") {
+        layer.push(hover_card(k, "context", rune::Side::Top, 280.0, context_card(&ctx, k)));
+    }
     Some(row().key("context-gauge").h(28.0).px(6.0).center_y().radius(8.0)
+        .hover(c.hover)
         .label(format!("Context window: {}", context_words(&ctx)))
-        .help(help)
+        .on_hover_change(|s: &mut App, on: bool, _: &mut Tx| hover(s, "context", on))
         .child(dial("context", Some(frac), tone(frac, Good::Low, k), c.icon_muted, c.surface_raised_base, 18.0)))
 }
 
-/// The plan's tightest window, for the toolbar's gauge, and every window's line for its tooltip.
-fn plan_reading(s: &App) -> Option<(&Window, String)> {
-    let l = s.limits.as_ref().filter(|l| l.available)?;
-    let w = l.tightest()?;
+/// Opens or closes a gauge's hover card as the pointer comes and goes.
+fn hover(s: &mut App, which: &'static str, on: bool) {
+    if on { s.hover = Some(which); } else if s.hover == Some(which) { s.hover = None; }
+}
+
+/// A gauge's hover card: a raised panel beside the gauge keyed `{key}-gauge`, its right edge
+/// on the gauge's, entering as the app's other overlays do. It's inert, so the pointer passes
+/// through it and it can't hold itself open.
+fn hover_card(k: &Kit, key: &str, side: rune::Side, width: f32, body: El) -> El {
+    let origin = rune::Vec2::new(1.0, if side == rune::Side::Top { 1.0 } else { 0.0 });
+    let panel = col().key(format!("{key}-card")).w(width).padding(14.0).gap(10.0).radius(12.0)
+        .fill(k.c.surface_raised_base).border(1.0, k.c.border_weak)
+        .child(body)
+        .inert();
+    k.elevate(panel, &k.elevation.overlay)
+        .anchored(format!("{key}-gauge"), side, rune::Align::End, 8.0)
+        .transition(rune::Transition::scale_anchor(0.96, origin))
+        .token_motion(k.motion.overlay)
+}
+
+/// A hover card's heading: a title and, at the right, a figure or a note.
+fn card_head(k: &Kit, title: String, right: El) -> El {
+    row().w_full().gap(8.0).center_y()
+        .child(text(title).font(k.ty.ui_medium).color(k.c.text_strong).truncate().shrink().grow(1.0).min_w(0.0))
+        .child(right)
+}
+
+/// The context card: how full, as a bar in the gauge's colour, the tokens used and left, and
+/// a word on what happens as it fills.
+fn context_card(ctx: &Context, k: &Kit) -> El {
+    let c = &k.c;
+    let frac = ctx.fraction();
+    let color = tone(frac, Good::Low, k);
+    let tnum = |t: TextStyle| t.features("'tnum' 1");
+    let pct = text(format!("{:.0}%", frac * 100.0)).font(tnum(k.ty.ui_medium)).color(c.text_strong);
+    let h = 6.0;
+    let mut track = row().w_full().h(h).radius(h / 2.0).fill(color.alpha(0.18)).clip_rounded(h / 2.0);
+    if frac > 0.0 {
+        track = track.child(el().w_frac(frac as f32).min_w(h).h_full().radius(h / 2.0).fill(color));
+    }
+    let left = ctx.window.saturating_sub(ctx.used);
+    let figures = row().w_full().gap(8.0).center_y()
+        .child(text(format!("{} of {} tokens", compact(ctx.used), compact(ctx.window))).font(tnum(k.ty.small)).color(c.text_base).truncate().shrink().grow(1.0).min_w(0.0))
+        .child(text(format!("{} left", compact(left))).font(tnum(k.ty.small)).color(c.text_faint));
+    let note = if !ctx.measured {
+        Some("The window's size is a guess until Claude Code's first reply.")
+    } else if frac >= 0.9 {
+        Some("Nearly full. Claude Code compacts the conversation when it fills, summarising what came before.")
+    } else {
+        None
+    };
+    let mut body = col().w_full().gap(8.0)
+        .child(card_head(k, "Context window".into(), pct))
+        .child(track)
+        .child(figures);
+    if let Some(n) = note {
+        body = body.child(text(n).font(k.ty.text_xsmall).color(c.text_faint).wrap().w_full());
+    }
+    body
+}
+
+/// The plan card: every window's meter (used, the even-pace tick, when it resets), extra usage,
+/// and the way to the page.
+fn plan_card(s: &App, k: &Kit) -> El {
+    let c = &k.c;
+    let key = s.keys.label(crate::shortcuts::Cmd::Usage);
+    let foot = text(if key.is_empty() { "Click for usage and spend".to_owned() } else { format!("Click for usage and spend  ·  {key}") })
+        .font(k.ty.text_xsmall).color(c.text_faint);
+    let Some(l) = s.limits.as_ref().filter(|l| l.available) else {
+        let why = match (&s.limits, &s.limits_error) {
+            (_, Some(e)) => format!("Couldn't read the plan's limits: {e}"),
+            (Some(_), None) => "Signed in without a plan, so every token is billed.".to_owned(),
+            (None, None) if s.binary(Harness::Claude).is_none() => "Claude Code isn't installed, so there's no plan to read.".to_owned(),
+            (None, None) => "Reading the plan's limits…".to_owned(),
+        };
+        return col().w_full().gap(8.0)
+            .child(card_head(k, "Usage".into(), el()))
+            .child(text(why).font(k.ty.small).color(c.text_muted).wrap().w_full())
+            .child(foot);
+    };
     let now = SystemTime::now();
-    let lines: Vec<String> = l.windows.iter().map(|w| {
-        let reset = resets(w, now);
-        if reset.is_empty() { format!("{}: {:.0}% used", w.label, w.used) } else { format!("{}: {:.0}% used · {}", w.label, w.used, reset.to_lowercase()) }
-    }).collect();
-    Some((w, format!("{}\n{}", plan_title(l), lines.join("\n"))))
+    let mut body = col().w_full().gap(14.0)
+        .child(card_head(k, plan_title(l), text(format!("Read {}", ago(l.checked))).font(k.ty.text_xsmall).color(c.text_faint)));
+    for w in &l.windows {
+        body = body.child(meter(w, now, k, true));
+    }
+    if let Some(sp) = &l.spend {
+        body = body.child(spend_line(sp, k));
+    }
+    body.child(el().w_full().h(1.0).fill(c.border_weak)).child(foot)
 }
 
 fn spend_line(sp: &crate::harness::limits::Spend, k: &Kit) -> El {
@@ -520,29 +602,28 @@ fn card(k: &Kit, rows: Vec<El>) -> El {
 }
 
 /// The toolbar's Usage button: a gauge of the plan's tightest window, which is there to be used,
-/// so it reads red near empty and green near full. Hover for every window; click for the page.
-pub fn toolbar_button(s: &App, k: &Kit) -> El {
+/// so it reads red near empty and green near full. Hover for every window's meter
+/// (`plan_card`); click for the page.
+pub fn toolbar_button(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
     let c = &k.c;
-    let key = s.keys.label(crate::shortcuts::Cmd::Usage);
-    let reading = plan_reading(s);
-    let frac = reading.as_ref().map(|(w, _)| (w.used / 100.0).clamp(0.0, 1.0));
+    let frac = s.limits.as_ref().filter(|l| l.available).and_then(|l| l.tightest()).map(|w| (w.used / 100.0).clamp(0.0, 1.0));
     let color = frac.map_or(c.icon_muted, |f| tone(f, Good::High, k));
     let face = dial("plan", frac, color, c.icon_muted, c.bg_base, 16.0);
     let label = if s.usage_open { "Close Usage" } else { "Usage and plan limits" };
-    let help = match &reading {
-        Some((_, lines)) => format!("{lines}\n{label}"),
-        None => label.to_owned(),
-    };
-    Button::new(label)
+    // Not over the page it opens.
+    if s.hover == Some("plan") && !s.usage_open {
+        layer.push(hover_card(k, "plan", rune::Side::Bottom, 340.0, plan_card(s, k)));
+    }
+    let button = Button::new(label)
         .variant(ButtonVariant::GhostMuted)
         .expanded(s.usage_open)
-        .help(help)
-        .shortcut(&key)
         .label_with(move |_, _| face)
-        .on_press(|s: &mut App| if s.usage_open { s.close_usage() } else { s.open_usage() })
+        .on_press(|s: &mut App| { s.hover = None; if s.usage_open { s.close_usage() } else { s.open_usage() } })
         .build(k)
         .px(4.0)
-        .key("usage-toggle")
+        .key("usage-toggle");
+    row().key("plan-gauge").child(button)
+        .on_hover_change(|s: &mut App, on: bool, _: &mut Tx| hover(s, "plan", on))
 }
 
 #[cfg(test)]

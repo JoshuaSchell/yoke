@@ -7,6 +7,7 @@ mod app;
 mod attention;
 #[cfg(test)]
 mod bench;
+mod editors;
 mod harness;
 mod history;
 mod picker;
@@ -87,6 +88,13 @@ const SCENES: &[Scene] = &[
     ("approval", app::scenes::approval),
     ("attach", app::scenes::attach),
     ("collapsed", app::scenes::collapsed),
+    ("delete", app::scenes::delete),
+    ("context-hover", app::scenes::context_hover),
+    ("plan-hover", app::scenes::plan_hover),
+    ("update-ready", app::scenes::update_ready),
+    ("open-in", app::scenes::open_in),
+    ("tools", app::scenes::tools),
+    ("trust", app::scenes::trust),
 ];
 
 fn main() {
@@ -138,7 +146,9 @@ mod tests {
     }
 
     fn new_app() -> App {
-        App::new(Some(std::env::current_dir().unwrap()), rune::prefs::Prefs::memory())
+        let mut app = App::new(Some(std::env::current_dir().unwrap()), rune::prefs::Prefs::memory());
+        app.ask_trust = false;
+        app
     }
 
     fn runtime() -> Runtime<App> {
@@ -529,20 +539,148 @@ mod tests {
         assert_eq!(rt.state.picker_summary().1, Some("Max"), "the chip shows the effort");
     }
 
+    /// A file row's "Open in …" goes to the file at the line: a read's first, an edit's
+    /// replacement where the file has it now, a write's top. Other rows and gone files have none.
+    #[test]
+    fn tool_rows_open_their_file_at_the_line() {
+        use crate::app::{Item, Kind, ToolState};
+        use crate::harness::ToolBody;
+        let dir = std::env::temp_dir().join(format!("yoke-open-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "fn a() {}\n\nfn b() {\n    retry();\n}\n").unwrap();
+        let path = file.display().to_string();
+        let mut app = new_app();
+        crate::app::scenes::demo(&mut app);
+        let id = app.selected.unwrap();
+        let rows = [
+            ("Read", ToolBody::None, "    40\tfn b() {".to_owned()),
+            ("Edit", ToolBody::Edits(vec![("x".into(), "    retry();".into())]), String::new()),
+            ("Write", ToolBody::Code("fn a() {}".into()), String::new()),
+            ("Bash", ToolBody::None, String::new()),
+        ];
+        let t = app.threads.iter_mut().find(|t| t.id == id).unwrap();
+        for (i, (name, body, output)) in rows.into_iter().enumerate() {
+            let detail = if name == "Bash" { "ls".to_owned() } else { path.clone() };
+            t.items.push(Item { id: 9000 + i as u64, rev: 0, kind: Kind::Tool { call: format!("f{i}"), name: name.into(), detail, state: ToolState::Ok, output, body } });
+        }
+        assert_eq!(app.tool_file(9000), Some((file.clone(), Some(40))));
+        assert_eq!(app.tool_file(9001), Some((file.clone(), Some(4))), "the edit is on line 4 now");
+        assert_eq!(app.tool_file(9002), Some((file.clone(), None)));
+        assert_eq!(app.tool_file(9003), None, "a command isn't a file");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(app.tool_file(9000), None, "nor is a deleted one");
+        let mut rt = headless(app);
+        rt.frame(0.1);
+        assert!(rt.elements().iter().any(|e| e.key.as_deref() == Some("open-file")), "file rows have the button");
+    }
+
+    /// A project neither Yoke nor Claude Code trusts asks before its first turn, keeping the
+    /// draft; Escape sends nothing, Trust sends and remembers, and a folder inside a trusted one
+    /// (or one Claude Code trusts) doesn't ask.
+    #[test]
+    fn a_new_project_asks_to_be_trusted_before_its_first_turn() {
+        let mut app = new_app();
+        app.installed = vec![(Harness::Claude, Some(fake_claude("claude-trust")))];
+        app.choose_harness(Harness::Claude);
+        app.ask_trust = true;
+        app.claude_trusted = Some(Vec::new());
+        let project = app.current.clone().unwrap();
+        let mut rt = headless(app);
+        rt.key(key(Key::Text("hello".into())));
+        rt.key(key(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.confirm_trust.as_ref(), Some(&project));
+        assert!(rt.state.threads.iter().all(|t| t.items.is_empty()) && rt.state.draft.text == "hello", "nothing sent, the draft kept");
+        assert!(rt.find("trust-confirm").is_some());
+        rt.key(key(Key::Escape));
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.confirm_trust.is_none() && rt.state.draft.text == "hello");
+        rt.key(key(Key::Enter));
+        rt.frame(1.0 / 60.0);
+        let (x, y) = rt.find("trust-confirm").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert!(rt.state.confirm_trust.is_none() && rt.state.draft.text.is_empty(), "sent");
+        assert!(rt.state.trusted.contains(&project));
+        assert!(rt.state.is_trusted(&project.join("sub")), "a folder inside it is trusted too");
+        let saved: Vec<String> = rt.state.prefs.get("trusted.projects").unwrap();
+        assert_eq!(saved, [project.display().to_string()]);
+        rt.update(|s, _| s.claude_trusted = Some(vec![std::path::PathBuf::from("/claude/ok")]));
+        assert!(rt.state.is_trusted(std::path::Path::new("/claude/ok/app")) && !rt.state.is_trusted(std::path::Path::new("/elsewhere")));
+    }
+
+    /// A long thread title wraps inside the delete dialog instead of running past it.
+    #[test]
+    fn delete_dialog_wraps_a_long_title() {
+        let mut app = new_app();
+        crate::app::scenes::delete(&mut app);
+        let mut rt = headless(app);
+        rt.frame(1.0);
+        let rect = |key: &str| rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).map(|e| e.target).unwrap();
+        let (panel, what) = (rect("delete-dialog"), rt.elements().into_iter().find(|e| e.text.as_deref().is_some_and(|t| t.ends_with("can't be undone."))).map(|e| e.target).unwrap());
+        assert!(what[0] >= panel[0] && what[0] + what[2] <= panel[0] + panel[2], "the text {what:?} stays in the panel {panel:?}");
+        assert!(what[3] > 30.0, "and wraps onto more lines: {what:?}");
+    }
+
+    /// The toolbar's update button: a check while idle, a turning arrow while it checks and
+    /// downloads, then the same button restarts, held back while a turn runs.
+    #[test]
+    fn update_button_follows_the_update() {
+        use crate::updater::Status;
+        let mut app = new_app();
+        crate::app::scenes::demo(&mut app);
+        app.update.status = Status::Installing("9.9.9".into());
+        let mut rt = headless(app);
+        let label = |rt: &Runtime<App>| rt.elements().into_iter().find(|e| e.key.as_deref() == Some("update")).and_then(|e| e.label.clone());
+        assert_eq!(label(&rt).as_deref(), Some("Downloading update"));
+        assert!(rt.find("update-glyph").is_some());
+        rt.update(|s, _| s.update.status = Status::Ready("9.9.9".into()));
+        rt.frame(0.1);
+        assert_eq!(label(&rt).as_deref(), Some("Restart to update"));
+        let (x, y) = rt.find("update").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.2);
+        assert!(rt.state.update_ready().is_some(), "a running turn holds the restart back");
+    }
+
     /// The composer's gauge reads the thread's context window and the toolbar's the plan, each
-    /// with the numbers in its tooltip; the toolbar's opens the page, which ⇧⌘U and Esc close.
+    /// with the numbers in a hover card; the toolbar's opens the page, which ⇧⌘U and Esc close.
     #[test]
     fn usage_gauges_and_page() {
         use crate::ui::usage::{Good, tone};
         let mut app = new_app();
         crate::app::scenes::demo(&mut app);
         let mut rt = headless(app);
-        let help = |rt: &Runtime<App>, key: &str| rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).and_then(|e| e.help.clone()).unwrap_or_default();
-        let ctx = help(&rt, "context-gauge");
+        let label = |rt: &Runtime<App>, key: &str| rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).and_then(|e| e.label.clone()).unwrap_or_default();
+        let shows = |rt: &Runtime<App>, t: &str| rt.elements().iter().any(|e| e.text.as_deref() == Some(t));
+        let ctx = label(&rt, "context-gauge");
         assert!(ctx.contains("64.3K of 200K tokens (32%)"), "{ctx}");
-        let plan = help(&rt, "usage-toggle");
-        assert!(plan.contains("Session: 78% used") && plan.contains("Weekly · Fable: 12% used"), "{plan}");
         assert!(rt.find("context-needle").is_some() && rt.find("plan-needle").is_some());
+        assert!(rt.find("context-card").is_none() && rt.find("plan-card").is_none(), "no cards until hovered");
+        rt.update(|s, _| s.hover = Some("context"));
+        rt.frame(0.05);
+        assert!(rt.find("context-card").is_some() && shows(&rt, "64.3K of 200K tokens") && shows(&rt, "135.7K left"));
+        rt.update(|s, _| s.hover = Some("plan"));
+        rt.frame(0.08);
+        assert!(rt.find("plan-card").is_some() && rt.find("context-card").is_none());
+        assert!(shows(&rt, "Claude Max") && shows(&rt, "Weekly · Fable") && shows(&rt, "12% used"));
+        rt.update(|s, _| s.hover = None);
+        rt.frame(0.09);
+        // The pointer opens and closes them.
+        let (x, y) = rt.find("context-gauge").unwrap();
+        rt.pointer_move(x, y);
+        rt.frame(0.1);
+        assert_eq!(rt.state.hover, Some("context"));
+        let (x, y) = rt.find("usage-toggle").unwrap();
+        rt.pointer_move(x, y);
+        rt.frame(0.11);
+        assert_eq!(rt.state.hover, Some("plan"));
+        rt.pointer_move(x - 300.0, y + 300.0);
+        rt.frame(0.12);
+        assert_eq!(rt.state.hover, None);
 
         // Context is good low, the plan good high.
         let k = crate::ui::theme::kit(rt.state.theme, true);
@@ -555,7 +693,7 @@ mod tests {
         // A new thread's context is empty.
         rt.update(|s, _| s.new_thread());
         rt.frame(0.1);
-        assert!(help(&rt, "context-gauge").contains("0 of "), "{}", help(&rt, "context-gauge"));
+        assert!(label(&rt, "context-gauge").contains("0 of "), "{}", label(&rt, "context-gauge"));
 
         let (x, y) = rt.find("usage-toggle").unwrap();
         rt.pointer_down(x, y);
@@ -691,6 +829,7 @@ mod tests {
         git(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first"]);
 
         let mut app = App::new(Some(repo.clone()), rune::prefs::Prefs::memory());
+        app.ask_trust = false;
         if app.binary(Harness::Codex).is_some() { return; }
         app.choose_harness(Harness::Codex);
         let mut rt = headless(app);
@@ -740,7 +879,7 @@ mod tests {
             let n = rt.state.threads.iter().filter(|t| rt.state.in_project(t, &p.path)).count();
             eprintln!("{}: {n} threads", p.path.display());
         }
-        assert!(rt.state.threads.len() > 0);
+        assert!(!rt.state.threads.is_empty());
     }
 
     /// Every project's threads share one inbox, the last to come back first, each row naming
@@ -1009,7 +1148,7 @@ mod tests {
         rt.pointer_up(x, y);
         rt.frame(1.0);
         assert!(!rt.state.defaults.peer_messages);
-        assert_eq!(crate::settings::Prefs::load(&rt.state.prefs).peer_messages, false, "saved");
+        assert!(!crate::settings::Prefs::load(&rt.state.prefs).peer_messages, "saved");
     }
 
     /// Settings › Chat: with ⌘↩ sending, ↩ is a newline; with follow-ups steering, sending into
@@ -1056,7 +1195,7 @@ mod tests {
     }
 
     /// An image dropped on the window shows in the composer and goes to the CLI as an image
-    /// block; a file that isn't an image is refused with a note.
+    /// block; another file goes by its path, named in the prompt for the agent to read.
     #[test]
     fn dropped_images_attach_and_send() {
         let mut app = new_app();
@@ -1067,19 +1206,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let png = dir.join("shot.png");
         std::fs::write(&png, b"\x89PNG\r\n\x1a\nnot really").unwrap();
-        rt.drop_files(vec![dir.join("notes.txt")], Some((500.0, 300.0)));
+        let notes = dir.join("notes.txt");
+        std::fs::write(&notes, "todo").unwrap();
+        rt.drop_files(vec![notes.clone(), png.clone()], Some((500.0, 300.0)));
         rt.frame(1.0 / 60.0);
-        assert!(rt.state.attachments.is_empty() && rt.state.composer_error.is_some());
-        rt.drop_files(vec![png.clone()], Some((500.0, 300.0)));
-        rt.frame(1.0 / 60.0);
-        assert_eq!(rt.state.attachments.len(), 1);
+        assert_eq!(rt.state.attachments.len(), 2);
+        assert!(rt.state.composer_error.is_none());
         assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("shot.png")), "the attachment shows");
+        assert!(rt.elements().iter().any(|e| e.text.as_deref() == Some("notes.txt")));
         // Return with no text still sends the image.
         rt.key(key(Key::Enter));
         rt.frame(1.0 / 60.0);
         assert!(rt.state.attachments.is_empty());
         let t = rt.state.thread().expect("a thread started");
-        assert!(matches!(&t.items[0].kind, Kind::User(m) if m.contains("Attached: shot.png")));
+        assert!(matches!(&t.items[0].kind, Kind::User(m) if m.contains("Attached: shot.png, notes.txt")));
+        assert_eq!(crate::app::with_files("look", std::slice::from_ref(&notes)), format!("look\n\nAttached files:\n- {}", notes.display()));
         let turn = crate::harness::Turn { harness: Harness::Claude, prompt: "look".into(), model: "Default".into(), effort: crate::harness::DEFAULT_EFFORT.into(), access: Access::Edits, resume: None, cwd: ".".into(), images: vec![png], peer_messages: true };
         let msg: serde_json::Value = serde_json::from_str(Harness::Claude.stdin_lines(&turn).last().unwrap()).unwrap();
         assert_eq!(msg["message"]["content"][0]["text"], "look");

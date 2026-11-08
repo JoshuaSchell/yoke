@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-use super::{Event, ParseState, output_text, tool_detail};
+use super::{Event, ParseState, output_text, tool_body, tool_detail};
 
 pub fn parse(v: &Value, _: &mut ParseState) -> Vec<Event> {
     let mut out = Vec::new();
@@ -16,7 +16,7 @@ pub fn parse(v: &Value, _: &mut ParseState) -> Vec<Event> {
         Some("tool_use") => {
             let id = part["callID"].as_str().or(part["id"].as_str()).unwrap_or_default().to_owned();
             let state = &part["state"];
-            out.push(Event::ToolStart { id: id.clone(), name: part["tool"].as_str().unwrap_or("tool").into(), detail: tool_detail(&state["input"]) });
+            out.push(Event::ToolStart { id: id.clone(), name: part["tool"].as_str().unwrap_or("tool").into(), detail: tool_detail(&state["input"]), body: tool_body(part["tool"].as_str().unwrap_or_default(), &state["input"]) });
             match state["status"].as_str() {
                 Some("completed") => out.push(Event::ToolEnd { id, ok: true, output: output_text(&state["output"]) }),
                 Some("error") => out.push(Event::ToolEnd { id, ok: false, output: output_text(&state["error"]) }),

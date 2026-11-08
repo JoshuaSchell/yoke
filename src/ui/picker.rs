@@ -1,14 +1,15 @@
 //! The model picker, after T3 Code's: one chip in the composer ("Opus 5.5 · High") opening a
 //! popover with Favorites and the harnesses down a rail, a search over the chosen one's models
 //! (starred ones pinned to Favorites, ⌘1–⌘9 on the first nine), and the reasoning effort in a
-//! column beside them. State and keys live in `crate::picker`.
+//! column beside them, and the access level along the foot, as T3 Code puts it in the same
+//! popover. State and keys live in `crate::picker`.
 
 use rune::{Cursor, El, Icon, ScrollSpec, Tx, col, el, icon, row, text};
-use rune_kit::{Keybind, KeybindVariant, Kit, Placement, TextInput, popover, scrim};
+use rune_kit::{Keybind, KeybindVariant, Kit, Placement, SegmentedControl, TextInput, popover, scrim};
 use rune_theme_opencode::icons;
 
 use crate::app::App;
-use crate::harness::{self, ALL, Harness};
+use crate::harness::{self, ACCESS, ALL, Access, Harness};
 use crate::picker::{Row, effort_label};
 use crate::ui::sidebar::{claude_orange, provider_icon};
 
@@ -50,8 +51,8 @@ pub fn view(s: &App, k: &Kit, compact: bool, layer: &mut Vec<El>) -> El {
         .expanded(open)
         .fill(if open { c.surface_hover } else { rune::Color::TRANSPARENT })
         .hover(c.hover)
-        .label(format!("Model: {}, {model}{}", h.name(), effort.map_or(String::new(), |e| format!(", {e} reasoning"))))
-        .help(if key.is_empty() { "Choose model".to_owned() } else { format!("Choose model ({key})") })
+        .label(format!("Model: {}, {model}{}, {}", h.name(), effort.map_or(String::new(), |e| format!(", {e} reasoning")), s.access.for_harness(h).label()))
+        .help(if key.is_empty() { "Choose model and access".to_owned() } else { format!("Choose model and access ({key})") })
         .child(harness_icon(h, 14.0, k))
         .child(text(model).font(k.ty.ui_medium).color(c.text_strong).truncate().min_w(16.0));
     if let Some(e) = effort.filter(|_| !compact) {
@@ -80,7 +81,64 @@ fn panel(s: &App, k: &Kit) -> El {
     if !h.efforts().is_empty() {
         body = body.child(vline()).child(efforts(s, h, k));
     }
-    col().clip_rounded(12.0).child(body)
+    col().clip_rounded(12.0).child(body).child(el().w_full().h(1.0).fill(c.border_weak)).child(access_bar(s, k))
+}
+
+/// The access levels, along the popover's foot: how much the agent may do before it asks.
+/// "Ask first" only for harnesses that can ask (the others would treat it as read only), and
+/// Read only can't be switched on mid-turn.
+fn access_bar(s: &App, k: &Kit) -> El {
+    let c = &k.c;
+    let h = s.active_harness();
+    // OpenCode's one-shot `run` takes no permission flags Yoke could set, so a level picked
+    // here would only look like it applied.
+    if !h.has_access() {
+        return row().key("access-bar").w_full().px(14.0).py(12.0).gap(8.0).center_y()
+            .child(icon(&icons::SHIELD, 14.0).color(c.icon_weaker))
+            .child(text(format!("{} decides what it may do from its own config.", h.name())).font(k.ty.small).color(c.text_muted).truncate().shrink().min_w(0.0));
+    }
+    let levels: Vec<Access> = ACCESS.into_iter().filter(|a| *a != Access::Ask || h.asks()).collect();
+    let current = s.access.for_harness(h);
+    let labels: Vec<&str> = levels.iter().map(|a| a.label()).collect();
+    let mut seg = SegmentedControl::new(&labels, levels.iter().position(|a| *a == current))
+        .label("Access")
+        .fit()
+        .on_pick({
+            let levels = levels.clone();
+            move |s: &mut App, i: usize, _: &mut Tx| s.set_access(levels[i])
+        });
+    let running = s.thread().is_some_and(|t| t.busy && t.harness.asks());
+    if running && let Some(i) = levels.iter().position(|a| *a == Access::ReadOnly) {
+        seg = seg.segment_state(i, rune_kit::State::Disabled);
+    }
+    let note = match current {
+        Access::ReadOnly => "Changes nothing",
+        Access::Ask => "Asks before edits and commands",
+        Access::Edits => "Asks before commands",
+        Access::Full => "Never asks",
+    };
+    let key = s.keys.label(crate::shortcuts::Cmd::AccessMenu);
+    let mut head = row().gap(6.0).center_y()
+        .child(icon(access_icon(current), 14.0).color(if current == Access::Full { c.warning.fg } else { c.icon_base }))
+        .child(text("Access").font(k.ty.ui_medium).color(c.text_muted));
+    if !key.is_empty() {
+        head = head.help(format!("Access ({key})"));
+    }
+    row().key("access-bar").w_full().px(14.0).py(10.0).gap(14.0).center_y()
+        .child(head)
+        .child(seg.build(k).key("access-levels"))
+        .child(text(note).font(k.ty.small).color(c.text_faint).truncate().shrink().grow(1.0).min_w(0.0))
+}
+
+/// Each access level's glyph: an eye to look, a shield to ask, a pencil to edit, and a warning
+/// for full access.
+fn access_icon(a: Access) -> &'static Icon {
+    match a {
+        Access::ReadOnly => &icons::EYE,
+        Access::Ask => &icons::SHIELD,
+        Access::Edits => &icons::PENCIL_LINE,
+        Access::Full => &icons::WARNING,
+    }
 }
 
 /// Favorites, then each harness. One that isn't installed, or isn't the thread's, is dimmed.

@@ -282,7 +282,7 @@ fn bench_big_tool_output() {
     eprintln!("\n== big tool output: {:.1} MB, {} lines", mb(output.len() as i64), output.lines().count());
     header();
     let heap = live();
-    let start = timed(&mut rt, |rt| rt.update(|s, _| s.apply(901, Event::ToolStart { id: "big".into(), name: "Bash".into(), detail: "cargo test".into() })));
+    let start = timed(&mut rt, |rt| rt.update(|s, _| s.apply(901, Event::ToolStart { id: "big".into(), name: "Bash".into(), detail: "cargo test".into(), body: crate::harness::ToolBody::None })));
     summary("tool starts", &[start]);
     let out = output.clone();
     let end = timed(&mut rt, |rt| rt.update(|s, _| s.apply(901, Event::ToolEnd { id: "big".into(), ok: true, output: out })));
@@ -301,7 +301,7 @@ fn bench_big_tool_output() {
     let heap = live();
     for i in 0..50 {
         let id = format!("big{i}");
-        rt.update(|s, _| s.apply(901, Event::ToolStart { id: id.clone(), name: "Bash".into(), detail: "cargo test".into() }));
+        rt.update(|s, _| s.apply(901, Event::ToolStart { id: id.clone(), name: "Bash".into(), detail: "cargo test".into(), body: crate::harness::ToolBody::None }));
         let out = output.clone();
         rt.update(|s, _| s.apply(901, Event::ToolEnd { id, ok: true, output: out }));
         rt.frame(DT);

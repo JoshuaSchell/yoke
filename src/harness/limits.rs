@@ -88,7 +88,7 @@ impl Limits {
             changed = true;
         }
         if let Some(t) = info["resetsAt"].as_f64().filter(|t| *t > 0.0) {
-            w.resets = Some(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(t));
+            w.resets = Duration::try_from_secs_f64(t).ok().and_then(|d| SystemTime::UNIX_EPOCH.checked_add(d));
             changed = true;
         }
         if info["status"] == "rejected" {
@@ -115,7 +115,7 @@ impl Limits {
     }
 
     pub fn from_json(v: &Value) -> Option<Limits> {
-        let at = |v: &Value| v.as_u64().map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s));
+        let at = |v: &Value| v.as_u64().and_then(|s| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(s)));
         let windows = v["windows"].as_array()?.iter().filter_map(|w| Some(Window {
             id: w["id"].as_str()?.into(),
             label: w["label"].as_str()?.into(),

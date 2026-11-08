@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{Value, json};
 
 use crate::app::{Kind, Thread, ToolState};
-use crate::harness::{ALL, Harness};
+use crate::harness::{ALL, Harness, ToolBody};
 use crate::worktree::Worktree;
 
 /// Where the records go: `threads/` beside the prefs file. `None` for in-memory prefs (tests).
@@ -92,13 +92,14 @@ pub fn list(dir: &Path, project: &Path) -> Vec<Saved> {
                 session: v["session"].as_str()?.to_owned(),
                 title: v["title"].as_str().unwrap_or("Untitled").to_owned(),
                 model: v["model"].as_str().unwrap_or(crate::harness::models::DEFAULT).to_owned(),
-                modified: SystemTime::UNIX_EPOCH + Duration::from_secs(v["updated"].as_u64().unwrap_or(0)),
+                // A time past what the clock holds (a damaged record) reads as 1970, not a crash.
+                modified: SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(v["updated"].as_u64().unwrap_or(0))).unwrap_or(SystemTime::UNIX_EPOCH),
                 worktree: v["worktree"]["path"].as_str().map(|p| Worktree { path: PathBuf::from(p), branch: v["worktree"]["branch"].as_str().unwrap_or_default().to_owned() }),
                 path,
             })
         })
         .collect();
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|x| std::cmp::Reverse(x.modified));
     out
 }
 
@@ -119,7 +120,15 @@ fn kind_json(k: &Kind) -> Option<Value> {
     Some(match k {
         Kind::User(t) => json!({ "type": "user", "text": t }),
         Kind::Assistant { text, .. } => json!({ "type": "assistant", "text": text }),
-        Kind::Tool { call, name, detail, state, output } => json!({ "type": "tool", "call": call, "name": name, "detail": detail, "state": state_name(*state), "output": output }),
+        Kind::Tool { call, name, detail, state, output, body } => {
+            let mut v = json!({ "type": "tool", "call": call, "name": name, "detail": detail, "state": state_name(*state), "output": output });
+            match body {
+                ToolBody::None => {}
+                ToolBody::Code(c) => v["code"] = json!(c),
+                ToolBody::Edits(e) => v["edits"] = json!(e),
+            }
+            v
+        }
         Kind::Error(t) => json!({ "type": "error", "text": t }),
         Kind::TurnEnd { secs, cost_usd, stopped } => json!({ "type": "turn-end", "secs": secs, "cost_usd": cost_usd, "stopped": stopped }),
     })
@@ -130,7 +139,16 @@ fn json_kind(v: &Value) -> Option<Kind> {
     Some(match v["type"].as_str()? {
         "user" => Kind::User(s("text")),
         "assistant" => Kind::Assistant { text: s("text"), streaming: false },
-        "tool" => Kind::Tool { call: s("call"), name: s("name"), detail: s("detail"), state: if v["state"] == "ok" { ToolState::Ok } else { ToolState::Failed }, output: s("output") },
+        "tool" => {
+            let body = if let Some(c) = v["code"].as_str() {
+                ToolBody::Code(c.to_owned())
+            } else if let Some(e) = v["edits"].as_array() {
+                ToolBody::Edits(e.iter().filter_map(|p| Some((p[0].as_str()?.to_owned(), p[1].as_str()?.to_owned()))).collect())
+            } else {
+                ToolBody::None
+            };
+            Kind::Tool { call: s("call"), name: s("name"), detail: s("detail"), state: if v["state"] == "ok" { ToolState::Ok } else { ToolState::Failed }, output: s("output"), body }
+        }
         "error" => Kind::Error(s("text")),
         "turn-end" => Kind::TurnEnd { secs: v["secs"].as_f64().unwrap_or(0.0), cost_usd: v["cost_usd"].as_f64(), stopped: v["stopped"].as_bool().unwrap_or(false) },
         _ => return None,
@@ -150,7 +168,7 @@ mod tests {
         t.project = PathBuf::from("/work/app");
         for kind in [
             Kind::User("Write it".into()),
-            Kind::Tool { call: "c1".into(), name: "Shell".into(), detail: "git log".into(), state: ToolState::Ok, output: "a1b2 fix".into() },
+            Kind::Tool { call: "c1".into(), name: "Shell".into(), detail: "git log".into(), state: ToolState::Ok, output: "a1b2 fix".into(), body: ToolBody::Edits(vec![("a".into(), "b".into())]) },
             Kind::Assistant { text: "Done.".into(), streaming: false },
             Kind::TurnEnd { secs: 4.5, cost_usd: None, stopped: false },
         ] {
@@ -167,6 +185,7 @@ mod tests {
         let items = load(&found[0].path);
         assert_eq!(items.len(), 4);
         assert!(matches!(&items[1], Kind::Tool { state: ToolState::Ok, output, .. } if output == "a1b2 fix"));
+        assert!(matches!(&items[1], Kind::Tool { body: ToolBody::Edits(e), .. } if e == &[("a".to_owned(), "b".to_owned())]), "the body comes back too");
         assert!(matches!(&items[3], Kind::TurnEnd { secs, stopped: false, .. } if *secs == 4.5));
 
         remove(&dir, Harness::Codex, "abc/123");

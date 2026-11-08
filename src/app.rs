@@ -12,7 +12,7 @@ use rune_kit::shell::PaneState;
 
 use crate::harness::limits::{self, Limits};
 use crate::harness::models::{self, ModelOpt};
-use crate::harness::{self, Access, AskRequest, Decision, Event, Harness, Running, Turn};
+use crate::harness::{self, Access, AskRequest, Decision, Event, Harness, Running, ToolBody, Turn};
 use crate::history;
 use crate::store;
 use crate::worktree::{self, Worktree};
@@ -65,6 +65,10 @@ const CONTEXT_WINDOWS_KEY: &str = "usage.context-windows";
 const PRICES_KEY: &str = "usage.prices";
 const PRICES_AT_KEY: &str = "usage.prices-fetched";
 const USAGE_DAYS_KEY: &str = "usage.days";
+/// The editor "Open in …" uses (`editors::Editor::id`).
+const EDITOR_KEY: &str = "editor";
+/// Project folders you've said agents may work in (`App::trusted`).
+const TRUSTED_KEY: &str = "trusted.projects";
 /// How often plan limits are read again while the app is open (turns also read them).
 pub const LIMITS_EVERY: Duration = Duration::from_secs(5 * 60);
 /// The Usage page's periods, in days.
@@ -92,6 +96,23 @@ pub enum Lane {
 /// OpenCode by path), so they outlive it, and `purge_old_pastes` clears them at a later launch.
 fn pastes_dir() -> PathBuf {
     std::env::temp_dir().join("yoke-pastes")
+}
+
+/// `pastes_dir`, made if need be and only yours: on Linux the temp folder is shared, so a
+/// folder someone else made (or a link in its place) is refused, and ours is closed to others.
+fn own_pastes_dir() -> Option<PathBuf> {
+    let dir = pastes_dir();
+    let _ = std::fs::create_dir(&dir);
+    let meta = std::fs::symlink_metadata(&dir).ok()?;
+    if !meta.is_dir() { return None; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: getuid has no preconditions.
+        if meta.uid() != unsafe { libc::getuid() } { return None; }
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Some(dir)
 }
 
 /// Deletes pastes over a day old, so the app leaves nothing growing behind it. Windows never
@@ -126,6 +147,10 @@ pub struct App {
     pub effort: String,
     pub access: Access,
     pub open_menu: Option<&'static str>,
+    /// The editor the toolbar's "Open in …" opens the thread's folder in, as picked last.
+    pub editor: Option<String>,
+    /// The gauge whose hover card shows ("context" or "plan"), while the pointer is on it.
+    pub hover: Option<&'static str>,
     /// The model picker's search, rail and favorites (`picker`).
     pub picker: crate::picker::Picker,
     /// The new-thread screen's project picker: its search and the row under the arrows.
@@ -209,6 +234,15 @@ pub struct App {
     settled_by_hand: HashMap<String, bool>,
     /// The thread the delete dialog asks about (the row's ✕, or ⇧⌘⌫).
     pub confirm_delete: Option<ThreadId>,
+    /// The project waiting on "Trust this project?" before its first turn, the draft kept.
+    pub confirm_trust: Option<PathBuf>,
+    /// Project folders trusted here (saved in prefs). See `App::is_trusted`.
+    pub trusted: HashSet<PathBuf>,
+    /// The folders Claude Code itself has been told to trust, read from its config the first
+    /// time a project needs asking about.
+    pub claude_trusted: Option<Vec<PathBuf>>,
+    /// Whether to ask before a project's first turn; off in tests.
+    pub ask_trust: bool,
     /// Claude Code's folder, where deleting a thread deletes its session (`history::remove`).
     /// `None` in tests unless one sets a scratch folder.
     pub(crate) claude_home: Option<PathBuf>,
@@ -252,17 +286,33 @@ pub struct Queued {
     pub effort: String,
     pub access: Access,
     pub images: Vec<PathBuf>,
+    /// Other files (and folders) attached: named in the prompt for the agent to read.
+    pub files: Vec<PathBuf>,
 }
 
-/// An image waiting in the composer: its file, and the thumbnail decoding from it.
+/// A file waiting in the composer, and for an image the thumbnail decoding from it.
 pub struct Attachment {
     pub id: u64,
     pub path: PathBuf,
+    /// A folder, as found when it was attached (not asked of the disk every frame).
+    pub dir: bool,
     pub thumb: Option<Image>,
 }
 
 /// Image types the agents take.
 pub const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+/// Whether `path` goes to the agent as an image (else by its path, for it to read).
+pub fn is_image(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+/// The prompt with attached files named after it, for the agent to read.
+pub fn with_files(prompt: &str, files: &[PathBuf]) -> String {
+    if files.is_empty() { return prompt.to_owned(); }
+    let list: Vec<String> = files.iter().map(|f| format!("- {}", f.display())).collect();
+    format!("{prompt}\n\nAttached files:\n{}", list.join("\n"))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Appearance {
@@ -442,7 +492,7 @@ pub enum ToolState {
 pub enum Kind {
     User(String),
     Assistant { text: String, streaming: bool },
-    Tool { call: String, name: String, detail: String, state: ToolState, output: String },
+    Tool { call: String, name: String, detail: String, state: ToolState, output: String, body: harness::ToolBody },
     Error(String),
     TurnEnd { secs: f64, cost_usd: Option<f64>, stopped: bool },
 }
@@ -490,7 +540,7 @@ impl App {
         let theme = prefs.get::<String>("theme").and_then(|l| Theme::from_label(&l)).unwrap_or(Theme::OpenCode);
         let appearance = prefs.get::<String>("appearance").and_then(|l| Appearance::from_label(&l)).unwrap_or(Appearance::System);
         let limits = prefs.get::<serde_json::Value>(LIMITS_KEY).and_then(|v| Limits::from_json(&v));
-        let fetched = prefs.get::<u64>(PRICES_AT_KEY).map(|s| SystemTime::UNIX_EPOCH + Duration::from_secs(s));
+        let fetched = prefs.get::<u64>(PRICES_AT_KEY).and_then(|s| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(s)));
         let prices = match prefs.get::<serde_json::Value>(PRICES_KEY) {
             Some(doc) => usage::Prices::from_json(&doc, fetched),
             None => usage::Prices::built_in(),
@@ -498,6 +548,7 @@ impl App {
         let prices = if prices.len() == 0 { usage::Prices::built_in() } else { prices };
         let usage_days = prefs.get::<u32>(USAGE_DAYS_KEY).filter(|d| USAGE_PERIODS.iter().any(|(p, _)| p == d)).unwrap_or(7);
         let context_windows = prefs.get(CONTEXT_WINDOWS_KEY).unwrap_or_default();
+        let trusted = prefs.get::<Vec<String>>(TRUSTED_KEY).unwrap_or_default().into_iter().map(PathBuf::from).collect();
         let mut app = App {
             sidebar: PaneState::new(272.0).range(200.0, 480.0),
             context_windows,
@@ -511,6 +562,8 @@ impl App {
             effort: harness::DEFAULT_EFFORT.into(),
             access: Access::Edits,
             open_menu: None,
+            hover: None,
+            editor: prefs.get::<String>(EDITOR_KEY),
             settings: false,
             settings_page: crate::settings::Page::default(),
             defaults: crate::settings::Prefs::load(&prefs),
@@ -563,6 +616,10 @@ impl App {
             merge_settled: HashSet::new(),
             settled_by_hand,
             confirm_delete: None,
+            confirm_trust: None,
+            trusted,
+            claude_trusted: None,
+            ask_trust: true,
             claude_home: if cfg!(test) { None } else { history::claude_home() },
             events,
             sender,
@@ -592,6 +649,8 @@ impl App {
         self.waker = Some(w);
         self.discover_models();
         self.load_sessions();
+        // "Open in …" stats each editor's app; done here, off the UI thread, before it's drawn.
+        std::thread::spawn(|| { crate::editors::installed(); });
         self.refresh_limits();
         self.rescan_usage();
         self.fetch_prices_if_stale();
@@ -720,6 +779,7 @@ impl App {
 
     pub fn close_usage(&mut self) {
         self.usage_open = false;
+        self.hover = None;
         self.draft.focused = true;
     }
 
@@ -768,7 +828,7 @@ impl App {
             t.updated = x.modified;
             self.threads.push(t);
         }
-        self.threads.sort_by(|a, b| b.updated.cmp(&a.updated));
+        self.threads.sort_by_key(|t| std::cmp::Reverse(t.updated));
     }
 
     /// A worktree was made (its queued message goes now) or couldn't be (it waits, to send
@@ -819,29 +879,46 @@ impl App {
             t.updated = x.modified;
             self.threads.push(t);
         }
-        self.threads.sort_by(|a, b| b.updated.cmp(&a.updated));
+        self.threads.sort_by_key(|t| std::cmp::Reverse(t.updated));
     }
 
-    /// Images dropped on the window, or pasted: added to the composer for the next message.
+    /// Files dropped on the window, picked with the paperclip, or pasted (an image): added to
+    /// the composer for the next message.
     pub fn attach(&mut self, files: &[PathBuf]) {
         self.drop_over = false;
         self.composer_error = None;
         for path in files {
             if self.attachments.iter().any(|a| a.path == *path) { continue; }
             let id = self.id();
-            let thumb = self.images.as_ref().map(|c| c.file(path, 56.0, 2.0));
-            self.attachments.push(Attachment { id, path: path.clone(), thumb });
+            let thumb = if is_image(path) { self.images.as_ref().map(|c| c.file(path, 56.0, 2.0)) } else { None };
+            self.attachments.push(Attachment { id, path: path.clone(), dir: path.is_dir(), thumb });
         }
         self.draft.focused = true;
     }
 
     /// A pasted image (a screenshot): saved to a temporary file and attached.
     pub fn attach_png(&mut self, png: &[u8]) {
-        let dir = pastes_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-        let path = dir.join(format!("pasted-{stamp}.png"));
-        if std::fs::write(&path, png).is_ok() { self.attach(&[path]); }
+        use std::io::Write;
+        let Some(dir) = own_pastes_dir() else {
+            self.composer_error = Some("Couldn't save the pasted image.".into());
+            return;
+        };
+        let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let path = dir.join(format!("pasted-{stamp}-{}.png", self.id()));
+        // A new file only: never through a link or over a file already there.
+        let wrote = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).and_then(|mut f| f.write_all(png));
+        if wrote.is_ok() { self.attach(&[path]); }
+    }
+
+    /// The paperclip: picks a file to attach, starting in the project's folder.
+    pub fn choose_attachment(&mut self, tx: &mut Tx) {
+        self.open_menu = None;
+        let options = rune::FileDialogOptions { title: "Attach a File".into(), directory: self.open_target(), ..Default::default() };
+        tx.open_file(options, |s: &mut App, result, _: &mut Tx| match result {
+            Ok(Some(path)) => s.attach(&[path]),
+            Ok(None) => {}
+            Err(e) => s.composer_error = Some(format!("Couldn't pick a file: {e}")),
+        });
     }
 
     pub fn detach(&mut self, id: u64) {
@@ -948,9 +1025,74 @@ impl App {
         self.projects.iter().find(|p| p.path == path)
     }
 
-    /// Where background asks (models, plan limits) run: the current project, else home.
+    /// The folder "Open in …" opens: where the thread runs (`run_dir`), else the project a new
+    /// thread would start in.
+    pub fn open_target(&self) -> Option<PathBuf> {
+        match self.thread() {
+            Some(t) => self.run_dir(t),
+            None => self.project().map(|p| p.path.clone()),
+        }
+    }
+
+    /// The editor "Open in …" uses now.
+    pub fn editor(&self) -> crate::editors::Editor {
+        crate::editors::preferred(self.editor.as_deref())
+    }
+
+    /// Opens the thread's folder in `editor` and remembers it as the one to use.
+    pub fn open_in(&mut self, editor: crate::editors::Editor) {
+        self.open_menu = None;
+        let Some(folder) = self.open_target() else { return };
+        if let Err(e) = editor.open(&folder) {
+            self.composer_error = Some(e);
+            return;
+        }
+        if self.editor.as_deref() != Some(editor.id) {
+            self.editor = Some(editor.id.to_owned());
+            let _ = self.prefs.set(EDITOR_KEY, &editor.id.to_owned());
+        }
+    }
+
+    /// The file a tool row is about and the line to open it at, for its "Open in …" button:
+    /// a read's first line, an edit's first replacement where the file now has it, a write's
+    /// top. Paths the CLI gave relative are taken from the thread's folder. `None` when the
+    /// row isn't about a file or the file is gone.
+    pub fn tool_file(&self, item: u64) -> Option<(PathBuf, Option<u32>)> {
+        let t = self.thread()?;
+        let Kind::Tool { name, detail, output, body, .. } = &t.items.iter().find(|i| i.id == item)?.kind else { return None };
+        if !file_tool(name) { return None; }
+        let path = PathBuf::from(detail.trim());
+        let path = if path.is_absolute() { path } else { self.open_target()?.join(path) };
+        if !path.is_file() { return None; }
+        let line = match body {
+            ToolBody::Edits(edits) => {
+                let new = edits.iter().map(|(_, n)| n.as_str()).find(|n| !n.trim().is_empty());
+                let text = std::fs::read_to_string(&path).ok();
+                new.zip(text).and_then(|(n, text)| text.find(n).map(|at| text[..at].matches('\n').count() as u32 + 1))
+            }
+            _ => crate::ui::transcript::numbered(output).map(|(first, _)| first),
+        };
+        Some((path, line))
+    }
+
+    /// Opens a tool row's file in the editor, at its line.
+    pub fn open_tool_file(&mut self, item: u64) {
+        let Some((file, line)) = self.tool_file(item) else {
+            self.composer_error = Some("That file isn't there any more.".to_owned());
+            return;
+        };
+        if let Err(e) = crate::editors::for_files(self.editor.as_deref()).open_file(&file, line) {
+            self.composer_error = Some(e);
+        }
+    }
+
+    /// Where background asks (models, plan limits) run: an empty folder of the app's own, not a
+    /// project. They start the CLIs with no one watching, and a project's own settings (Claude
+    /// Code hooks, OpenCode's MCP servers) could run commands from a repository you only opened.
     fn work_dir(&self) -> PathBuf {
-        self.current.clone().or_else(|| std::env::var_os("HOME").map(PathBuf::from)).unwrap_or_else(|| PathBuf::from("."))
+        let dir = self.prefs.path().and_then(|p| p.parent()).map_or_else(|| std::env::temp_dir().join("yoke-probe"), |d| d.join("probe"));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
     }
 
     /// The folder thread `t`'s turns run in: its worktree, else its project's.
@@ -1024,12 +1166,16 @@ impl App {
 
     pub fn open_settings(&mut self) {
         self.open_menu = None;
+        self.hover = None;
         self.usage_open = false;
         self.settings = true;
     }
 
+    /// Also where every change of screen or thread passes (`select`, `new_thread`,
+    /// `open_usage`), so a gauge's hover card doesn't outlive the gauge.
     pub fn close_settings(&mut self) {
         self.settings = false;
+        self.hover = None;
         self.recording = None;
         self.key_error = None;
         self.draft.focused = true;
@@ -1063,7 +1209,7 @@ impl App {
     /// get a message) first.
     pub fn lane_threads(&self, lane: Lane) -> Vec<&Thread> {
         let mut v: Vec<&Thread> = self.threads.iter().filter(|t| Self::lane(t) == lane).collect();
-        v.sort_by(|a, b| b.updated.cmp(&a.updated));
+        v.sort_by_key(|t| std::cmp::Reverse(t.updated));
         v
     }
 
@@ -1335,17 +1481,47 @@ impl App {
     /// The draft with the composer's current choices, emptying the composer. `None` if blank.
     fn take_draft(&mut self) -> Option<Queued> {
         let mut text = self.draft.text.trim().to_owned();
-        let images: Vec<PathBuf> = self.attachments.drain(..).map(|a| a.path).collect();
-        if text.is_empty() && images.is_empty() { return None; }
-        if text.is_empty() { text = "See the attached image.".into(); }
+        let (images, files): (Vec<PathBuf>, Vec<PathBuf>) = self.attachments.drain(..).map(|a| a.path).partition(|p| is_image(p));
+        if text.is_empty() && images.is_empty() && files.is_empty() { return None; }
+        if text.is_empty() { text = if files.is_empty() { "See the attached image." } else { "See the attached files." }.into(); }
         self.draft.clear();
         let id = self.id();
-        Some(Queued { id, text, model: self.model.clone(), effort: self.effort.clone(), access: self.access, images })
+        Some(Queued { id, text, model: self.model.clone(), effort: self.effort.clone(), access: self.access, images, files })
+    }
+
+    /// Whether agents may work in `project` without asking first: you trusted it (or a folder
+    /// it's in) here, or in Claude Code. The CLIs' print modes skip their own trust prompt, and
+    /// a project can carry settings that run commands as a turn starts (Claude Code hooks, MCP
+    /// servers), so a folder that's new to both is asked about once, before its first turn.
+    pub fn is_trusted(&mut self, project: &Path) -> bool {
+        if !self.ask_trust || project.ancestors().any(|a| self.trusted.contains(a)) { return true; }
+        let claude = self.claude_trusted.get_or_insert_with(claude_trusted_folders);
+        project.ancestors().any(|a| claude.iter().any(|c| c == a))
+    }
+
+    /// "Trust": remembers the project and sends the draft that was waiting on it.
+    pub fn trust(&mut self, tx: &mut Tx) {
+        let Some(project) = self.confirm_trust.take() else { return };
+        self.trusted.insert(project);
+        let mut saved: Vec<String> = self.trusted.iter().map(|p| p.display().to_string()).collect();
+        saved.sort();
+        let _ = self.prefs.set(TRUSTED_KEY, &saved);
+        self.send(tx);
     }
 
     /// Return: sends the draft to the selected thread (or starts a thread with it). While that
-    /// thread's turn runs, queues it to go when the turn ends.
+    /// thread's turn runs, queues it to go when the turn ends. A project's first turn waits on
+    /// "Trust this project?" (`is_trusted`).
     pub fn send(&mut self, tx: &mut Tx) {
+        let project = match self.selected {
+            Some(_) => self.thread().map(|t| t.project.clone()).filter(|p| !p.as_os_str().is_empty()),
+            None => self.current.clone(),
+        };
+        let typed = !self.draft.text.trim().is_empty() || !self.attachments.is_empty();
+        if typed && let Some(p) = project && !self.is_trusted(&p) {
+            self.confirm_trust = Some(p);
+            return;
+        }
         let Some(q) = self.take_draft() else { return };
         match self.selected {
             Some(id) if self.is_running(id) || self.thread().is_some_and(|t| t.preparing) => {
@@ -1439,9 +1615,12 @@ impl App {
         let item = self.id();
         let Some(cwd) = self.threads.iter().find(|t| t.id == id).and_then(|t| self.run_dir(t)) else { return };
         let peer_messages = self.defaults.peer_messages;
+        // A queued message runs at the access shown now, not when it was queued: lowering the
+        // picker reaches what's waiting too.
+        let access = self.access;
         let Some(t) = self.thread_mut(id) else { return };
-        let shown = if q.images.is_empty() { q.text.clone() } else {
-            let names: Vec<String> = q.images.iter().map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())).collect();
+        let shown = if q.images.is_empty() && q.files.is_empty() { q.text.clone() } else {
+            let names: Vec<String> = q.images.iter().chain(&q.files).map(|p| p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())).collect();
             format!("{}\n\nAttached: {}", q.text, names.join(", "))
         };
         t.items.push(Item { id: item, rev: 0, kind: Kind::User(shown) });
@@ -1449,7 +1628,8 @@ impl App {
         t.rev += 1;
         t.failed = false;
         t.updated = SystemTime::now();
-        let turn = Turn { harness: t.harness, prompt: q.text, model: q.model, effort: q.effort, access: q.access, resume: t.session.clone(), cwd, images: q.images, peer_messages };
+        let turn = Turn { harness: t.harness, prompt: with_files(&q.text, &q.files), model: q.model, effort: q.effort, access: q.access, resume: t.session.clone(), cwd, images: q.images, peer_messages };
+        let turn = Turn { access, ..turn };
         let h = t.harness;
         let Some(bin) = self.binary(h) else {
             let e = self.id();
@@ -1468,7 +1648,9 @@ impl App {
     }
 
     /// The access picker. A Claude Code turn already running on the selected thread switches
-    /// to the new level straight away, and approvals it now covers are allowed.
+    /// to the new level straight away. Switching to Full access also allows what's waiting;
+    /// Edit files doesn't, since an edit the CLI still asks about under it (outside the
+    /// project, or a settings file) is one it wants a person to look at.
     pub fn set_access(&mut self, a: Access) {
         self.access = a;
         let Some(t) = self.thread().filter(|t| t.harness.asks()) else { return };
@@ -1477,7 +1659,8 @@ impl App {
         // Read only can't be reached mid-turn: plan mode would refuse without the prompt tool.
         if a == Access::ReadOnly { return; }
         r.set_access(a);
-        let covered: Vec<u64> = t.asks.iter().filter(|p| a.allows(&p.ask.tool)).map(|p| p.item).collect();
+        if a != Access::Full { return; }
+        let covered: Vec<u64> = t.asks.iter().map(|p| p.item).collect();
         for item in covered { self.answer(id, item, Decision::Allow); }
     }
 
@@ -1595,11 +1778,11 @@ impl App {
                 end_stream(t);
                 if !s.trim().is_empty() { t.items.push(Item { id: fresh, rev: 0, kind: Kind::Assistant { text: s, streaming: false } }); }
             }
-            Event::ToolStart { id: call, name, detail } => {
+            Event::ToolStart { id: call, name, detail, body } => {
                 end_stream(t);
                 // An approval can arrive first and make the row itself.
                 if t.tool_row(&call).is_none() {
-                    t.items.push(Item { id: fresh, rev: 0, kind: Kind::Tool { call, name, detail, state: ToolState::Running, output: String::new() } });
+                    t.items.push(Item { id: fresh, rev: 0, kind: Kind::Tool { call, name, detail, state: ToolState::Running, output: String::new(), body } });
                 }
             }
             Event::Ask(ask) => {
@@ -1612,7 +1795,8 @@ impl App {
                     }
                     None => {
                         let detail = harness::tool_detail(&ask.input);
-                        t.items.push(Item { id: fresh, rev: 0, kind: Kind::Tool { call, name: ask.tool.clone(), detail, state: ToolState::Running, output: String::new() } });
+                        let body = harness::tool_body(&ask.tool, &ask.input);
+                        t.items.push(Item { id: fresh, rev: 0, kind: Kind::Tool { call, name: ask.tool.clone(), detail, state: ToolState::Running, output: String::new(), body } });
                         fresh
                     }
                 };
@@ -1684,7 +1868,7 @@ impl App {
                 let stopped_by_user = std::mem::take(&mut t.stop_requested);
                 let advance = !t.queue.is_empty() && (steering || (!stopped_by_user && code == Some(0)));
                 // A turn you stopped isn't news, and one with a queue behind it isn't over.
-                let alert = (!stopped_by_user && !advance).then(|| if t.failed { Alert::Failed } else { Alert::Done });
+                let alert = (!stopped_by_user && !advance).then_some(if t.failed { Alert::Failed } else { Alert::Done });
                 self.running.remove(&id);
                 if advance { self.ready.push(id); }
                 if let Some(a) = alert { self.alerts.push((id, a)); }
@@ -1705,6 +1889,25 @@ fn end_stream(t: &mut Thread) {
         }
 }
 
+/// The folders Claude Code has been told to trust: `projects.<path>.hasTrustDialogAccepted` in
+/// its config (`$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`). Empty if unreadable.
+fn claude_trusted_folders() -> Vec<PathBuf> {
+    let file = std::env::var_os("CLAUDE_CONFIG_DIR").map(|d| PathBuf::from(d).join(".claude.json"))
+        .filter(|f| f.is_file())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude.json")));
+    let Some(v) = file.and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else { return Vec::new() };
+    v["projects"].as_object().into_iter().flatten()
+        .filter(|(_, p)| p["hasTrustDialogAccepted"] == true)
+        .map(|(path, _)| PathBuf::from(path))
+        .collect()
+}
+
+/// Whether a tool's row is about one file (its detail the path): reads, edits and writes, as
+/// Claude Code, OpenCode and Gemini name them.
+pub fn file_tool(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "read" | "edit" | "multiedit" | "write" | "notebookedit" | "read_file" | "write_file" | "replace")
+}
+
 /// Headless scenes: a finished conversation and one still working, for snapshots.
 pub mod scenes {
     use super::*;
@@ -1720,10 +1923,14 @@ pub mod scenes {
         (t.context, t.context_window) = (Some(64_300), Some(200_000));
         push(s, &mut t, Kind::User("Add a retry with exponential backoff to the fetch client, and cap it at 5 attempts.".into()));
         push(s, &mut t, Kind::Assistant { text: "I'll look at how the client is structured first.".into(), streaming: false });
-        push(s, &mut t, Kind::Tool { call: "1".into(), name: "Grep".into(), detail: "fn fetch".into(), state: ToolState::Ok, output: "src/client.rs:42: pub async fn fetch(&self, req: Request)".into() });
-        push(s, &mut t, Kind::Tool { call: "2".into(), name: "Read".into(), detail: "src/client.rs".into(), state: ToolState::Ok, output: String::new() });
-        push(s, &mut t, Kind::Tool { call: "3".into(), name: "Edit".into(), detail: "src/client.rs".into(), state: ToolState::Ok, output: String::new() });
-        push(s, &mut t, Kind::Tool { call: "4".into(), name: "Bash".into(), detail: "cargo test -p client retry".into(), state: ToolState::Ok, output: "running 3 tests\ntest retry::gives_up_after_five ... ok\ntest retry::backs_off ... ok\ntest retry::succeeds_first_try ... ok\n\ntest result: ok. 3 passed".into() });
+        push(s, &mut t, Kind::Tool { call: "1".into(), name: "Grep".into(), detail: "fn fetch".into(), state: ToolState::Ok, output: "src/client.rs:42: pub async fn fetch(&self, req: Request)".into(), body: ToolBody::None });
+        push(s, &mut t, Kind::Tool { call: "2".into(), name: "Read".into(), detail: "src/client.rs".into(), state: ToolState::Ok, output: "     1\tuse std::time::Duration;\n     2\t\n     3\t/// How many times `fetch` tries before giving up.\n     4\tconst MAX_ATTEMPTS: u32 = 5;\n     5\t\n     6\timpl Client {\n     7\t    pub async fn fetch(&self, req: Request) -> Result<Response> {\n     8\t        self.send(req).await\n     9\t    }\n    10\t}".into(), body: ToolBody::None });
+        let edit = ToolBody::Edits(vec![(
+            "    pub async fn fetch(&self, req: Request) -> Result<Response> {\n        self.send(req).await\n    }".into(),
+            "    pub async fn fetch(&self, req: Request) -> Result<Response> {\n        let mut delay = Duration::from_millis(100);\n        for attempt in 1..=MAX_ATTEMPTS {\n            match self.send(req.clone()).await {\n                Err(e) if e.is_transient() && attempt < MAX_ATTEMPTS => {\n                    sleep(delay).await;\n                    delay *= 2; // back off\n                }\n                other => return other,\n            }\n        }\n        unreachable!()\n    }".into(),
+        )]);
+        push(s, &mut t, Kind::Tool { call: "3".into(), name: "Edit".into(), detail: "src/client.rs".into(), state: ToolState::Ok, output: "The file src/client.rs has been updated.".into(), body: edit });
+        push(s, &mut t, Kind::Tool { call: "4".into(), name: "Bash".into(), detail: "cargo test -p client retry".into(), state: ToolState::Ok, output: "running 3 tests\ntest retry::gives_up_after_five ... ok\ntest retry::backs_off ... ok\ntest retry::succeeds_first_try ... ok\n\ntest result: ok. 3 passed".into(), body: ToolBody::None });
         push(s, &mut t, Kind::Assistant { text: DEMO_ANSWER.into(), streaming: false });
         push(s, &mut t, Kind::TurnEnd { secs: 48.3, cost_usd: Some(0.1842), stopped: false });
         let mut w = Thread::new(101, "Why is the settings window slow to open?".into(), Harness::Claude, models::DEFAULT.into());
@@ -1731,7 +1938,7 @@ pub mod scenes {
         (w.context, w.context_window) = (Some(131_500), Some(200_000));
         w.turn_started = Instant::now().checked_sub(Duration::from_secs(34));
         push(s, &mut w, Kind::User("Why is the settings window slow to open?".into()));
-        push(s, &mut w, Kind::Tool { call: "1".into(), name: "Bash".into(), detail: "cargo build --profile perf -p settings".into(), state: ToolState::Running, output: String::new() });
+        push(s, &mut w, Kind::Tool { call: "1".into(), name: "Bash".into(), detail: "cargo build --profile perf -p settings".into(), state: ToolState::Running, output: String::new(), body: ToolBody::None });
         let mut c = Thread::new(102, "Write a changelog entry for the release".into(), Harness::Codex, models::DEFAULT.into());
         c.unread = true;
         push(s, &mut c, Kind::User("Write a changelog entry for the release".into()));
@@ -1774,7 +1981,7 @@ pub mod scenes {
                 let kind = match k {
                     Kind::User(m) => Kind::User(format!("{m} (#{n})")),
                     Kind::Assistant { text, .. } => Kind::Assistant { text: text.clone(), streaming: false },
-                    Kind::Tool { call, name, detail, state, output } => Kind::Tool { call: format!("{n}-{call}"), name: name.clone(), detail: detail.clone(), state: *state, output: output.clone() },
+                    Kind::Tool { call, name, detail, state, output, body } => Kind::Tool { call: format!("{n}-{call}"), name: name.clone(), detail: detail.clone(), state: *state, output: output.clone(), body: body.clone() },
                     Kind::Error(m) => Kind::Error(m.clone()),
                     Kind::TurnEnd { secs, cost_usd, stopped } => Kind::TurnEnd { secs: *secs, cost_usd: *cost_usd, stopped: *stopped },
                 };
@@ -1874,7 +2081,7 @@ pub mod scenes {
         s.selected = Some(101);
         for text in ["Also check whether the font atlas is rebuilt on open.", "Then write up what you find in NOTES.md."] {
             let id = s.id();
-            let q = Queued { id, text: text.into(), model: models::DEFAULT.into(), effort: harness::DEFAULT_EFFORT.into(), access: Access::Edits, images: Vec::new() };
+            let q = Queued { id, text: text.into(), model: models::DEFAULT.into(), effort: harness::DEFAULT_EFFORT.into(), access: Access::Edits, images: Vec::new(), files: Vec::new() };
             s.thread_mut(101).unwrap().queue.push(q);
         }
         s.draft = TextEdit::new("Skip the release build, debug is fine");
@@ -1901,8 +2108,61 @@ pub mod scenes {
     pub fn attach(s: &mut App) {
         demo(s);
         let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shots/demo-light.png");
-        s.attach(&[shot]);
+        s.attach(&[shot, std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")]);
         s.draft = TextEdit::new("Why is the sidebar wider in this one?");
+    }
+
+    /// The delete dialog over a thread with a long title.
+    pub fn delete(s: &mut App) {
+        demo(s);
+        let id = s.selected.unwrap();
+        s.thread_mut(id).unwrap().title = "Count from 1 to 300, one number per line, nothing else, and then explain why".into();
+        s.confirm_delete = Some(id);
+    }
+
+    /// The context gauge's hover card, with a draft so send is live.
+    pub fn context_hover(s: &mut App) {
+        demo(s);
+        s.hover = Some("context");
+        s.draft = TextEdit::new("Now add jitter to the delay");
+    }
+
+    /// The plan gauge's hover card, and an update downloading.
+    pub fn plan_hover(s: &mut App) {
+        demo(s);
+        stand_in_usage(s);
+        s.hover = Some("plan");
+        s.update.status = crate::updater::Status::Installing("0.1.6".into());
+    }
+
+    /// The demo thread's Read, Edit and Bash rows opened: code in the file's colours, the edit
+    /// as a diff. Scrolled to them.
+    pub fn tools(s: &mut App) {
+        demo(s);
+        let id = s.selected.unwrap();
+        let t = s.thread_mut(id).unwrap();
+        let open: Vec<u64> = t.items.iter().filter(|i| matches!(&i.kind, Kind::Tool { call, .. } if ["2", "3"].contains(&call.as_str()))).map(|i| i.id).collect();
+        t.items.retain(|i| !matches!(i.kind, Kind::Assistant { .. } | Kind::TurnEnd { .. }));
+        s.expanded.extend(open);
+    }
+
+    /// "Trust this project?" before a new project's first turn.
+    pub fn trust(s: &mut App) {
+        empty(s);
+        s.confirm_trust = s.current.clone();
+        s.draft = TextEdit::new("Set up CI for this repo");
+    }
+
+    /// The toolbar's "Open in …" menu.
+    pub fn open_in(s: &mut App) {
+        demo(s);
+        s.open_menu = Some("open-in");
+    }
+
+    /// An update waiting for a restart.
+    pub fn update_ready(s: &mut App) {
+        demo(s);
+        s.update.status = crate::updater::Status::Ready("0.1.6".into());
     }
 
     /// The demo with the sidebar shut: the toolbar starts past the traffic lights.

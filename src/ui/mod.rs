@@ -40,9 +40,17 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
         main.child(usage::page(s, k))
     } else {
         match s.thread() {
-            Some(_) => main.child(transcript::view(s, k, (s.theme, dark))).child(composer::view(s, k, &mut layer)),
+            // The transcript runs the pane's full height and the composer floats over its foot,
+            // as in T3 Code: scrolled up, the conversation shows through the frosted card. The
+            // transcript's last row clears the composer (as last laid out) at the bottom.
+            Some(_) => {
+                let dock = rune::memo::layout_with("composer-dock", |r| r[3]).unwrap_or(150.0);
+                main.child(col().key("thread-pane").w_full().grow(1.0).min_h(0.0)
+                    .child(transcript::view(s, k, (s.theme, dark), dock))
+                    .child(composer::view(s, k, true, &mut layer).pin(Some(0.0), None, Some(0.0), Some(0.0))))
+            }
             None if s.projects.is_empty() => main.child(no_projects(s, k)),
-            None => main.child(hero(s, k, &mut layer)).child(composer::view(s, k, &mut layer)),
+            None => main.child(hero(s, k, &mut layer)).child(composer::view(s, k, false, &mut layer)),
         }
     };
     if s.hud {
@@ -73,10 +81,13 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
         .build(k)
         .key("settings-open");
     let mut trailing = row().gap(2.0).center_y().offset(0.0, -FRAME);
-    if let Some(button) = update_button(s, k) {
-        trailing = trailing.child(button.mr(6.0));
+    if !s.settings && !s.usage_open && let Some(open) = open_in(s, k, &mut layer) {
+        trailing = trailing.child(open.mr(6.0));
     }
-    let toolbar = Toolbar::new().leading(crumbs).trailing(trailing.child(usage::toolbar_button(s, k)).child(hud_button).child(settings_button));
+    if let Some(button) = update_button(s, k) {
+        trailing = trailing.child(button);
+    }
+    let toolbar = Toolbar::new().leading(crumbs).trailing(trailing.child(usage::toolbar_button(s, k, &mut layer)).child(hud_button).child(settings_button));
     let attention = Attention::of(s, k);
     let window = SplitView::new(main)
         .sidebar(&s.sidebar, |s: &mut App| &mut s.sidebar, sidebar::view(s, k))
@@ -94,18 +105,30 @@ pub fn view(s: &App, cx: &mut Cx<App>) -> El {
         .reduced_motion(cx.is_reduced_motion())
         .build(k)
         .child(sidebar_toggle(s, cx.titlebar_inset(), attention, sidebar_key, cx.is_reduced_motion(), k));
-    // Images dropped anywhere in the window go to the composer; anything else is refused with
-    // a note there.
+    // Files dropped anywhere in the window go to the composer.
     sidebar::delete_dialog(s, k, &mut layer);
+    trust_dialog(s, k, &mut layer);
     rune_kit::root(window, layer)
         .on_drop_files(|s: &mut App, files: &[std::path::PathBuf], _: &mut Tx| s.attach(files))
-        .accepts_extensions(&crate::app::IMAGE_EXTENSIONS)
         .on_drop_hover(|s: &mut App, over: bool, _: &mut Tx| { s.drop_over = over; s.composer_error = None; })
-        .on_drop_rejected(|s: &mut App, files: &[std::path::PathBuf], _: &mut Tx| {
-            s.drop_over = false;
-            let name = files.first().and_then(|f| f.file_name()).map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-            s.composer_error = Some(format!("{name} isn't an image. Drop a PNG, JPEG, GIF or WebP."));
-        })
+}
+
+/// "Trust this project?", before a project's first turn: what an agent working there can run,
+/// and Trust (Return) or Cancel (Escape, which keeps the draft).
+fn trust_dialog(s: &App, k: &Kit, layer: &mut Vec<El>) {
+    use rune_kit::{Button, ButtonVariant, Dialog};
+    let Some(project) = &s.confirm_trust else { return };
+    let what = format!(
+        "Agents will work in {} and can run what it sets up for them: Claude Code hooks, MCP servers and other project settings in that folder can run commands as soon as a turn starts. Only trust folders whose contents you know.",
+        tilde(project)
+    );
+    let buttons = row().key("trust-buttons").w_full().padding(16.0).gap(8.0).justify_end()
+        .child(Button::new("Cancel").variant(ButtonVariant::Ghost).on_press(|s: &mut App| s.confirm_trust = None).build(k).key("trust-cancel"))
+        .child(Button::new("Trust and send").variant(ButtonVariant::Contrast).on_press_tx(|s: &mut App, tx: &mut Tx| s.trust(tx)).build(k).default_button().key("trust-confirm"));
+    Dialog::new("trust", "Trust this project?").description(what).width(440.0).fit().open(true)
+        .on_close(|s: &mut App| s.confirm_trust = None)
+        .child(buttons)
+        .build(k, layer);
 }
 
 /// Settings' toolbar icon: an eight-toothed cog round a hub, on the 16-point grid and 1-point
@@ -221,21 +244,122 @@ fn breadcrumb(project: &str, title: &str, k: &Kit) -> El {
         .child(text(title.to_owned()).key("crumb-title").font(k.ty.ui_medium).color(c.text_strong).truncate().shrink().a11y_hidden())
 }
 
-/// "Restart to update", once an update is installed and waits for a restart. Held back while
-/// a turn runs, since quitting would cut it off.
-fn update_button(s: &App, k: &Kit) -> Option<El> {
-    let version = s.update_ready()?;
-    let busy = s.threads.iter().any(|t| t.busy);
-    let help = if busy { format!("Yoke {version} is installed. Finish or stop the running turns, then restart.") } else { format!("Yoke {version} is installed. Restart to use it.") };
-    Some(rune_kit::Button::new("Restart to update")
-        .variant(rune_kit::ButtonVariant::Contrast)
+/// "Open in …", as T3 Code's toolbar has: the editor picked last, opening the thread's folder
+/// (its worktree, if it has one), and a menu of the others on this computer.
+fn open_in(s: &App, k: &Kit, layer: &mut Vec<El>) -> Option<El> {
+    use crate::editors::{self, Kind};
+    let c = &k.c;
+    let folder = s.open_target()?;
+    let current = s.editor();
+    let key = s.keys.label(Cmd::OpenInEditor);
+    let where_ = tilde(&folder);
+    let mark = editor_icon(current, k);
+    let open = rune_kit::Button::new(format!("Open in {}", current.name))
+        .variant(rune_kit::ButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
-        .disabled(busy)
-        .on_press(|s: &mut App| { s.restart_to_update(); })
+        .help(format!("Open {where_} in {}", current.name))
+        .shortcut(&key)
+        .label_with({
+            let ty = k.ty.small_medium;
+            let ink = c.text_base;
+            move |_, _| row().gap(6.0).center_y().child(mark).child(text("Open").font(ty).color(ink))
+        })
+        .on_press(move |s: &mut App| s.open_in(current))
         .build(k)
-        .help(help)
-        .key("restart-to-update"))
+        .px(8.0)
+        .key("open-in");
+    let open_menu = s.open_menu == Some("open-in");
+    let chevron = IconButton::new(&icons::CHEVRON_DOWN)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label("Open in another app")
+        .expanded(open_menu)
+        .on_press(|s: &mut App| s.toggle_menu("open-in"))
+        .build(k)
+        .key("open-in-more");
+    let mut menu = rune_kit::Menu::new("open-in-menu")
+        .trigger(chevron)
+        .open(open_menu)
+        .placement(rune_kit::Placement::BottomEnd)
+        .min_width(200.0)
+        .on_close(|s: &mut App| s.open_menu = None);
+    let mut last = None;
+    for e in editors::installed().iter().copied() {
+        if last.is_some_and(|l: Kind| l != e.kind) { menu = menu.separator(); }
+        last = Some(e.kind);
+        menu = menu.item(rune_kit::MenuItem::new(e.name)
+            .lead(editor_icon(e, k))
+            .checked(e.id == current.id)
+            .on_select(move |s: &mut App| s.open_in(e)));
+    }
+    let chevron = menu.build(k, layer);
+    Some(row().key("open-in-group").h(24.0).gap(0.0).center_y().radius(7.0).border(1.0, c.border_weak)
+        .child(open)
+        .child(el().w(1.0).h(14.0).fill(c.border_weak))
+        .child(chevron))
 }
+
+/// An app's mark (OpenCode's set has the common editors and terminals), else a plain glyph.
+fn editor_icon(e: crate::editors::Editor, k: &Kit) -> El {
+    use crate::editors::Kind;
+    match rune_theme_opencode::app_icons::named(e.id, k.dark) {
+        Some(mark) => rune::icon(mark, 14.0).a11y_hidden(),
+        None => {
+            let glyph = match e.kind { Kind::Terminal => &icons::CONSOLE, Kind::Files => &icons::FOLDER, Kind::Editor => &icons::CODE };
+            rune::icon(glyph, 14.0).color(k.c.icon_base).a11y_hidden()
+        }
+    }
+}
+
+/// Updates, at the toolbar's end as in T3 Code: a circling arrow that checks for one, turning
+/// while it checks and downloads. Once an update is installed the same button grows a label and
+/// restarts into it (held back while a turn runs, since quitting would cut it off). A build run
+/// from source doesn't update itself, so it has no button.
+fn update_button(s: &App, k: &Kit) -> Option<El> {
+    use crate::updater::Status;
+    let c = &k.c;
+    if !crate::updater::installed() && s.update.status == Status::Idle { return None; }
+    if let Status::Ready(version) = &s.update.status {
+        let busy = s.threads.iter().any(|t| t.busy);
+        let help = if busy { format!("Yoke {version} is downloaded. Finish or stop the running turns, then restart.") } else { format!("Yoke {version} is downloaded. Restart to use it.") };
+        return Some(rune_kit::Button::new("Restart to update")
+            .variant(rune_kit::ButtonVariant::Contrast)
+            .control_size(ControlSize::Small)
+            .icon(&ROTATE)
+            .disabled(busy)
+            .help(help)
+            .on_press(|s: &mut App| { s.restart_to_update(); })
+            .build(k)
+            .key("update"));
+    }
+    let ago = s.update.checked().map(|d| crate::ui::usage::span(d.as_secs()));
+    let version = env!("CARGO_PKG_VERSION");
+    let (label, help, ink) = match &s.update.status {
+        Status::Checking => ("Checking for updates", format!("Checking for updates…\nYoke {version}"), c.icon_muted),
+        Status::Installing(v) => ("Downloading update", format!("Downloading Yoke {v}…\nIt installs in the background; restart when it's ready."), c.icon_muted),
+        Status::Failed(e) => ("Check for updates", format!("Couldn't update: {e}\nClick to try again."), c.warning.icon),
+        Status::UpToDate => ("Check for updates", format!("Yoke {version} is up to date{}.\nClick to check again.", ago.map_or(String::new(), |a| format!(" · checked {a} ago"))), c.icon_muted),
+        _ => ("Check for updates", format!("Yoke {version}\nChecks at launch and every 6 hours."), c.icon_muted),
+    };
+    let glyph = rune::icon(&ROTATE, 16.0).key("update-glyph").color(ink).a11y_hidden();
+    let glyph = if s.update.working() { glyph.looping(rune::LoopSpec::rotation(1.0)) } else { glyph };
+    Some(rune_kit::Button::new(label)
+        .variant(rune_kit::ButtonVariant::GhostMuted)
+        .help(help)
+        .label_with(move |_, _| glyph)
+        .on_press(|s: &mut App| s.check_for_update())
+        .build(k)
+        .px(6.0)
+        .key("update"))
+}
+
+/// A clockwise circling arrow, centred so it can turn in place: a 300° arc round (8, 8) from
+/// two o'clock to twelve, the head at twelve pointing on round.
+pub static ROTATE: Icon = Icon {
+    name: "yoke-rotate",
+    view: 16.0,
+    body: r#"<path d="M12.55 5.38A5.25 5.25 0 1 1 8 2.75" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" fill="none"/><path d="M5.9 0.9L8 2.75L5.9 4.6" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" fill="none"/>"#,
+};
 
 /// The new-thread screen's centre.
 /// The new-thread screen: "What should we build in yoke?", the project a picker (as T3 Code's
