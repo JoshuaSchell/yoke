@@ -192,6 +192,32 @@ mod tests {
         assert_eq!(ids(&s), [4], "no second look at a thread its merge already settled");
     }
 
+    /// A turn that ends with work still running in the background isn't done: the one Done
+    /// comes once that work has ended and the CLI's own turn reporting on it does, as recorded
+    /// from Claude Code with a background command and with background subagents.
+    #[test]
+    fn done_waits_for_background_work() {
+        use crate::app::scenes::{play, BACKGROUND_BASH, SUBAGENTS};
+        for (file, first_end) in [(BACKGROUND_BASH, 8), (SUBAGENTS, 76)] {
+            let mut s = app();
+            let id = play(&mut s, "x", file, 0);
+            let mut p = crate::harness::ParseState::default();
+            let mut feed = |s: &mut App, lines: std::ops::Range<usize>| {
+                for line in file.lines().skip(lines.start).take(lines.len()) {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                    for e in crate::harness::claude::parse(&v, &mut p) { s.apply(id, e); }
+                }
+            };
+            feed(&mut s, 0..first_end);
+            let t = s.threads.iter().find(|t| t.id == id).unwrap();
+            assert!(t.has_background(), "work runs on in the background");
+            if file == BACKGROUND_BASH { assert!(!t.busy, "the turn has ended"); }
+            assert!(s.alerts.is_empty(), "no Done while it runs: {:?}", s.alerts);
+            feed(&mut s, first_end..usize::MAX);
+            assert_eq!(s.alerts, [(id, Alert::Done)], "one Done, once it's all over");
+        }
+    }
+
     #[test]
     fn finishing_failing_and_asking_queue_alerts() {
         let mut s = app();

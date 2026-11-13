@@ -3052,8 +3052,7 @@ impl App {
                     t.busy = false;
                     t.unread = !selected;
                     let next = !t.queue.is_empty() && !t.has_background();
-                    let alert = if t.failed { Alert::Failed } else { Alert::Done };
-                    if !next { self.alerts.push((id, alert)); }
+                    if let Some(alert) = turn_alert(t).filter(|_| !next) { self.alerts.push((id, alert)); }
                     return;
                 };
                 l.stop_by = None;
@@ -3071,8 +3070,7 @@ impl App {
                 // The queue goes on, into the same CLI, unless the turn was stopped.
                 let next = !stopped && !t.queue.is_empty() && t.held.is_none();
                 if next { self.ready.push(id); }
-                let alert = if t.failed { Alert::Failed } else { Alert::Done };
-                if !next && !stopped { self.alerts.push((id, alert)); }
+                if let Some(alert) = turn_alert(t).filter(|_| !next && !stopped) { self.alerts.push((id, alert)); }
             }
             Event::Exited { code, stderr } => {
                 end_stream(t);
@@ -3116,6 +3114,13 @@ impl App {
             }
         }
     }
+}
+
+/// The notification a turn's end is worth: a failure at once; Done only once nothing it
+/// started runs on in the background. Until then the CLI isn't done: when that work ends it
+/// reports on it in a turn of its own, and that turn's end says Done.
+fn turn_alert(t: &Thread) -> Option<Alert> {
+    if t.failed { Some(Alert::Failed) } else { (!t.has_background()).then_some(Alert::Done) }
 }
 
 /// What woke a turn the CLI started itself: what finished in the background.
