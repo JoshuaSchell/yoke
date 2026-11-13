@@ -102,7 +102,7 @@ impl App {
     pub fn close_picker(&mut self) {
         if self.picker_open() { self.open_menu = None; }
         self.picker.search.focused = false;
-        self.picker.search.preedit = None;
+        self.picker.search.cancel_composition();
         self.draft.focused = true;
     }
 
@@ -187,7 +187,7 @@ impl App {
 
     /// The search field's keys. True when the key was the picker's.
     pub fn picker_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
-        if self.picker.search.preedit.is_some() { return false; }
+        if self.picker.search.is_composing() { return false; }
         let (rows, _) = self.picker_rows();
         match &ev.key {
             Key::Escape => { if !tx.key_repeat() { self.close_picker(); } true }
@@ -258,7 +258,7 @@ impl App {
     pub fn close_project_picker(&mut self) {
         if self.project_picker_open() { self.open_menu = None; }
         self.project_pick.search.focused = false;
-        self.project_pick.search.preedit = None;
+        self.project_pick.search.cancel_composition();
         self.draft.focused = true;
     }
 
@@ -287,7 +287,7 @@ impl App {
 
     /// The search field's keys. True when the key was the picker's.
     pub fn project_picker_key(&mut self, ev: &KeyEvent, tx: &mut Tx) -> bool {
-        if self.project_pick.search.preedit.is_some() { return false; }
+        if self.project_pick.search.is_composing() { return false; }
         let rows = self.project_rows();
         match &ev.key {
             Key::Escape => { if !tx.key_repeat() { self.close_project_picker(); } true }

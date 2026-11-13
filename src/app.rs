@@ -1332,6 +1332,12 @@ impl App {
         self.usage_rx.is_some()
     }
 
+    /// A transcript scan was asked for while one ran (it starts once that one lands); clears it.
+    #[cfg(test)]
+    pub fn take_usage_rescan(&mut self) -> bool {
+        std::mem::take(&mut self.usage_again)
+    }
+
     /// Fetches LiteLLM's prices when the saved copy is a day old (or there's none).
     fn fetch_prices_if_stale(&mut self) {
         let fresh = self.prices.fetched.and_then(|t| t.elapsed().ok()).is_some_and(|age| age < usage::PRICES_MAX_AGE);
@@ -1390,6 +1396,9 @@ impl App {
     pub fn usage_tick(&mut self, now: SystemTime) -> bool {
         let due = self.limits_asked.is_none_or(|t| t.elapsed() >= LIMITS_EVERY);
         if due {
+            // Set here as well as in `refresh_limits`, which asks nothing without Claude Code:
+            // else every poll was due, and each rescan landing drew a frame and asked again.
+            self.limits_asked = Some(Instant::now());
             self.refresh_limits();
             self.rescan_usage();
         }

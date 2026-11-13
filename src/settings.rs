@@ -338,7 +338,7 @@ impl App {
     /// The prompt field's own keys for the send setting, before the shortcut table: with ⌘↩
     /// sending, plain ↩ is a newline and ⇧⌘↩ is the other of queue and steer.
     pub fn prompt_key(&mut self, ev: &rune::KeyEvent, tx: &mut Tx) -> bool {
-        if self.defaults.send != SendKey::ModReturn || ev.key != rune::Key::Enter || self.draft.preedit.is_some() { return false; }
+        if self.defaults.send != SendKey::ModReturn || ev.key != rune::Key::Enter || self.draft.is_composing() { return false; }
         let m = ev.mods;
         if m.cmd && !m.alt && !m.ctrl {
             if tx.key_repeat() { return true; }

@@ -43,6 +43,9 @@ fn init() -> App {
     App::new(arg, prefs)
 }
 
+/// The app menu's Settings item, which `ui::mac` waits for.
+pub const SETTINGS_TITLE: &str = "Settings…";
+
 /// The app icon, small enough to decode at launch. A packaged app's own icon (the bundle's on
 /// macOS) is what the Dock and launchers show; this covers `cargo run` and Windows' title bars.
 const ICON: &[u8] = include_bytes!("../assets/icon-256.png");
@@ -141,10 +144,10 @@ fn main() {
     // and the sidebar toggle line up with them (`ui::LIGHTS_MID`).
     let chrome = Chrome { full_size_content: true, traffic_lights: Some((16.0, 17.0)), drag_regions: true };
     // Yoke › Settings…, on the Settings shortcut as saved at launch (a rebinding reaches the
-    // menu at the next launch; the shortcut table answers it straight away). `ui::mac` moves
-    // it below About.
+    // menu at the next launch; the shortcut table answers it straight away). Rune puts it
+    // right after About; a separator first gives it a group of its own, as in Mac apps.
     let keys = shortcuts::Keys::load(&Prefs::open(app::APP_ID));
-    let mut settings = MenuItem::new("Settings…", |s: &mut App, _: &mut Tx| s.open_settings()).id("settings");
+    let mut settings = MenuItem::new(SETTINGS_TITLE, |s: &mut App, _: &mut Tx| s.open_settings()).id("settings");
     if let Ok(k) = keys.spec(shortcuts::Cmd::Settings).parse() {
         settings = settings.key_equivalent(k);
     }
@@ -152,7 +155,7 @@ fn main() {
     if let Ok(k) = keys.spec(shortcuts::Cmd::OpenFolder).parse() {
         open = open.key_equivalent(k);
     }
-    rune::App::new(spec).chrome(chrome).standard_menus().menu_item(settings).menu_item(open).on_frame_encoded(ui::hud::record).on_focus(attention::on_focus)
+    rune::App::new(spec).chrome(chrome).standard_menus().menu_item(MenuItem::separator()).menu_item(settings).menu_item(open).on_frame_encoded(ui::hud::record).on_focus(attention::on_focus)
         // Whatever still runs ends with the app (after asking, while there was any).
         .on_quit(|s: &mut App, _: &mut Tx| s.stop_everything())
         .run();
@@ -742,6 +745,23 @@ mod tests {
         rt.frame(0.8);
         assert!(rt.find("context-gauge").is_none());
         assert!(rt.find("usage-toggle").is_some(), "the plan's gauge stays");
+    }
+
+    /// Without Claude Code there are no plan limits to read, and the transcripts are still
+    /// rescanned only every `LIMITS_EVERY`: it used to be every poll, and each scan landing
+    /// drew a frame, whose poll asked again.
+    #[test]
+    fn without_claude_code_usage_waits_its_beat() {
+        let mut app = new_app();
+        app.installed.retain(|(h, _)| *h != Harness::Claude);
+        app.waker = Some(std::sync::Arc::new(|| {}));
+        // Scans that never land stand in for running ones, so nothing is read.
+        crate::app::scenes::stand_in_usage(&mut app);
+        let now = std::time::SystemTime::now();
+        app.usage_tick(now);
+        assert!(app.take_usage_rescan(), "the first beat asks for a scan");
+        app.usage_tick(now);
+        assert!(!app.take_usage_rescan(), "the next poll waits for the beat");
     }
 
     /// The real plan and transcripts land in the app and on screen (no tokens spent):
