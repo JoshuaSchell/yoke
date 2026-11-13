@@ -106,6 +106,10 @@ fn subtitle(s: &App, t: &Thread, k: &Kit) -> (String, Option<rune::Color>) {
         let secs = t.turn_started.map_or(0, |s| s.elapsed().as_secs());
         return (format!("{project}Working {}{queued}", crate::ui::transcript::duration(secs as f64)), None);
     }
+    // The turn ended, but what it started runs on: "Waiting on 2 agents".
+    if t.has_background() {
+        return (format!("{project}Waiting on {}{queued}", t.background_counts()), None);
+    }
     (format!("{project}{who}{queued}"), None)
 }
 
@@ -129,7 +133,8 @@ pub fn status(t: &Thread) -> Option<Status> {
         Some(Status::Approval)
     } else if t.unread && t.failed {
         Some(Status::Failed)
-    } else if t.unread {
+    } else if t.unread && !t.has_background() {
+        // Not done while its subagents or commands run on (it's on the Working shelf).
         Some(Status::Done)
     } else {
         None
@@ -161,7 +166,7 @@ fn thread_row(s: &App, t: &Thread, lane: Lane, k: &Kit) -> El {
         Some(st) => status_label(st, k),
         None => text(ago(t)).key("ago").font(k.ty.small).color(c.text_faint),
     };
-    let mark = t.busy.then(|| Spinner::new().size(10.0).color(c.icon_muted).build(k));
+    let mark = t.at_work().then(|| Spinner::new().size(10.0).color(c.icon_muted).build(k));
     let meta = col()
         .key("meta")
         .min_w(META_W)

@@ -63,7 +63,7 @@ fn poll(s: &mut App, clock: f64, tx: &mut Tx) -> bool {
     // The "Working… 12s" counter and the frame-stats HUD redraw on their own beat, not every
     // frame: `poll` says true only when something on screen changed.
     let beat = if s.hud { (clock * 2.0) as u64 } else { clock as u64 };
-    if (s.hud || s.threads.iter().any(|t| t.busy || t.has_background())) && beat != s.beat {
+    if (s.hud || s.threads.iter().any(|t| t.at_work())) && beat != s.beat {
         s.beat = beat;
         changed = true;
     }
@@ -351,6 +351,38 @@ mod tests {
 
     fn lane_ids(s: &App, lane: crate::app::Lane) -> Vec<u64> {
         s.lane_threads(lane).iter().map(|t| t.id).collect()
+    }
+
+    /// A thread whose turn ended while its subagents run on is still working: it sits on the
+    /// Working shelf with a spinner and what it waits on, can't settle, and shows no Done
+    /// until the work ends, when it comes back to the inbox.
+    #[test]
+    fn background_work_keeps_a_thread_working() {
+        use crate::app::Lane;
+        use crate::harness::{BackgroundTask, Event};
+        let mut app = new_app();
+        crate::app::scenes::demo(&mut app);
+        let mut rt = headless(app);
+        let agent = |id: &str| BackgroundTask { id: id.into(), kind: "local_agent".into(), description: "Explore".into(), parent_task: None, ambient: false };
+        rt.update(|s, _| {
+            s.threads.iter_mut().find(|t| t.id == 102).unwrap().unread = true;
+            s.apply(102, Event::Background(vec![agent("a1"), agent("a2")]));
+        });
+        assert_eq!(lane_ids(&rt.state, Lane::Working), [101, 102]);
+        let t = rt.state.threads.iter().find(|t| t.id == 102).unwrap();
+        assert_eq!(crate::ui::sidebar::status(t), None, "not Done while its agents run");
+        assert!(!rt.state.at_work().is_empty());
+        rt.update(|s, _| { s.settle(102); });
+        assert_eq!(lane_ids(&rt.state, Lane::Working), [101, 102], "a working thread can't settle");
+        rt.update(|s, _| s.toggle_working_shelf());
+        rt.frame(1.0 / 60.0);
+        assert!(rt.elements().iter().any(|e| e.text.as_deref().is_some_and(|x| x.ends_with("Waiting on 2 agents"))), "the row says what it waits on");
+
+        // The agents finish: back in the inbox, done.
+        rt.update(|s, _| s.apply(102, Event::Background(Vec::new())));
+        assert!(lane_ids(&rt.state, Lane::Inbox).contains(&102));
+        let t = rt.state.threads.iter().find(|t| t.id == 102).unwrap();
+        assert_eq!(crate::ui::sidebar::status(t), Some(crate::ui::sidebar::Status::Done));
     }
 
     /// The inbox: ⇧⌘S settles the open thread and goes on to the next one in the inbox; a

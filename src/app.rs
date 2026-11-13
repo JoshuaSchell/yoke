@@ -92,7 +92,8 @@ pub struct Listed {
 pub enum Lane {
     /// Needs you: waiting on an approval, finished, failed, or not settled yet.
     Inbox,
-    /// A turn is running and nothing is asked of you.
+    /// A turn is running, or its background work (subagents, commands) is, and nothing is
+    /// asked of you.
     Working,
     /// Done with, until it does something again.
     Settled,
@@ -623,6 +624,12 @@ impl Thread {
     /// Whether its process still runs work in the background, which ending the process stops.
     pub fn has_background(&self) -> bool {
         !self.background.is_empty()
+    }
+
+    /// A turn runs, or work its CLI started goes on in the background (subagents, commands)
+    /// though the turn has ended: either way it's working, not waiting for you.
+    pub fn at_work(&self) -> bool {
+        self.busy || self.has_background()
     }
 
     /// What's running in the background, in words: "1 agent, 2 commands".
@@ -1911,7 +1918,7 @@ impl App {
     }
 
     pub fn lane(t: &Thread) -> Lane {
-        if !t.asks.is_empty() { Lane::Inbox } else if t.busy { Lane::Working } else if t.settled { Lane::Settled } else { Lane::Inbox }
+        if !t.asks.is_empty() { Lane::Inbox } else if t.at_work() { Lane::Working } else if t.settled { Lane::Settled } else { Lane::Inbox }
     }
 
     /// One lane's threads in the sidebar's order: the last to come back to you (finish, ask,
@@ -1957,10 +1964,10 @@ impl App {
 
     /// Moves a thread to the Settled shelf (⇧⌘S, or ✓ on its row). Settling the open thread
     /// goes on to the next one in the inbox, as in T3 Code, or the new-thread screen at inbox
-    /// zero. A running thread can't settle: it would come straight back when it finished.
+    /// zero. A working thread can't settle: it would come straight back when it finished.
     pub fn settle(&mut self, id: ThreadId) -> bool {
         let inbox = self.inbox_order();
-        let Some(t) = self.thread_mut(id).filter(|t| !t.busy && t.asks.is_empty() && !t.settled) else { return false };
+        let Some(t) = self.thread_mut(id).filter(|t| !t.at_work() && t.asks.is_empty() && !t.settled) else { return false };
         t.settled = true;
         t.unread = false;
         t.rev += 1;
@@ -1987,7 +1994,7 @@ impl App {
     /// queue, and not kept in the inbox by hand.
     fn may_auto_settle(&self, t: &Thread) -> bool {
         let kept = t.session.as_ref().is_some_and(|s| self.settled_by_hand.get(s) == Some(&false));
-        !t.settled && !t.busy && t.asks.is_empty() && t.queue.is_empty() && !kept
+        !t.settled && !t.at_work() && t.asks.is_empty() && t.queue.is_empty() && !kept
     }
 
     /// Settles every thread nobody has touched for `settle_after`, as T3 Code does, that may
@@ -2599,7 +2606,7 @@ impl App {
 
     /// The threads whose CLI is still at work: a turn, or work in the background.
     pub fn at_work(&self) -> Vec<&Thread> {
-        self.threads.iter().filter(|t| t.busy || t.has_background()).collect()
+        self.threads.iter().filter(|t| t.at_work()).collect()
     }
 
     /// Quitting: asks first while any thread's CLI is at work, since quitting ends it. True if
@@ -2657,7 +2664,7 @@ impl App {
                 changed = true;
             }
         }
-        if self.threads.iter().any(|t| t.busy || t.has_background()) {
+        if self.threads.iter().any(|t| t.at_work()) {
             // The "Working… 12s" counter, and the background work's times.
             tx.wake_after(Duration::from_secs(1));
         } else if let Some(next) = self.live.values().map(|l| l.active + self.timing.0).min() {
