@@ -375,15 +375,16 @@ fn editor_icon(e: crate::editors::Editor, k: &Kit) -> El {
 
 /// Updates, at the toolbar's end as in T3 Code: a circling arrow that checks for one, turning
 /// while it checks and downloads. Once an update is installed the same button grows a label and
-/// restarts into it (held back while a turn runs, since quitting would cut it off). A build run
+/// restarts into it (held back while a thread is at work, a turn or its background work, since
+/// quitting would cut it off). A build run
 /// from source doesn't update itself, so it has no button.
 fn update_button(s: &App, k: &Kit) -> Option<El> {
     use crate::updater::Status;
     let c = &k.c;
     if !crate::updater::installed() && s.update.status == Status::Idle { return None; }
     if let Status::Ready(version) = &s.update.status {
-        let busy = s.threads.iter().any(|t| t.busy);
-        let help = if busy { format!("Yoke {version} is downloaded. Finish or stop the running turns, then restart.") } else { format!("Yoke {version} is downloaded. Restart to use it.") };
+        let busy = !s.at_work().is_empty();
+        let help = if busy { format!("Yoke {version} is downloaded. Restart once the running work (turns, agents, background commands) finishes or is stopped.") } else { format!("Yoke {version} is downloaded. Restart to use it.") };
         return Some(rune_kit::Button::new("Restart to update")
             .variant(rune_kit::ButtonVariant::Contrast)
             .control_size(ControlSize::Small)

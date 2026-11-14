@@ -151,9 +151,10 @@ impl App {
         }
     }
 
-    /// Quits and opens the updated app. Refused while a turn runs, since quitting would cut it off.
+    /// Quits and opens the updated app. Refused while a thread is at work (a turn, or its
+    /// subagents or commands in the background), since quitting would cut it off.
     pub fn restart_to_update(&mut self) -> bool {
-        if self.update_ready().is_none() || self.threads.iter().any(|t| t.busy) { return false; }
+        if self.update_ready().is_none() || !self.at_work().is_empty() { return false; }
         let Some(app) = bundle() else { return false };
         if std::process::Command::new("/usr/bin/open").arg("-n").arg(&app).spawn().is_err() { return false; }
         std::process::exit(0);

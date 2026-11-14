@@ -705,6 +705,19 @@ mod tests {
         rt.pointer_up(x, y);
         rt.frame(0.2);
         assert!(rt.state.update_ready().is_some(), "a running turn holds the restart back");
+
+        // Background work holds it back too, with no turn running; once it's over it may go.
+        let help = |rt: &Runtime<App>| rt.elements().into_iter().find(|e| e.key.as_deref() == Some("update")).and_then(|e| e.help.clone()).unwrap_or_default();
+        let agent = crate::harness::BackgroundTask { id: "a1".into(), kind: "local_agent".into(), description: "Explore".into(), parent_task: None, ambient: false };
+        rt.update(|s, _| {
+            for t in &mut s.threads { t.busy = false; }
+            s.apply(102, crate::harness::Event::Background(vec![agent]));
+        });
+        rt.frame(0.3);
+        assert!(help(&rt).contains("finishes or is stopped"), "{}", help(&rt));
+        rt.update(|s, _| s.apply(102, crate::harness::Event::Background(Vec::new())));
+        rt.frame(0.4);
+        assert!(help(&rt).ends_with("Restart to use it."), "{}", help(&rt));
     }
 
     /// The composer's gauge reads the thread's context window and the toolbar's the plan, each
